@@ -1,0 +1,71 @@
+{
+  "version": 3,
+  "cmakeMinimumRequired": { "major": 3, "minor": 22, "patch": 0 },
+  "configurePresets": [
+    {
+      "name": "dev",
+      "displayName": "dev",
+      "generator": "Ninja",
+      "binaryDir": "${sourceDir}/build/dev",
+      "toolchainFile": "${sourceDir}/cmake/toolchains/x86_64-linux-gnu.cmake",
+      "cacheVariables": {
+        "CMAKE_EXPORT_COMPILE_COMMANDS": "ON",
+        "CMAKE_BUILD_TYPE": "Debug",
+        "YANTERM_SSH_BUILD_TESTS": "ON",
+        "CMAKE_PREFIX_PATH": "${sourceDir}/.deps/libuv",
+        "OPENSSL_ROOT_DIR": "${sourceDir}/.deps/openssl",
+        "OPENSSL_USE_STATIC_LIBS": "ON"
+      }
+    },
+    {
+      "name": "asan",
+      "displayName": "asan",
+      "inherits": "dev",
+      "binaryDir": "${sourceDir}/build/asan",
+      "cacheVariables": {
+        "YANTERM_SSH_ENABLE_ASAN": "ON"
+      }
+    },
+    {
+      "name": "release",
+      "displayName": "release",
+      "generator": "Ninja",
+      "binaryDir": "${sourceDir}/build/release",
+      "toolchainFile": "${sourceDir}/cmake/toolchains/x86_64-linux-gnu.cmake",
+      "cacheVariables": {
+        "CMAKE_EXPORT_COMPILE_COMMANDS": "ON",
+        "CMAKE_BUILD_TYPE": "Release",
+        "YANTERM_SSH_BUILD_TESTS": "ON",
+        "CMAKE_PREFIX_PATH": "${sourceDir}/.deps/libuv",
+        "OPENSSL_ROOT_DIR": "${sourceDir}/.deps/openssl",
+        "OPENSSL_USE_STATIC_LIBS": "ON"
+      }
+    },
+    {
+      "name": "clang",
+      "displayName": "clang",
+      "generator": "Ninja",
+      "binaryDir": "${sourceDir}/build/clang",
+      "cacheVariables": {
+        "CMAKE_EXPORT_COMPILE_COMMANDS": "ON",
+        "CMAKE_BUILD_TYPE": "Debug",
+        "CMAKE_CXX_COMPILER": "/usr/lib/llvm-18/bin/clang++",
+        "YANTERM_SSH_BUILD_TESTS": "ON",
+        "CMAKE_PREFIX_PATH": "${sourceDir}/.deps/libuv",
+        "OPENSSL_ROOT_DIR": "${sourceDir}/.deps/openssl",
+        "OPENSSL_USE_STATIC_LIBS": "ON"
+      }
+    }
+  ],
+  "buildPresets": [
+    { "name": "dev", "configurePreset": "dev", "jobs": 8 },
+    { "name": "asan", "configurePreset": "asan", "jobs": 8 },
+    { "name": "release", "configurePreset": "release", "jobs": 8 },
+    { "name": "clang", "configurePreset": "clang", "jobs": 8 }
+  ],
+  "testPresets": [
+    { "name": "dev", "configurePreset": "dev", "output": { "outputOnFailure": true } },
+    { "name": "asan", "configurePreset": "asan", "output": { "outputOnFailure": true } },
+    { "name": "clang", "configurePreset": "clang", "output": { "outputOnFailure": true } }
+  ]
+}

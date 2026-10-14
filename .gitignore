@@ -1,0 +1,7 @@
+build/
+.cache/
+.deps/
+.worktrees/
+compile_commands.json
+CMakeUserPresets.json
+docs/superpowers/

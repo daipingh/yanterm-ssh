@@ -1,0 +1,4 @@
+If:
+  PathMatch: .*\.ipp$
+CompileFlags:
+  Add: [-xc++]

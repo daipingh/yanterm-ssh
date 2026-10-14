@@ -1,0 +1,22 @@
+#define YANTERM_SSH_SOURCE
+
+#include <yanterm-ssh/core/detail/impl/auth_signature.ipp>
+#include <yanterm-ssh/channels/impl/requests.ipp>
+#include <yanterm-ssh/core/detail/impl/channel_codec.ipp>
+#include <yanterm-ssh/core/impl/connection_lifecycle.ipp>
+#include <yanterm-ssh/core/impl/connection_transport.ipp>
+#include <yanterm-ssh/core/impl/connection_kex.ipp>
+#include <yanterm-ssh/core/impl/connection_auth.ipp>
+#include <yanterm-ssh/core/impl/connection_channels.ipp>
+#include <yanterm-ssh/core/impl/connection_handler.ipp>
+#include <yanterm-ssh/core/detail/impl/kex_exchange.ipp>
+#include <yanterm-ssh/core/detail/impl/kex_negotiation.ipp>
+#include <yanterm-ssh/core/detail/impl/packet.ipp>
+#include <yanterm-ssh/core/detail/impl/version_exchange.ipp>
+#include <yanterm-ssh/kex/impl/algorithms.ipp>
+#include <yanterm-ssh/core/detail/impl/host_key.ipp>
+#include <yanterm-ssh/memory/detail/impl/pages.ipp>
+#include <yanterm-ssh/memory/impl/page_resource.ipp>
+#include <yanterm-ssh/core/detail/impl/kdf.ipp>
+#include <yanterm-ssh/wire/detail/impl/messages.ipp>
+#include <yanterm-ssh/wire/impl/types.ipp>

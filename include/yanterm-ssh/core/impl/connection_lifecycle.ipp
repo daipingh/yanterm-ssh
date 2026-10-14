@@ -1,0 +1,272 @@
+#pragma once
+
+#include <yanterm-ssh/core/connection.hpp>
+
+#if !defined(YANTERM_SSH_HEADER_ONLY) && !defined(YANTERM_SSH_SOURCE)
+#error "yanterm-ssh/core/impl/connection_lifecycle.ipp is an implementation file, not a public header."
+#endif
+
+#include <yanterm-ssh/core/detail/detail_format.hpp>
+#include <yanterm-ssh/wire/detail/messages.hpp>
+#include <yanterm-ssh/wire/types.hpp>
+#include <yanterm-ssh/detail/error.hpp>
+
+#include <cassert>
+
+namespace yanterm::ssh::core {
+
+YANTERM_SSH_INLINE connection::connection(role r, crypto::provider p, const config& cfg,
+                                          handler& h, std::pmr::memory_resource* mr)
+    : app_{h}
+    , role_{r}
+    , pool_{memory::default_page_size, mr}
+    , p_{p}
+    , cfg_{cfg}
+    , version_{r, cfg.software}
+    , reader_{p}
+    , writer_{p}
+    , slots_{cfg_.max_channels} {
+    auth_ = std::make_unique<detail::auth_state>();
+    auth_->banner.assign(cfg.auth_banner);
+    auth_->banner_language.assign(cfg.auth_banner_language);
+    const auto banner = version_.outgoing();
+    push_output_bytes(banner);
+}
+
+YANTERM_SSH_INLINE void connection::on_unwind() noexcept {
+    phase_ = phase::dead;
+    if (!failure_) failure_ = code::invalid_state;
+}
+
+YANTERM_SSH_INLINE std::error_code connection::disconnect(wire::disconnect_reason reason, std::string_view description) {
+    if (phase_ == phase::dead) return failure_ ? failure_ : code::invalid_state;
+    if (auth_) auth_->wipe_secrets();
+    auto ec = enqueue_disconnect(reason, description);
+    phase_ = phase::dead;
+    return ec;
+}
+
+YANTERM_SSH_INLINE std::error_code connection::fail(std::error_code ec, std::string detail) {
+    if (!failure_) {
+        failure_ = ec;
+        failure_detail_ = detail::clip_failure_detail(std::move(detail));
+    }
+    if (auth_) auth_->wipe_secrets();
+    return failure_;
+}
+
+YANTERM_SSH_INLINE std::error_code connection::enqueue_disconnect(wire::disconnect_reason reason,
+                                   std::string_view description) {
+    wire::detail::disconnect_msg msg;
+    msg.reason = reason;
+    msg.description = description;
+    msg.language = {};
+    wire::writer payload;
+    msg.encode(payload);
+    return write_packet(payload.data());
+}
+
+YANTERM_SSH_INLINE std::error_code connection::dispatch_payload(memory::detail::page_slice& payload) {
+    const auto bytes = payload.bytes();
+    if (bytes.empty()) return code::invalid_format;
+    const auto id = static_cast<wire::msg>(std::to_integer<std::uint8_t>(bytes[0]));
+
+    if (pending_handshake_done_) {
+        pending_handshake_done_ = false;
+        if (id == wire::msg::ext_info) {
+            // Same-flight NEWKEYS + EXT_INFO: apply before handshake_done so
+            // the event carries server_sig_algs.
+            if (auto err = apply_ext_info(bytes)) return err;
+            if (auto err = emit_handshake_done()) return err;
+            note_inbound_packet();
+            return {};
+        }
+        if (auto err = emit_handshake_done()) return err;
+    }
+
+    return handle_payload(payload);
+}
+
+YANTERM_SSH_INLINE std::error_code connection::handle_payload(memory::detail::page_slice& pkt) {
+    const auto payload = pkt.bytes();
+    if (payload.empty()) return code::invalid_format;
+    const auto id = static_cast<wire::msg>(std::to_integer<std::uint8_t>(payload[0]));
+    auto unexpected = [&] {
+        return fail(code::unexpected_message,
+                    detail::format_unexpected_message(static_cast<std::uint8_t>(id),
+                                                      static_cast<std::uint8_t>(phase_)));
+    };
+
+    if (id == wire::msg::disconnect) {
+        wire::reader r{payload};
+        wire::detail::disconnect_msg msg;
+        if (!msg.decode(r)) return code::invalid_format;
+        fail(code::peer_disconnected);
+        phase_ = phase::dead;
+        notify([&](handler& app, connection& self) {
+            app.on_disconnect(self, msg.reason, msg.description, msg.language);
+        });
+        return {};
+    }
+
+    // Strict KEX (CVE-2023-48795): once enabled, IGNORE/DEBUG/UNIMPLEMENTED
+    // are forbidden for the rest of the initial KEX (until NEWKEYS is received).
+    if (id == wire::msg::ignore || id == wire::msg::debug || id == wire::msg::unimplemented) {
+        if (strict_kex_active_ && in_initial_kex()) {
+            return code::strict_kex_violation;
+        }
+    }
+
+    if (id == wire::msg::ignore) {
+        wire::reader r{payload};
+        wire::detail::ignore_msg msg;
+        if (!msg.decode(r)) return code::invalid_format;
+        notify([&](handler& app, connection& self) { app.on_ignore(self, msg.data); });
+        note_inbound_packet();
+        return {};
+    }
+
+    if (id == wire::msg::debug) {
+        wire::reader r{payload};
+        wire::detail::debug_msg msg;
+        if (!msg.decode(r)) return code::invalid_format;
+        notify([&](handler& app, connection& self) {
+            app.on_debug(self, msg.always_display, msg.message, msg.language);
+        });
+        note_inbound_packet();
+        return {};
+    }
+
+    if (id == wire::msg::unimplemented) {
+        note_inbound_packet();
+        return {};
+    }
+
+    if (id == wire::msg::ext_info) {
+        // RFC 8308: one optional EXT_INFO after first NEWKEYS. Same-flight
+        // is handled in on_newkeys; a delayed copy is accepted once in
+        // established (fills server_sig_algs_ without re-emitting handshake_done).
+        if (phase_ == phase::established && role_ == role::client && !ext_info_seen_) {
+            note_inbound_packet();
+            return apply_ext_info(payload);
+        }
+        return unexpected();
+    }
+
+    switch (phase_) {
+    case phase::wait_kexinit:
+        if (id != wire::msg::kexinit) {
+            // First binary packet must be KEXINIT when we advertise strict.
+            if (!rekeying_ && cfg_.advertise_strict_kex) {
+                return code::strict_kex_violation;
+            }
+            if (rekeying_) return dispatch_app(payload, &pkt);
+            return unexpected();
+        }
+        note_inbound_packet();
+        return on_kexinit(payload);
+    case phase::wait_kex_msg:
+        if (role_ == role::client) {
+            if (id != wire::msg::kex_ecdh_reply) {
+                if (rekeying_) return dispatch_app(payload, &pkt);
+                return unexpected();
+            }
+            note_inbound_packet();
+            return on_client_kex_reply(payload);
+        }
+        if (id != wire::msg::kex_ecdh_init) {
+            if (rekeying_) return dispatch_app(payload, &pkt);
+            return unexpected();
+        }
+        note_inbound_packet();
+        return on_server_kex_init(payload);
+    case phase::wait_newkeys:
+        if (id != wire::msg::newkeys) {
+            if (rekeying_) return dispatch_app(payload, &pkt);
+            return unexpected();
+        }
+        note_inbound_packet();
+        return on_newkeys();
+    case phase::established:
+        if (id == wire::msg::kexinit) {
+            // Count traffic but do not maybe_auto_rekey: peer KEXINIT already
+            // starts rekey; auto-init here would send a second local KEXINIT.
+            note_inbound_packet(/*allow_auto_rekey=*/false);
+            return on_peer_rekey_kexinit(payload);
+        }
+        return dispatch_app(payload, &pkt);
+    case phase::await_host_key:
+    case phase::version:
+    case phase::dead:
+        return unexpected();
+    }
+    return unexpected();
+}
+
+YANTERM_SSH_INLINE std::error_code connection::emit_handshake_done() {
+    phase_ = phase::established;
+    finish_round();
+    traffic_armed_ = true;
+    reset_traffic_counters();
+    notify([](handler& app, connection& self) { app.on_handshake_done(self); });
+    return {};
+}
+
+YANTERM_SSH_INLINE std::error_code connection::emit_rekey_done() {
+    phase_ = phase::established;
+    rekeying_ = false;
+    finish_round();
+    reset_traffic_counters();
+    // Deferred control must leave before the callback. on_rekey_done runs
+    // inline and may rekey() again, which would otherwise push these packets
+    // back onto the queue. The write pause is lifted first so a waiter resumed
+    // from that callback can send; channel_writable is signaled afterwards,
+    // and skipped when the callback already started another rekey.
+    if (auto ec = flush_deferred_control()) return ec;
+    if (!rekeying_) writes_paused_ = false;
+    notify([](handler& app, connection& self) { app.on_rekey_done(self); });
+    if (!rekeying_) resume_writes();
+    return {};
+}
+
+YANTERM_SSH_INLINE bool connection::is_userauth_or_service(wire::msg id) noexcept {
+    const auto n = static_cast<std::uint8_t>(id);
+    return id == wire::msg::service_request || id == wire::msg::service_accept
+        || (n >= 50 && n <= 53) || n == 60 || n == 61;
+}
+
+YANTERM_SSH_INLINE bool connection::channels_active() const noexcept {
+    return app_traffic_ok() && authenticated();
+}
+
+YANTERM_SSH_INLINE bool connection::is_connection_layer(wire::msg id) noexcept {
+    const auto n = static_cast<std::uint8_t>(id);
+    return (n >= 80 && n <= 82) || (n >= 90 && n <= 100);
+}
+
+YANTERM_SSH_INLINE std::error_code connection::dispatch_app(std::span<const std::byte> payload, memory::detail::page_slice* pkt_page) {
+    const auto id = static_cast<wire::msg>(std::to_integer<std::uint8_t>(payload[0]));
+    auto unexpected = [&] {
+        return fail(code::unexpected_message,
+                    detail::format_unexpected_message(static_cast<std::uint8_t>(id),
+                                                      static_cast<std::uint8_t>(phase_)));
+    };
+    if (is_userauth_or_service(id)) {
+        if (authenticated()) {
+            return unexpected();
+        }
+        note_inbound_packet();
+        assert(auth_);
+        return auth_on_payload(payload, pkt_page);
+    }
+    if (is_connection_layer(id)) {
+        if (!authenticated()) return unexpected();
+        note_inbound_packet();
+        memory::detail::page_slice dummy;
+        memory::detail::page_slice& page = pkt_page ? *pkt_page : dummy;
+        return on_channel_payload(page);
+    }
+    return unexpected();
+}
+
+}  // namespace yanterm::ssh::core

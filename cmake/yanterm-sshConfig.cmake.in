@@ -1,0 +1,15 @@
+@PACKAGE_INIT@
+
+include("${CMAKE_CURRENT_LIST_DIR}/yanterm-sshTargets.cmake")
+
+if(NOT TARGET yanterm::ssh-core AND TARGET yanterm-ssh-core)
+    add_library(yanterm::ssh-core ALIAS yanterm-ssh-core)
+endif()
+if(NOT TARGET yanterm::ssh AND TARGET yanterm-ssh)
+    add_library(yanterm::ssh ALIAS yanterm-ssh)
+endif()
+if(NOT TARGET yanterm::ssh-static AND TARGET yanterm-ssh-static)
+    add_library(yanterm::ssh-static ALIAS yanterm-ssh-static)
+endif()
+
+check_required_components(yanterm-ssh)

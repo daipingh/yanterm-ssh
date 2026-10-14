@@ -1,0 +1,354 @@
+#pragma once
+
+#include <yanterm-ssh/crypto/provider.hpp>
+
+#include <openssl/opensslv.h>
+#include <openssl/rand.h>
+#if OPENSSL_VERSION_NUMBER >= 0x30000000L
+#include <openssl/core.h>
+#include <openssl/core_dispatch.h>
+#include <openssl/core_names.h>
+#include <openssl/evp.h>
+#include <openssl/params.h>
+#include <openssl/provider.h>
+#endif
+
+#include <cstdint>
+#include <new>
+#include <span>
+
+namespace yanterm::ssh::testing {
+
+// Decorates a real provider, replacing only random_bytes with a deterministic
+// stream. Other slots (hash/hmac/cipher/aead/poly1305, and unoverridden
+// supports / constant_time_eq) are forwarded by provider::decorate.
+//
+// OpenSSL's kex_new / ECDSA sig_sign / generate_keypair still call RAND_bytes
+// internally. Those overlay entry points install a scoped RAND_METHOD aimed at
+// this instance's PRNG so multiple fixed_random_provider objects can coexist
+// (client + server loopback) without sharing one process-global stream.
+class fixed_random_provider {
+public:
+    fixed_random_provider(crypto::provider inner, std::uint64_t seed)
+        : inner_{inner} {
+        seed_prng(rng_, seed);
+    }
+
+    fixed_random_provider(const fixed_random_provider&) = delete;
+    fixed_random_provider& operator=(const fixed_random_provider&) = delete;
+    fixed_random_provider(fixed_random_provider&&) = delete;
+    fixed_random_provider& operator=(fixed_random_provider&&) = delete;
+
+    [[nodiscard]] crypto::provider inner() const noexcept { return inner_; }
+    [[nodiscard]] crypto::provider get() noexcept {
+        return crypto::provider::decorate(*this);
+    }
+
+    bool random_bytes(std::byte* out, std::size_t len) noexcept {
+        fill_random(out, len);
+        return true;
+    }
+
+    void* kex_new(crypto::kex_id id) noexcept {
+        rand_scope scope{this};
+        auto h = inner_.new_kex(id);
+        if (!h) return nullptr;
+        return new (std::nothrow) crypto::kex_agreement(std::move(h));
+    }
+    void kex_free(void* ctx) noexcept { delete static_cast<crypto::kex_agreement*>(ctx); }
+    bool kex_public(void* ctx, std::byte* out, std::size_t cap, std::size_t* out_len) noexcept {
+        if (ctx == nullptr || out_len == nullptr) return false;
+        return static_cast<crypto::kex_agreement*>(ctx)->public_value(
+            std::span<std::byte>{out, cap}, *out_len);
+    }
+    bool kex_agree(void* ctx, const std::byte* peer, std::size_t peerlen, std::byte* out,
+                   std::size_t cap, std::size_t* out_len) noexcept {
+        if (ctx == nullptr || out_len == nullptr) return false;
+        return static_cast<crypto::kex_agreement*>(ctx)->agree(
+            std::span<const std::byte>{peer, peerlen}, std::span<std::byte>{out, cap}, *out_len);
+    }
+
+    bool sig_verify(const crypto::public_key_material* key, const std::byte* msg,
+                    std::size_t msglen, const crypto::signature_material* sig) noexcept {
+        if (key == nullptr || sig == nullptr) return false;
+        return inner_.verify(*key, std::span<const std::byte>{msg, msglen}, *sig);
+    }
+    void* signing_key_new(const crypto::private_key_material* key) noexcept {
+        if (key == nullptr) return nullptr;
+        auto h = inner_.new_signing_key(*key);
+        if (!h) return nullptr;
+        return new (std::nothrow) crypto::signing_key(std::move(h));
+    }
+    void signing_key_free(void* handle) noexcept {
+        delete static_cast<crypto::signing_key*>(handle);
+    }
+    bool sig_sign(void* handle, const std::byte* msg, std::size_t msglen, std::byte* out,
+                  std::size_t cap, std::size_t* out_len) noexcept {
+        rand_scope scope{this};
+        if (handle == nullptr || out_len == nullptr) return false;
+        return static_cast<crypto::signing_key*>(handle)->sign(
+            std::span<const std::byte>{msg, msglen}, std::span<std::byte>{out, cap}, *out_len);
+    }
+
+    bool generate_keypair(crypto::sig_id id, std::uint32_t bits,
+                          crypto::private_key_material* out, std::byte* storage,
+                          std::size_t storage_cap, std::size_t* storage_used) noexcept {
+        rand_scope scope{this};
+        if (out == nullptr || storage_used == nullptr) return false;
+        if (!inner_.generate_keypair(id, bits, *out, std::span<std::byte>{storage, storage_cap})) {
+            return false;
+        }
+        *storage_used = storage_cap;
+        return true;
+    }
+
+private:
+    struct xoshiro256ss {
+        std::uint64_t s[4]{};
+    };
+
+    static std::uint64_t splitmix64(std::uint64_t& x) noexcept {
+        x += 0x9e3779b97f4a7c15ull;
+        std::uint64_t z = x;
+        z = (z ^ (z >> 30)) * 0xbf58476d1ce4e5b9ull;
+        z = (z ^ (z >> 27)) * 0x94d049bb133111ebull;
+        return z ^ (z >> 31);
+    }
+
+    static void seed_prng(xoshiro256ss& rng, std::uint64_t seed) noexcept {
+        std::uint64_t x = seed;
+        rng.s[0] = splitmix64(x);
+        rng.s[1] = splitmix64(x);
+        rng.s[2] = splitmix64(x);
+        rng.s[3] = splitmix64(x);
+    }
+
+    static std::uint64_t rotl(std::uint64_t x, int k) noexcept {
+        return (x << k) | (x >> (64 - k));
+    }
+
+    static std::uint64_t next_u64(xoshiro256ss& rng) noexcept {
+        const std::uint64_t result = rotl(rng.s[1] * 5, 7) * 9;
+        const std::uint64_t t = rng.s[1] << 17;
+        rng.s[2] ^= rng.s[0];
+        rng.s[3] ^= rng.s[1];
+        rng.s[1] ^= rng.s[2];
+        rng.s[0] ^= rng.s[3];
+        rng.s[2] ^= t;
+        rng.s[3] = rotl(rng.s[3], 45);
+        return result;
+    }
+
+    void fill_random(std::byte* out, std::size_t len) noexcept {
+        while (len > 0) {
+            const std::uint64_t v = next_u64(rng_);
+            const std::size_t n = len < 8 ? len : 8;
+            for (std::size_t i = 0; i < n; ++i) {
+                out[i] = static_cast<std::byte>((v >> (8 * i)) & 0xffu);
+            }
+            out += n;
+            len -= n;
+        }
+    }
+
+    // Scoped OpenSSL RAND redirection for one call into the inner backend.
+    struct rand_scope {
+        fixed_random_provider* prev_active = nullptr;
+        static inline fixed_random_provider* active = nullptr;
+
+#if OPENSSL_VERSION_NUMBER >= 0x30000000L
+        EVP_RAND_CTX* saved_pub = nullptr;
+        EVP_RAND_CTX* saved_priv = nullptr;
+
+        static void* rand_newctx(void*, void*, const OSSL_DISPATCH*) noexcept {
+            return reinterpret_cast<void*>(1);
+        }
+        static void rand_freectx(void*) noexcept {}
+        static int rand_instantiate(void*, unsigned int, int, const unsigned char*,
+                                    std::size_t, const OSSL_PARAM*) noexcept {
+            return 1;
+        }
+        static int rand_uninstantiate(void*) noexcept { return 1; }
+        static int rand_generate(void*, unsigned char* out, std::size_t outlen,
+                                 unsigned int, int, const unsigned char*,
+                                 std::size_t) noexcept {
+            if (active == nullptr || out == nullptr) return 0;
+            active->fill_random(reinterpret_cast<std::byte*>(out), outlen);
+            return 1;
+        }
+        static int rand_enable_locking(void*) noexcept { return 1; }
+        static const OSSL_PARAM* rand_gettable_ctx_params(void*, void*) noexcept {
+            static const OSSL_PARAM table[] = {
+                OSSL_PARAM_int(OSSL_RAND_PARAM_STATE, nullptr),
+                OSSL_PARAM_uint(OSSL_RAND_PARAM_STRENGTH, nullptr),
+                OSSL_PARAM_size_t(OSSL_RAND_PARAM_MAX_REQUEST, nullptr),
+                OSSL_PARAM_END,
+            };
+            return table;
+        }
+        static int rand_get_ctx_params(void*, OSSL_PARAM params[]) noexcept {
+            OSSL_PARAM* p = OSSL_PARAM_locate(params, OSSL_RAND_PARAM_STATE);
+            if (p != nullptr && !OSSL_PARAM_set_int(p, EVP_RAND_STATE_READY)) return 0;
+            p = OSSL_PARAM_locate(params, OSSL_RAND_PARAM_STRENGTH);
+            if (p != nullptr && !OSSL_PARAM_set_uint(p, 256)) return 0;
+            p = OSSL_PARAM_locate(params, OSSL_RAND_PARAM_MAX_REQUEST);
+            if (p != nullptr
+                && !OSSL_PARAM_set_size_t(p, static_cast<std::size_t>(INT_MAX))) {
+                return 0;
+            }
+            return 1;
+        }
+        static const OSSL_ALGORITHM* prov_query(void*, int op_id, int* no_store) noexcept {
+            static const OSSL_DISPATCH rand_fns[] = {
+                {OSSL_FUNC_RAND_NEWCTX, reinterpret_cast<void (*)()>(&rand_newctx)},
+                {OSSL_FUNC_RAND_FREECTX, reinterpret_cast<void (*)()>(&rand_freectx)},
+                {OSSL_FUNC_RAND_INSTANTIATE,
+                 reinterpret_cast<void (*)()>(&rand_instantiate)},
+                {OSSL_FUNC_RAND_UNINSTANTIATE,
+                 reinterpret_cast<void (*)()>(&rand_uninstantiate)},
+                {OSSL_FUNC_RAND_GENERATE, reinterpret_cast<void (*)()>(&rand_generate)},
+                {OSSL_FUNC_RAND_ENABLE_LOCKING,
+                 reinterpret_cast<void (*)()>(&rand_enable_locking)},
+                {OSSL_FUNC_RAND_GETTABLE_CTX_PARAMS,
+                 reinterpret_cast<void (*)()>(&rand_gettable_ctx_params)},
+                {OSSL_FUNC_RAND_GET_CTX_PARAMS,
+                 reinterpret_cast<void (*)()>(&rand_get_ctx_params)},
+                OSSL_DISPATCH_END,
+            };
+            static const OSSL_ALGORITHM rand_algs[] = {
+                {"YANTERM-FIXED-RAND", "provider=yanterm-fixed-rand", rand_fns, nullptr},
+                {nullptr, nullptr, nullptr, nullptr},
+            };
+            if (no_store != nullptr) *no_store = 0;
+            if (op_id == OSSL_OP_RAND) return rand_algs;
+            return nullptr;
+        }
+        static int prov_init(const OSSL_CORE_HANDLE*, const OSSL_DISPATCH*,
+                             const OSSL_DISPATCH** out, void** provctx) noexcept {
+            static const OSSL_DISPATCH prov_fns[] = {
+                {OSSL_FUNC_PROVIDER_QUERY_OPERATION,
+                 reinterpret_cast<void (*)()>(&prov_query)},
+                OSSL_DISPATCH_END,
+            };
+            *out = prov_fns;
+            *provctx = reinterpret_cast<void*>(1);
+            return 1;
+        }
+        static EVP_RAND_CTX* fixed_rand_ctx() noexcept {
+            struct holder {
+                OSSL_PROVIDER* def_prov = nullptr;
+                OSSL_PROVIDER* fix_prov = nullptr;
+                EVP_RAND_CTX* ctx = nullptr;
+
+                holder() noexcept {
+                    def_prov = OSSL_PROVIDER_load(nullptr, "default");
+                    if (OSSL_PROVIDER_add_builtin(nullptr, "yanterm-fixed-rand",
+                                                  &prov_init)
+                        != 1) {
+                        return;
+                    }
+                    fix_prov = OSSL_PROVIDER_load(nullptr, "yanterm-fixed-rand");
+                    if (fix_prov == nullptr) return;
+                    EVP_RAND* r = EVP_RAND_fetch(nullptr, "YANTERM-FIXED-RAND",
+                                                 "provider=yanterm-fixed-rand");
+                    if (r == nullptr) return;
+                    ctx = EVP_RAND_CTX_new(r, nullptr);
+                    EVP_RAND_free(r);
+                    if (ctx != nullptr) {
+                        (void)EVP_RAND_instantiate(ctx, 256, 0, nullptr, 0, nullptr);
+                    }
+                }
+
+                ~holder() {
+                    if (ctx != nullptr) EVP_RAND_CTX_free(ctx);
+                    if (fix_prov != nullptr) OSSL_PROVIDER_unload(fix_prov);
+                    if (def_prov != nullptr) OSSL_PROVIDER_unload(def_prov);
+                }
+            };
+            (void)OPENSSL_init_crypto(0, nullptr);
+            static holder h;
+            return h.ctx;
+        }
+
+        explicit rand_scope(fixed_random_provider* s) noexcept {
+            prev_active = active;
+            active = s;
+            if (prev_active != nullptr) {
+                return;
+            }
+            saved_pub = RAND_get0_public(nullptr);
+            if (saved_pub != nullptr) EVP_RAND_CTX_up_ref(saved_pub);
+            saved_priv = RAND_get0_private(nullptr);
+            if (saved_priv != nullptr) EVP_RAND_CTX_up_ref(saved_priv);
+            EVP_RAND_CTX* c = fixed_rand_ctx();
+            if (c != nullptr) {
+                EVP_RAND_CTX_up_ref(c);
+                RAND_set0_public(nullptr, c);
+                EVP_RAND_CTX_up_ref(c);
+                RAND_set0_private(nullptr, c);
+            }
+        }
+
+        ~rand_scope() {
+            active = prev_active;
+            if (prev_active != nullptr) {
+                return;
+            }
+            RAND_set0_public(nullptr, saved_pub);
+            RAND_set0_private(nullptr, saved_priv);
+        }
+#else
+        const RAND_METHOD* prev_method;
+        bool prev_installed;
+        static inline const RAND_METHOD* saved_method = nullptr;
+        static inline bool installed = false;
+
+        static int bytes(unsigned char* buf, int num) {
+            if (active == nullptr || buf == nullptr || num < 0) return 0;
+            active->fill_random(reinterpret_cast<std::byte*>(buf), static_cast<std::size_t>(num));
+            return 1;
+        }
+        static int status() { return 1; }
+
+        explicit rand_scope(fixed_random_provider* s) noexcept {
+            static RAND_METHOD method = {
+                nullptr, bytes, nullptr, nullptr, bytes, status,
+            };
+            prev_active = active;
+            prev_method = saved_method;
+            prev_installed = installed;
+            if (!installed) {
+                saved_method = RAND_get_rand_method();
+                installed = true;
+            }
+            active = s;
+            RAND_set_rand_method(&method);
+        }
+
+        ~rand_scope() {
+            active = prev_active;
+            if (prev_active != nullptr) {
+                // Nested scope: keep method installed, restore active only.
+                return;
+            }
+            if (prev_installed) {
+                if (prev_method != nullptr) RAND_set_rand_method(prev_method);
+                saved_method = prev_method;
+                installed = prev_installed;
+            } else {
+                if (saved_method != nullptr) RAND_set_rand_method(saved_method);
+                saved_method = nullptr;
+                installed = false;
+            }
+        }
+#endif
+
+        rand_scope(const rand_scope&) = delete;
+        rand_scope& operator=(const rand_scope&) = delete;
+    };
+
+    crypto::provider inner_;
+    xoshiro256ss rng_{};
+};
+
+}  // namespace yanterm::ssh::testing
