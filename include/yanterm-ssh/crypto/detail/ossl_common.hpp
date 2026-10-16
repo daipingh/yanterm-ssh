@@ -257,6 +257,20 @@ struct openssl_signing_key {
                      static_cast<int>(s.size()), nullptr);
 }
 
+// BN_FLG_SECURE makes BN_clear_free and OSSL_PARAM_BLD_push_BN wipe this copy.
+// Without a secure heap, OpenSSL still allocates normally and cleanses on free.
+[[nodiscard]] inline BIGNUM* bn_secret_from_span(std::span<const std::byte> s) noexcept {
+    if (s.empty()) return nullptr;
+    BIGNUM* bn = BN_secure_new();
+    if (bn == nullptr) return nullptr;
+    if (BN_bin2bn(reinterpret_cast<const unsigned char*>(s.data()),
+                  static_cast<int>(s.size()), bn) == nullptr) {
+        BN_clear_free(bn);
+        return nullptr;
+    }
+    return bn;
+}
+
 // Left-pads a BIGNUM into a fixed-width big-endian buffer, which is what
 // the DH public value and shared secret need.
 [[nodiscard]] inline bool bn_to_fixed(const BIGNUM* bn, std::byte* out,
@@ -289,8 +303,8 @@ struct openssl_signing_key {
     BN_CTX* ctx = BN_CTX_new();
     BIGNUM* p1 = BN_dup(p);
     BIGNUM* q1 = BN_dup(q);
-    BIGNUM* dmp1 = BN_new();
-    BIGNUM* dmq1 = BN_new();
+    BIGNUM* dmp1 = BN_secure_new();
+    BIGNUM* dmq1 = BN_secure_new();
     bool ok = false;
     if (ctx != nullptr && p1 != nullptr && q1 != nullptr && dmp1 != nullptr && dmq1 != nullptr
         && BN_sub_word(p1, 1) == 1 && BN_sub_word(q1, 1) == 1
@@ -301,10 +315,11 @@ struct openssl_signing_key {
         dmq1 = nullptr;
         ok = true;
     }
-    BN_free(dmq1);
-    BN_free(dmp1);
-    BN_free(q1);
-    BN_free(p1);
+    // p-1 and q-1 expose the factors. dmp1/dmq1 are the CRT exponents.
+    BN_clear_free(dmq1);
+    BN_clear_free(dmp1);
+    BN_clear_free(q1);
+    BN_clear_free(p1);
     BN_CTX_free(ctx);
     return ok;
 }
@@ -521,6 +536,7 @@ done:
         ok = 1;
         break;
     }
+    OPENSSL_cleanse(dgst, sizeof(dgst));
     EVP_MD_CTX_free(m);
     return ok == 1;
 }
@@ -544,6 +560,7 @@ done:
     BIGNUM* two_w = BN_new();
     BIGNUM* order = BN_new();
     unsigned char* buf = nullptr;
+    std::size_t buf_len = 0;
     int ret = 0;
 
     if (ctx == nullptr || U == nullptr || xs == nullptr || xp == nullptr || h == nullptr
@@ -573,7 +590,8 @@ done:
         const std::size_t elem =
             static_cast<std::size_t>((EC_GROUP_get_degree(group) + 7) / 8);
         const std::size_t buflen = elem * 2 + 32 * 2 + 1;
-        buf = static_cast<unsigned char*>(OPENSSL_zalloc(buflen + 8));
+        buf_len = buflen + 8;
+        buf = static_cast<unsigned char*>(OPENSSL_zalloc(buf_len));
         if (buf == nullptr) goto err;
         std::size_t idx = EC_POINT_point2oct(group, U, POINT_CONVERSION_UNCOMPRESSED, buf, buflen,
                                              ctx);
@@ -588,18 +606,21 @@ done:
             if (!sm2_z_digest(buf + idx, sm2_kap_id, sizeof(sm2_kap_id), group, rs)) goto err;
             idx += 32;
         }
-        if (!sm2_kdf_gmt0003(out, outlen, buf + 1, idx - 1)) goto err;
+        if (!sm2_kdf_gmt0003(out, outlen, buf + 1, idx - 1)) {
+            OPENSSL_cleanse(out, outlen);
+            goto err;
+        }
     }
     ret = 1;
 err:
-    OPENSSL_free(buf);
+    OPENSSL_clear_free(buf, buf_len);
     BN_free(xs);
     BN_free(xp);
     BN_free(h);
-    BN_free(t);
+    BN_clear_free(t);
     BN_free(two_w);
     BN_free(order);
-    EC_POINT_free(U);
+    EC_POINT_clear_free(U);
     BN_CTX_free(ctx);
     return ret == 1;
 }
@@ -620,8 +641,8 @@ err:
                == static_cast<int>(sm2_field_bytes)) {
         ok = 1;
     }
-    BN_free(x);
-    EC_POINT_free(p);
+    BN_clear_free(x);
+    EC_POINT_clear_free(p);
     BN_CTX_free(ctx);
     return ok == 1;
 }
@@ -767,10 +788,13 @@ err:
     if (dctx != nullptr
         && EVP_PKEY_derive_init(dctx) == 1
         && EVP_PKEY_derive_set_peer(dctx, peer_key) == 1
-        && EVP_PKEY_derive(dctx, reinterpret_cast<unsigned char*>(out), &len) == 1
-        && len == want) {
-        *out_len = want;
-        ok = true;
+        && EVP_PKEY_derive(dctx, reinterpret_cast<unsigned char*>(out), &len) == 1) {
+        if (len == want) {
+            *out_len = want;
+            ok = true;
+        } else {
+            OPENSSL_cleanse(out, want);
+        }
     }
     EVP_PKEY_CTX_free(dctx);
     return ok;

@@ -326,11 +326,11 @@ inline void hmac_update(void* ctx, const std::byte* in, std::size_t len) noexcep
     EC_KEY* ec = EC_KEY_new_by_curve_name(nid);
     BIGNUM* d = bn_from_span(key->seed);
     if (ec == nullptr || d == nullptr || EC_KEY_set_private_key(ec, d) != 1) {
-        BN_free(d);
+        BN_clear_free(d);
         EC_KEY_free(ec);
         return nullptr;
     }
-    BN_free(d);
+    BN_clear_free(d);
     const EC_GROUP* group = EC_KEY_get0_group(ec);
     EC_POINT* point = EC_POINT_new(group);
     bool pub_ok = false;
@@ -373,9 +373,9 @@ inline void hmac_update(void* ctx, const std::byte* in, std::size_t len) noexcep
         iq = nullptr;
         ok = true;
     }
-    BN_free(dmp1);
-    BN_free(dmq1);
-    BN_free(iq);
+    BN_clear_free(dmp1);
+    BN_clear_free(dmq1);
+    BN_clear_free(iq);
     return ok;
 }
 
@@ -393,15 +393,15 @@ inline void hmac_update(void* ctx, const std::byte* in, std::size_t len) noexcep
         || RSA_set0_key(rsa, n, e, d) != 1) {
         BN_free(n);
         BN_free(e);
-        BN_free(d);
+        BN_clear_free(d);
         RSA_free(rsa);
         return nullptr;
     }
     BIGNUM* p = bn_from_span(key->p);
     BIGNUM* q = bn_from_span(key->q);
     if (p == nullptr || q == nullptr || RSA_set0_factors(rsa, p, q) != 1) {
-        BN_free(p);
-        BN_free(q);
+        BN_clear_free(p);
+        BN_clear_free(q);
         RSA_free(rsa);
         return nullptr;
     }

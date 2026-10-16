@@ -163,7 +163,7 @@ inline void hmac_update(void* ctx, const std::byte* in, std::size_t len) noexcep
     }
     BIGNUM* d = nullptr;
     if (EVP_PKEY_get_bn_param(self_pkey, OSSL_PKEY_PARAM_PRIV_KEY, &d) != 1 || d == nullptr) {
-        BN_free(d);
+        BN_clear_free(d);
         return false;
     }
 
@@ -180,7 +180,7 @@ inline void hmac_update(void* ctx, const std::byte* in, std::size_t len) noexcep
     EC_POINT_free(rp);
     EC_POINT_free(rs);
     EC_GROUP_free(group);
-    BN_free(d);
+    BN_clear_free(d);
     return ok;
 }
 
@@ -201,7 +201,7 @@ inline void hmac_update(void* ctx, const std::byte* in, std::size_t len) noexcep
     BIGNUM* bn = nullptr;
     const bool ok = EVP_PKEY_get_bn_param(pkey, name, &bn) == 1
                     && append_bn(storage, cap, used, bn, dest);
-    BN_free(bn);
+    BN_clear_free(bn);
     return ok;
 }
 
@@ -291,7 +291,7 @@ inline void hmac_update(void* ctx, const std::byte* in, std::size_t len) noexcep
     const int nid = ec_sig_curve_nid(key->algorithm);
     if (group_name == nullptr || nid == NID_undef || key->seed.empty()) return nullptr;
 
-    BIGNUM* d = bn_from_span(key->seed);
+    BIGNUM* d = bn_secret_from_span(key->seed);
     if (d == nullptr) return nullptr;
 
     unsigned char pub_buf[133];
@@ -325,7 +325,7 @@ inline void hmac_update(void* ctx, const std::byte* in, std::size_t len) noexcep
     EVP_PKEY_CTX_free(c);
     OSSL_PARAM_free(params);
     OSSL_PARAM_BLD_free(bld);
-    BN_free(d);
+    BN_clear_free(d);
     return wrap_signing_key(key->algorithm, pkey);
 }
 
@@ -337,10 +337,10 @@ inline void hmac_update(void* ctx, const std::byte* in, std::size_t len) noexcep
     }
     BIGNUM* n = bn_from_span(key->n);
     BIGNUM* e = bn_from_span(key->e);
-    BIGNUM* d = bn_from_span(key->d);
-    BIGNUM* p = bn_from_span(key->p);
-    BIGNUM* q = bn_from_span(key->q);
-    BIGNUM* iq = bn_from_span(key->iqmp);
+    BIGNUM* d = bn_secret_from_span(key->d);
+    BIGNUM* p = bn_secret_from_span(key->p);
+    BIGNUM* q = bn_secret_from_span(key->q);
+    BIGNUM* iq = bn_secret_from_span(key->iqmp);
     BIGNUM* dmp1 = nullptr;
     BIGNUM* dmq1 = nullptr;
     OSSL_PARAM_BLD* bld = OSSL_PARAM_BLD_new();
@@ -371,12 +371,12 @@ inline void hmac_update(void* ctx, const std::byte* in, std::size_t len) noexcep
     EVP_PKEY_CTX_free(c);
     OSSL_PARAM_free(params);
     OSSL_PARAM_BLD_free(bld);
-    BN_free(dmq1);
-    BN_free(dmp1);
-    BN_free(iq);
-    BN_free(q);
-    BN_free(p);
-    BN_free(d);
+    BN_clear_free(dmq1);
+    BN_clear_free(dmp1);
+    BN_clear_free(iq);
+    BN_clear_free(q);
+    BN_clear_free(p);
+    BN_clear_free(d);
     BN_free(e);
     BN_free(n);
     return wrap_signing_key(key->algorithm, pkey);
@@ -559,10 +559,13 @@ inline void kex_cleanup(openssl_kex* k) noexcept {
                 if (dctx != nullptr
                     && EVP_PKEY_derive_init_ex(dctx, dparams) == 1
                     && EVP_PKEY_derive_set_peer(dctx, peer_key) == 1
-                    && EVP_PKEY_derive(dctx, reinterpret_cast<unsigned char*>(out), &len) == 1
-                    && len == want) {
-                    *out_len = want;
-                    ok = true;
+                    && EVP_PKEY_derive(dctx, reinterpret_cast<unsigned char*>(out), &len) == 1) {
+                    if (len == want) {
+                        *out_len = want;
+                        ok = true;
+                    } else {
+                        OPENSSL_cleanse(out, want);
+                    }
                 }
             }
         }

@@ -456,6 +456,7 @@ struct openssl_backend {
             ok = detail::ossl::generate_rsa(bits, out, storage, storage_cap, used);
         }
         if (!ok) {
+            OPENSSL_cleanse(storage, storage_cap);
             *out = private_key_material{};
             *storage_used = 0;
             return false;
