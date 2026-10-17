@@ -124,6 +124,7 @@ if(OpenSSL_FOUND)
         test_gm_crypto.cpp
         test_bcrypt_pbkdf.cpp
         test_base64.cpp
+        test_intrusive_list.cpp
         test_public_key.cpp
         test_private_key.cpp
         test_known_hosts.cpp

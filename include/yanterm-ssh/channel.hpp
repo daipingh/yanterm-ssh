@@ -643,17 +643,6 @@ inline corral::Task<std::error_code> channel::wait_channel_response() {
     session_impl::reply_waiter waiter;
     waiter.seq = st_->next_send_seq++;
     st_->reply_waiters.push_back(waiter);
-    struct waiter_guard {
-        session_impl::channel_state* st;
-        session_impl::reply_waiter* waiter;
-        ~waiter_guard() {
-            // done only records that the result was written. Cancellation,
-            // latch, and recv_close co_return while the node is still linked.
-            // unlink is a no-op when a completer already popped the node.
-            if (!st || !waiter) return;
-            st->reply_waiters.unlink(*waiter);
-        }
-    } g{st_, &waiter};
 
     for (;;) {
         if (self.latch_ || !self.run_active_) {

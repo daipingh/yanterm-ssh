@@ -114,8 +114,7 @@ struct session_impl : core::handler {
         on_debug_;
     corral::ParkingLot hs_lot_;
     bool hs_done_ = false;
-    struct reply_waiter {
-        detail::intrusive_hook hook{};
+    struct reply_waiter : detail::intrusive_list_item<reply_waiter> {
         std::uint64_t seq = 0;
         bool done = false;
         bool success = false;
@@ -182,7 +181,7 @@ struct session_impl : core::handler {
         std::string description;
     };
 
-    struct channel_state {
+    struct channel_state : detail::intrusive_list_item<channel_state> {
         std::uint32_t refs = 0;
         core::channel_ref ref{};
         corral::ParkingLot rd_lot;
@@ -195,13 +194,12 @@ struct session_impl : core::handler {
         bool serving_requests = false;
         std::optional<open_outcome> open;
         std::vector<pending_inbound_request> pending_reqs;
-        detail::intrusive_list<reply_waiter, &reply_waiter::hook> reply_waiters;
-        detail::intrusive_hook live{};
+        detail::intrusive_list<reply_waiter> reply_waiters;
         std::uint64_t next_send_seq = 1;
         std::uint64_t next_reply_seq = 1;
     };
 
-    detail::intrusive_list<channel_state, &channel_state::live> live_channels_;
+    detail::intrusive_list<channel_state> live_channels_;
 
     struct pending_inbound_open {
         core::open_ticket ticket{};
@@ -225,7 +223,7 @@ struct session_impl : core::handler {
         bool want_reply = false;
     };
     std::vector<pending_inbound_global> pending_globals_;
-    detail::intrusive_list<reply_waiter, &reply_waiter::hook> global_waiters_;
+    detail::intrusive_list<reply_waiter> global_waiters_;
     std::uint64_t next_global_send_seq_ = 1;
     std::uint64_t next_global_reply_seq_ = 1;
 
@@ -284,25 +282,27 @@ inline session_impl::session_impl(
 }
 
 inline session_impl::~session_impl() {
-    live_channels_.for_each([this](channel_state& st) {
+    for (auto it = live_channels_.begin(); it != live_channels_.end();) {
+        channel_state& st = *it;
         assert(st.refs == 1);
+        it = live_channels_.erase(it);
         release(&st);
-    });
+    }
 }
 
 inline void session_impl::release(channel_state* st) noexcept {
     if (st == nullptr) return;
     if (--st->refs > 0) return;
-    live_channels_.unlink(*st);
+    live_channels_.erase(*st);
     delete st;
 }
 
 inline bool session_impl::inbound_queue_full() const noexcept {
     if (pending_globals_.size() >= max_pending_requests_) return true;
     bool full = false;
-    live_channels_.for_each([&](const channel_state& st) {
+    for (const channel_state& st : live_channels_) {
         if (st.pending_reqs.size() >= max_pending_requests_) full = true;
-    });
+    }
     return full;
 }
 
@@ -588,7 +588,8 @@ inline void session_impl::fail_reply_waiters(channel_state& st) {
 }
 
 inline void session_impl::wake_reply_waiters() {
-    live_channels_.for_each([this](channel_state& st) {
+    for (auto it = live_channels_.begin(); it != live_channels_.end();) {
+        channel_state& st = *it++;
         while (!st.reply_waiters.empty()) {
             auto& w = st.reply_waiters.front();
             // trigger() resumes inline. latch_ makes the waiter return
@@ -596,7 +597,7 @@ inline void session_impl::wake_reply_waiters() {
             st.reply_waiters.pop_front();
             w.ready.trigger();
         }
-    });
+    }
     while (!global_waiters_.empty()) {
         auto& w = global_waiters_.front();
         global_waiters_.pop_front();
@@ -605,13 +606,14 @@ inline void session_impl::wake_reply_waiters() {
 }
 
 inline void session_impl::unpark_live_channels() {
-    live_channels_.for_each([](channel_state& st) {
+    for (auto it = live_channels_.begin(); it != live_channels_.end();) {
+        channel_state& st = *it++;
         st.rd_lot.unparkAll();
         st.ext_lot.unparkAll();
         st.wr_lot.unparkAll();
         st.req_lot.unparkAll();
         st.open_lot.unparkAll();
-    });
+    }
 }
 
 inline void session_impl::reject_pending_opens_and_globals() {
@@ -631,7 +633,8 @@ inline void session_impl::reject_pending_inbound() {
     // Leave it at the front so the serve_requests guard can reject the head
     // first, then this one. Globals are dropped: nothing retries that queue
     // after run_active_ becomes false.
-    live_channels_.for_each([this](channel_state& st) {
+    for (auto it = live_channels_.begin(); it != live_channels_.end();) {
+        channel_state& st = *it++;
         while (!st.pending_reqs.empty()) {
             auto r = std::move(st.pending_reqs.front());
             st.pending_reqs.erase(st.pending_reqs.begin());
@@ -640,7 +643,7 @@ inline void session_impl::reject_pending_inbound() {
                 break;
             }
         }
-    });
+    }
 }
 
 inline std::optional<session_impl::pending_inbound_open> session_impl::take_pending_open() {
