@@ -435,17 +435,6 @@ session::wait_global_response() {
     session_impl::reply_waiter waiter;
     waiter.seq = self.next_global_send_seq_++;
     self.global_waiters_.push_back(waiter);
-    struct waiter_guard {
-        session_impl* self;
-        session_impl::reply_waiter* waiter;
-        ~waiter_guard() {
-            // done only records that the result was written. Session close
-            // co_returns while the node is still linked. unlink is a no-op
-            // when a completer already popped the node.
-            if (!self || !waiter) return;
-            self->global_waiters_.unlink(*waiter);
-        }
-    } g{&self, &waiter};
 
     for (;;) {
         if (self.latch_ || !self.run_active_) {
