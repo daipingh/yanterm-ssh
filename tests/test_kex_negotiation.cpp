@@ -395,7 +395,9 @@ TEST_CASE("algorithm query lists", "[core][kex]") {
     REQUIRE_FALSE(wire::name_list{default_cipher_algorithms(p)}.contains("sm4-cbc"));
     REQUIRE(wire::name_list{supported_cipher_algorithms(p)}.contains("sm4-cbc"));
     REQUIRE(wire::name_list{d_kex}.contains("sm2-sm3"));
-    REQUIRE(wire::name_list{d_kex}.contains("ecgm-sm2-sm3"));
+    if (p.supports(crypto::kex_id::ecdh_sm2)) {
+        REQUIRE(wire::name_list{d_kex}.contains("ecgm-sm2-sm3"));
+    }
     REQUIRE(wire::name_list{d_host}.contains("sm2"));
     REQUIRE(wire::name_list{d_mac}.contains("hmac-sm3"));
 }

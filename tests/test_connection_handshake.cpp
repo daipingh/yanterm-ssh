@@ -658,6 +658,7 @@ TEST_CASE("handshake for GM kex/cipher/mac/hostkey", "[connection][handshake][gm
     for (const auto& c : cases) {
         INFO(c.kex);
         INFO(c.cipher);
+        if (c.kex == "ecgm-sm2-sm3" && !p.supports(crypto::kex_id::ecdh_sm2)) continue;
         core::config cfg;
         cfg.preferred_kex = c.kex;
         cfg.preferred_host_key = "sm2";

@@ -21,7 +21,7 @@ The entire public API lives under `include/yanterm-ssh/`; see [`PUBLIC_API.md`](
 - **Transport layer**: rekey (by byte and packet count thresholds), `ext-info`, strict kex (Terrapin attack mitigation).
 - **Keys and file formats**: parsing, generation and serialization of OpenSSH private keys (including bcrypt-pbkdf passphrase encryption), public keys, SHA-256 fingerprints, `known_hosts`, `authorized_keys`.
 - **Pluggable crypto backend**: ships with an OpenSSL backend; applications can also implement their own backend, as long as it satisfies the `crypto::provider` constraints.
-- **Chinese national (SM) algorithms**: SM2 / SM3 / SM4 algorithms are available when the backend supports them (e.g. Tongsuo).
+- **Chinese national (SM) algorithms**: SM2 / SM3 / SM4 algorithms are available when the backend supports them (e.g. Tongsuo). Upstream OpenSSL 3.x does not allow ECDH or plain ECDSA on the SM2 curve, so `ecgm-sm2-sm3` and the Kylin SM2 signature encoding are only available with Tongsuo (or OpenSSL 1.1.1).
 - **Memory and security**: plaintext and ciphertext live in reference-counted page memory; sensitive data is carried by types such as `secure_bytes` and wiped on release.
 - **Three delivery forms**: header-only, static library, C++20 modules (experimental).
 

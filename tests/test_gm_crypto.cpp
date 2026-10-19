@@ -63,9 +63,10 @@ const auto k_qs = unhex(
     "e858f9d81e5430a57b36daab8f950a3c64e6ee6a63094d99283aff767e124df0");
 
 [[nodiscard]] crypto::signing_key import_sm2(std::span<const std::byte> d,
-                                             std::span<const std::byte> q) {
+                                             std::span<const std::byte> q,
+                                             crypto::sig_id dialect) {
     crypto::private_key_material key;
-    key.algorithm = crypto::sig_id::sm2_ecdsa;
+    key.algorithm = dialect;
     key.seed = d;
     key.public_key = q;
     return prov().new_signing_key(key);
@@ -145,8 +146,8 @@ TEST_CASE("SM4-CTR round-trips and is distinct from CBC", "[crypto][gm][sm4]") {
 TEST_CASE("sm2-sm3 KAP matches appendix C.2 on both roles", "[crypto][gm][kap]") {
     unsigned char kc[32];
     unsigned char ks[32];
-    crypto::signing_key client = import_sm2(k_dc, k_qc);
-    crypto::signing_key server = import_sm2(k_ds, k_qs);
+    crypto::signing_key client = import_sm2(k_dc, k_qc, crypto::sig_id::sm2_za);
+    crypto::signing_key server = import_sm2(k_ds, k_qs, crypto::sig_id::sm2_za);
     REQUIRE(static_cast<bool>(client));
     REQUIRE(static_cast<bool>(server));
     REQUIRE(fixed_key_agree(client, crypto::kex_id::sm2_kap, k_qs, kc));
@@ -161,8 +162,9 @@ TEST_CASE("ecgm-sm2-sm3 ECDH x matches appendix C.3 and differs from KAP", "[cry
     unsigned char k_ecdh[32];
     unsigned char k_ecdh_s[32];
     unsigned char k_kap[32];
-    crypto::signing_key client = import_sm2(k_dc, k_qc);
-    crypto::signing_key server = import_sm2(k_ds, k_qs);
+    if (!prov().supports(crypto::kex_id::ecdh_sm2)) SKIP("ecgm-sm2-sm3 unsupported by this OpenSSL");
+    crypto::signing_key client = import_sm2(k_dc, k_qc, crypto::sig_id::sm2_ecdsa);
+    crypto::signing_key server = import_sm2(k_ds, k_qs, crypto::sig_id::sm2_ecdsa);
     REQUIRE(static_cast<bool>(client));
     REQUIRE(static_cast<bool>(server));
     REQUIRE(fixed_key_agree(client, crypto::kex_id::ecdh_sm2, k_qs, k_ecdh));
@@ -227,7 +229,9 @@ TEST_CASE("SM2 host signatures round-trip in both dialects", "[kex][gm][sig]") {
     };
 
     sign_and_verify(crypto::sig_id::sm2_za);
-    sign_and_verify(crypto::sig_id::sm2_ecdsa);
+    if (p.supports(crypto::sig_id::sm2_ecdsa)) {
+        sign_and_verify(crypto::sig_id::sm2_ecdsa);
+    }
 }
 
 TEST_CASE("SM2 generate/parse OpenSSH private key", "[keys][gm]") {
