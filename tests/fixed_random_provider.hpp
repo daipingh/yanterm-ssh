@@ -8,12 +8,16 @@
 #include <openssl/core.h>
 #include <openssl/core_dispatch.h>
 #include <openssl/core_names.h>
+#include <openssl/crypto.h>
 #include <openssl/evp.h>
 #include <openssl/params.h>
 #include <openssl/provider.h>
 #endif
 
+#include <climits>
 #include <cstdint>
+#include <cstdio>
+#include <cstdlib>
 #include <new>
 #include <span>
 
@@ -24,9 +28,10 @@ namespace yanterm::ssh::testing {
 // supports / constant_time_eq) are forwarded by provider::decorate.
 //
 // OpenSSL's kex_new / ECDSA sig_sign / generate_keypair still call RAND_bytes
-// internally. Those overlay entry points install a scoped RAND_METHOD aimed at
-// this instance's PRNG so multiple fixed_random_provider objects can coexist
-// (client + server loopback) without sharing one process-global stream.
+// internally. Those overlay entry points open a rand_scope that routes OpenSSL
+// randomness to this instance's PRNG so multiple fixed_random_provider objects
+// can coexist (client + server loopback) without sharing one process-global
+// stream.
 class fixed_random_provider {
 public:
     fixed_random_provider(crypto::provider inner, std::uint64_t seed)
@@ -157,8 +162,11 @@ private:
         static inline fixed_random_provider* active = nullptr;
 
 #if OPENSSL_VERSION_NUMBER >= 0x30000000L
-        EVP_RAND_CTX* saved_pub = nullptr;
-        EVP_RAND_CTX* saved_priv = nullptr;
+        // Every DRBG of the default libctx is YANTERM-FIXED-RAND. OpenSSL 3.0
+        // cannot swap DRBGs once instantiated, so the type is installed before
+        // first use and generate dispatches on `active`, forwarding to a
+        // private libctx when no scope is open.
+        static inline OSSL_LIB_CTX* fallback_libctx = nullptr;
 
         static void* rand_newctx(void*, void*, const OSSL_DISPATCH*) noexcept {
             return reinterpret_cast<void*>(1);
@@ -170,9 +178,14 @@ private:
         }
         static int rand_uninstantiate(void*) noexcept { return 1; }
         static int rand_generate(void*, unsigned char* out, std::size_t outlen,
-                                 unsigned int, int, const unsigned char*,
+                                 unsigned int strength, int, const unsigned char*,
                                  std::size_t) noexcept {
-            if (active == nullptr || out == nullptr) return 0;
+            if (out == nullptr) return 0;
+            if (active == nullptr) {
+                // A null libctx would recurse into this provider.
+                if (fallback_libctx == nullptr) return 0;
+                return RAND_bytes_ex(fallback_libctx, out, outlen, strength) == 1 ? 1 : 0;
+            }
             active->fill_random(reinterpret_cast<std::byte*>(out), outlen);
             return 1;
         }
@@ -213,7 +226,7 @@ private:
                  reinterpret_cast<void (*)()>(&rand_gettable_ctx_params)},
                 {OSSL_FUNC_RAND_GET_CTX_PARAMS,
                  reinterpret_cast<void (*)()>(&rand_get_ctx_params)},
-                OSSL_DISPATCH_END,
+                {0, nullptr},
             };
             static const OSSL_ALGORITHM rand_algs[] = {
                 {"YANTERM-FIXED-RAND", "provider=yanterm-fixed-rand", rand_fns, nullptr},
@@ -228,75 +241,57 @@ private:
             static const OSSL_DISPATCH prov_fns[] = {
                 {OSSL_FUNC_PROVIDER_QUERY_OPERATION,
                  reinterpret_cast<void (*)()>(&prov_query)},
-                OSSL_DISPATCH_END,
+                {0, nullptr},
             };
             *out = prov_fns;
             *provctx = reinterpret_cast<void*>(1);
             return 1;
         }
-        static EVP_RAND_CTX* fixed_rand_ctx() noexcept {
-            struct holder {
-                OSSL_PROVIDER* def_prov = nullptr;
-                OSSL_PROVIDER* fix_prov = nullptr;
-                EVP_RAND_CTX* ctx = nullptr;
+        struct installation {
+            OSSL_PROVIDER* def_prov = nullptr;
+            OSSL_PROVIDER* fix_prov = nullptr;
 
-                holder() noexcept {
-                    def_prov = OSSL_PROVIDER_load(nullptr, "default");
-                    if (OSSL_PROVIDER_add_builtin(nullptr, "yanterm-fixed-rand",
-                                                  &prov_init)
-                        != 1) {
-                        return;
-                    }
-                    fix_prov = OSSL_PROVIDER_load(nullptr, "yanterm-fixed-rand");
-                    if (fix_prov == nullptr) return;
-                    EVP_RAND* r = EVP_RAND_fetch(nullptr, "YANTERM-FIXED-RAND",
-                                                 "provider=yanterm-fixed-rand");
-                    if (r == nullptr) return;
-                    ctx = EVP_RAND_CTX_new(r, nullptr);
-                    EVP_RAND_free(r);
-                    if (ctx != nullptr) {
-                        (void)EVP_RAND_instantiate(ctx, 256, 0, nullptr, 0, nullptr);
-                    }
+            // OPENSSL_init_crypto runs first so this destructor precedes
+            // OpenSSL's atexit cleanup.
+            installation() noexcept {
+                const bool ok =
+                    OPENSSL_init_crypto(0, nullptr) == 1
+                    && (fallback_libctx = OSSL_LIB_CTX_new()) != nullptr
+                    && (def_prov = OSSL_PROVIDER_load(nullptr, "default")) != nullptr
+                    && OSSL_PROVIDER_add_builtin(nullptr, "yanterm-fixed-rand", &prov_init) == 1
+                    && (fix_prov = OSSL_PROVIDER_load(nullptr, "yanterm-fixed-rand")) != nullptr
+                    && RAND_set_DRBG_type(nullptr, "YANTERM-FIXED-RAND",
+                                          "provider=yanterm-fixed-rand", nullptr, nullptr)
+                           == 1;
+                if (!ok) {
+                    std::fputs("fixed_random_provider: OpenSSL randomness was used before "
+                               "YANTERM-FIXED-RAND could be installed\n",
+                               stderr);
+                    std::abort();
                 }
+            }
 
-                ~holder() {
-                    if (ctx != nullptr) EVP_RAND_CTX_free(ctx);
-                    if (fix_prov != nullptr) OSSL_PROVIDER_unload(fix_prov);
-                    if (def_prov != nullptr) OSSL_PROVIDER_unload(def_prov);
-                }
-            };
-            (void)OPENSSL_init_crypto(0, nullptr);
-            static holder h;
-            return h.ctx;
-        }
+            ~installation() {
+                OSSL_LIB_CTX* ctx = fallback_libctx;
+                fallback_libctx = nullptr;
+                OSSL_LIB_CTX_free(ctx);
+                OSSL_PROVIDER_unload(fix_prov);
+                OSSL_PROVIDER_unload(def_prov);
+            }
+
+            installation(const installation&) = delete;
+            installation& operator=(const installation&) = delete;
+        };
+        // Must run before anything instantiates the default libctx DRBGs.
+        static inline installation installed{};
 
         explicit rand_scope(fixed_random_provider* s) noexcept {
+            (void)installed;
             prev_active = active;
             active = s;
-            if (prev_active != nullptr) {
-                return;
-            }
-            saved_pub = RAND_get0_public(nullptr);
-            if (saved_pub != nullptr) EVP_RAND_CTX_up_ref(saved_pub);
-            saved_priv = RAND_get0_private(nullptr);
-            if (saved_priv != nullptr) EVP_RAND_CTX_up_ref(saved_priv);
-            EVP_RAND_CTX* c = fixed_rand_ctx();
-            if (c != nullptr) {
-                EVP_RAND_CTX_up_ref(c);
-                RAND_set0_public(nullptr, c);
-                EVP_RAND_CTX_up_ref(c);
-                RAND_set0_private(nullptr, c);
-            }
         }
 
-        ~rand_scope() {
-            active = prev_active;
-            if (prev_active != nullptr) {
-                return;
-            }
-            RAND_set0_public(nullptr, saved_pub);
-            RAND_set0_private(nullptr, saved_priv);
-        }
+        ~rand_scope() { active = prev_active; }
 #else
         const RAND_METHOD* prev_method;
         bool prev_installed;
