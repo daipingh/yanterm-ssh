@@ -208,6 +208,7 @@ TEST_CASE("client/server kex round-trip agrees on H and K", "[kex][exchange]") {
 
     for (const auto& c : cases) {
         INFO(c.name);
+        if (c.id == crypto::kex_id::ecdh_sm2 && !p.supports(c.id)) continue;
         const auto n = make_negotiated(c.id, c.name, c.hash);
         const auto rt = run_round_trip(p, n, hs, fx);
         REQUIRE(rt.client_hash == rt.server_hash);

@@ -8,6 +8,7 @@
 #include <yanterm-ssh/crypto/detail/ossl_common.hpp>
 
 #include <openssl/core_names.h>
+#include <openssl/err.h>
 #include <openssl/param_build.h>
 #include <openssl/params.h>
 
@@ -143,10 +144,6 @@ inline void hmac_update(void* ctx, const std::byte* in, std::size_t len) noexcep
     return avail;
 }
 
-[[nodiscard]] inline bool openssl_supports(primitive_kind kind, std::uint8_t id) noexcept {
-    return openssl_supports_common(sm2_primitives_available(), kind, id);
-}
-
 // SSH simplified GM/T 0003 KAP. Identity key = ephemeral key. is_server: client=0, server=1.
 [[nodiscard]] inline bool sm2_ssh_kap(unsigned char* out, std::size_t outlen, int is_server,
                                       std::span<const std::byte> peer_pub,
@@ -156,7 +153,7 @@ inline void hmac_update(void* ctx, const std::byte* in, std::size_t len) noexcep
     }
     unsigned char self_pub_oct[65];
     std::size_t self_pub_len = 0;
-    if (EVP_PKEY_get_octet_string_param(self_pkey, OSSL_PKEY_PARAM_PUB_KEY, self_pub_oct,
+    if (EVP_PKEY_get_octet_string_param(self_pkey, OSSL_PKEY_PARAM_ENCODED_PUBLIC_KEY, self_pub_oct,
                                         sizeof(self_pub_oct), &self_pub_len) != 1
         || self_pub_len != 65) {
         return false;
@@ -247,6 +244,40 @@ inline void hmac_update(void* ctx, const std::byte* in, std::size_t len) noexcep
     return pkey;
 }
 
+// ecdh_sm2 and sm2_ecdsa need "EC" keys on the SM2 curve. Upstream OpenSSL 3.x
+// only imports SM2-curve keys into the "SM2" keymgmt, which offers neither ECDH
+// nor plain ECDSA; Tongsuo also accepts them in "EC".
+[[nodiscard]] inline bool sm2_curve_ec_keys_available() noexcept {
+    static const bool avail = []() noexcept {
+        if (!sm2_primitives_available()) return false;
+        EC_GROUP* g = EC_GROUP_new_by_curve_name(NID_sm2);
+        unsigned char gen[65];
+        const std::size_t len =
+            g != nullptr ? EC_POINT_point2oct(g, EC_GROUP_get0_generator(g),
+                                              POINT_CONVERSION_UNCOMPRESSED, gen, sizeof(gen),
+                                              nullptr)
+                         : 0;
+        EC_GROUP_free(g);
+        if (len != sizeof(gen)) return false;
+        ERR_set_mark();
+        EVP_PKEY* pkey =
+            ec_from_public("EC", "SM2", std::span{reinterpret_cast<const std::byte*>(gen), len});
+        ERR_pop_to_mark();
+        const bool ok = pkey != nullptr;
+        EVP_PKEY_free(pkey);
+        return ok;
+    }();
+    return avail;
+}
+
+[[nodiscard]] inline bool openssl_supports(primitive_kind kind, std::uint8_t id) noexcept {
+    if ((kind == primitive_kind::kex && static_cast<kex_id>(id) == kex_id::ecdh_sm2)
+        || (kind == primitive_kind::signature && static_cast<sig_id>(id) == sig_id::sm2_ecdsa)) {
+        return sm2_curve_ec_keys_available();
+    }
+    return openssl_supports_common(sm2_primitives_available(), kind, id);
+}
+
 [[nodiscard]] inline bool generate_ecdsa(sig_id id, private_key_material* out, std::byte* storage,
                                          std::size_t cap, std::size_t& used) noexcept {
     const char* group = ec_sig_group_name(id);
@@ -257,7 +288,7 @@ inline void hmac_update(void* ctx, const std::byte* in, std::size_t len) noexcep
         && append_pkey_bn(pkey, OSSL_PKEY_PARAM_PRIV_KEY, storage, cap, used, out->seed)) {
         unsigned char pub[133];
         std::size_t publen = 0;
-        if (EVP_PKEY_get_octet_string_param(pkey, OSSL_PKEY_PARAM_PUB_KEY, pub, sizeof(pub),
+        if (EVP_PKEY_get_octet_string_param(pkey, OSSL_PKEY_PARAM_ENCODED_PUBLIC_KEY, pub, sizeof(pub),
                                             &publen) == 1
             && publen != 0
             && append_bytes(storage, cap, used, pub, publen, out->public_key)) {
@@ -480,7 +511,7 @@ inline void kex_cleanup(openssl_kex* k) noexcept {
     if (ec_kex_group_name(k->id) != nullptr) {
         std::size_t len = 0;
         if (EVP_PKEY_get_octet_string_param(
-                k->pkey, OSSL_PKEY_PARAM_PUB_KEY,
+                k->pkey, OSSL_PKEY_PARAM_ENCODED_PUBLIC_KEY,
                 reinterpret_cast<unsigned char*>(out), want, &len) != 1
             || len != want) {
             return false;
