@@ -71,6 +71,8 @@ YANTERM_SSH_INLINE std::error_code connection::dispatch_payload(memory::detail::
     if (bytes.empty()) return code::invalid_format;
     const auto id = static_cast<wire::msg>(std::to_integer<std::uint8_t>(bytes[0]));
 
+    // RFC 8308 §2.4: a client's EXT_INFO, and a server's first-opportunity
+    // one, is the very next packet after the sender's first NEWKEYS.
     if (pending_handshake_done_) {
         pending_handshake_done_ = false;
         if (id == wire::msg::ext_info) {
@@ -82,6 +84,15 @@ YANTERM_SSH_INLINE std::error_code connection::dispatch_payload(memory::detail::
             return {};
         }
         if (auto err = emit_handshake_done()) return err;
+    } else if (role_ == role::server && traffic_armed_ && !ext_info_closed_) {
+        // The server needs nothing from client EXT_INFO before handshake_done,
+        // so the slot stays open across feeds until the next packet arrives.
+        ext_info_closed_ = true;
+        if (id == wire::msg::ext_info && cfg_.advertise_ext_info) {
+            if (auto err = apply_ext_info(bytes)) return err;
+            note_inbound_packet();
+            return {};
+        }
     }
 
     return handle_payload(payload);
@@ -143,10 +154,12 @@ YANTERM_SSH_INLINE std::error_code connection::handle_payload(memory::detail::pa
     }
 
     if (id == wire::msg::ext_info) {
-        // RFC 8308: one optional EXT_INFO after first NEWKEYS. Same-flight
-        // is handled in on_newkeys; a delayed copy is accepted once in
-        // established (fills server_sig_algs_ without re-emitting handshake_done).
-        if (phase_ == phase::established && role_ == role::client && !ext_info_seen_) {
+        // A client accepts server EXT_INFO any number of times from its first
+        // NEWKEYS until USERAUTH_SUCCESS: RFC 8308 §2.4 allows both the
+        // post-NEWKEYS and pre-USERAUTH_SUCCESS slots, and the window is
+        // widened as if ext-info-in-auth@openssh.com had been sent. The
+        // NEWKEYS-adjacent packet in the same feed goes through dispatch_payload.
+        if (role_ == role::client && traffic_armed_ && !authenticated()) {
             note_inbound_packet();
             return apply_ext_info(payload);
         }

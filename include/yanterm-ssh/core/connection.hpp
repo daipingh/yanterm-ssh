@@ -467,7 +467,9 @@ private:
     bool strict_kex_session_ = false;  // sticky after first negotiation
     bool rekeying_ = false;
     std::vector<crypto::secure_bytes> deferred_control_;
-    bool ext_info_seen_ = false;
+    // Server only: the packet right after the client's first NEWKEYS has been
+    // seen, so no further client EXT_INFO is accepted.
+    bool ext_info_closed_ = false;
     bool traffic_armed_ = false;  // count volume only after first NEWKEYS completes
 
     bool advertised_ssh_rsa() const noexcept;

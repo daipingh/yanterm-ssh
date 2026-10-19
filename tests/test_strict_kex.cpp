@@ -16,6 +16,7 @@
 #include "handshake_fixture.hpp"
 #include "loopback.hpp"
 #include "recording_handler.hpp"
+#include "scripted_peer.hpp"
 
 #include <cstddef>
 #include <cstdint>
@@ -451,6 +452,82 @@ TEST_CASE("ext-info-s advertised without EXT_INFO still completes", "[strict_kex
     REQUIRE(sig_algs.empty());
     REQUIRE_FALSE(client.conn.failure());
     REQUIRE_FALSE(server.conn.failure());
+}
+
+// RFC 8308 §2.1: after the server advertised ext-info-s, the client may send
+// EXT_INFO as the next packet following its first NEWKEYS (OpenSSH >= 9.6).
+TEST_CASE("server accepts client EXT_INFO only right after first NEWKEYS", "[strict_kex][ext_info]") {
+    const auto value = std::as_bytes(std::span{"0", 1});
+    const wire::detail::ext_info::entry entries[] = {{"ext-info-in-auth@openssh.com", value}};
+    wire::detail::ext_info ext;
+    ext.entries = entries;
+    const wire::detail::service_msg service_request{wire::msg::service_request, "ssh-userauth"};
+
+    SECTION("next packet after NEWKEYS") {
+        peer_session s{core::role::server};
+        s.handshake();
+        s.peer.send_msg(ext);
+        s.peer.send_msg(service_request);
+        REQUIRE_FALSE(s.peer.exchange(s.sut));
+        REQUIRE_FALSE(s.sut.conn.failure());
+        REQUIRE(s.peer.take(wire::msg::service_accept));
+        REQUIRE(s.sut.conn.server_sig_algs().empty());
+    }
+    SECTION("after another packet") {
+        peer_session s{core::role::server};
+        s.handshake();
+        s.peer.send_msg(service_request);
+        s.peer.send_msg(ext);
+        (void)s.peer.exchange(s.sut);
+        REQUIRE(s.sut.conn.failure() == code::unexpected_message);
+    }
+}
+
+// RFC 8308 §2.4 lets the server send EXT_INFO both after NEWKEYS and before
+// USERAUTH_SUCCESS; the client also accepts ext-info-in-auth style updates.
+TEST_CASE("client accepts server EXT_INFO until USERAUTH_SUCCESS", "[strict_kex][ext_info]") {
+    auto send_ext = [](scripted_peer& peer, std::string_view algs) {
+        const wire::detail::ext_info::entry entries[] = {
+            {"server-sig-algs", std::as_bytes(std::span{algs.data(), algs.size()})}};
+        wire::detail::ext_info msg;
+        msg.entries = entries;
+        peer.send_msg(msg);
+    };
+    const std::string_view none[] = {"none"};
+    wire::detail::userauth_failure failure;
+    failure.out_methods = none;
+    const auto success = static_cast<std::byte>(wire::msg::userauth_success);
+
+    peer_session s{core::role::client};
+    s.handshake();
+    send_ext(s.peer, "ssh-ed25519");
+    REQUIRE_FALSE(s.peer.exchange(s.sut));
+    REQUIRE(s.sut.conn.server_sig_algs() == "ssh-ed25519");
+
+    REQUIRE_FALSE(s.sut.conn.auth_none("alice"));
+    REQUIRE_FALSE(s.peer.exchange(s.sut));
+    REQUIRE(s.peer.take(wire::msg::service_request));
+    s.peer.send_msg(wire::detail::service_msg{wire::msg::service_accept, "ssh-userauth"});
+    REQUIRE_FALSE(s.peer.exchange(s.sut));
+    REQUIRE(s.peer.take(wire::msg::userauth_request));
+    send_ext(s.peer, "rsa-sha2-256");
+    s.peer.send_msg(failure);
+    REQUIRE_FALSE(s.peer.exchange(s.sut));
+    REQUIRE_FALSE(s.sut.conn.failure());
+    REQUIRE(s.sut.conn.server_sig_algs() == "rsa-sha2-256");
+
+    REQUIRE_FALSE(s.sut.conn.auth_none("alice"));
+    REQUIRE_FALSE(s.peer.exchange(s.sut));
+    REQUIRE(s.peer.take(wire::msg::userauth_request));
+    send_ext(s.peer, "rsa-sha2-512");
+    s.peer.send(std::span<const std::byte>{&success, 1});
+    REQUIRE_FALSE(s.peer.exchange(s.sut));
+    REQUIRE_FALSE(s.sut.conn.failure());
+    REQUIRE(s.sut.conn.server_sig_algs() == "rsa-sha2-512");
+
+    send_ext(s.peer, "ssh-ed25519");
+    (void)s.peer.exchange(s.sut);
+    REQUIRE(s.sut.conn.failure() == code::unexpected_message);
 }
 
 TEST_CASE("EXT_INFO before NEWKEYS is unexpected_message", "[strict_kex][ext_info]") {

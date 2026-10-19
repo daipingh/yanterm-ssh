@@ -511,13 +511,12 @@ YANTERM_SSH_INLINE std::error_code connection::finish_kex_and_send_newkeys(std::
 }
 
 YANTERM_SSH_INLINE std::error_code connection::apply_ext_info(std::span<const std::byte> payload) {
-    if (ext_info_seen_) return code::unexpected_message;
-    ext_info_seen_ = true;
-
     wire::reader r{payload};
     wire::detail::ext_info msg;
     if (!msg.decode(r) || !r.empty()) return code::invalid_format;
 
+    // No client-sent extension is acted on; server-sig-algs is server-only.
+    if (role_ != role::client) return {};
     std::string_view algs;
     if (msg.find("server-sig-algs", algs)) {
         server_sig_algs_.assign(algs.begin(), algs.end());
