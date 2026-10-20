@@ -7,7 +7,6 @@
       "displayName": "dev",
       "generator": "Ninja",
       "binaryDir": "${sourceDir}/build/dev",
-      "toolchainFile": "${sourceDir}/cmake/toolchains/x86_64-linux-gnu.cmake",
       "cacheVariables": {
         "CMAKE_EXPORT_COMPILE_COMMANDS": "ON",
         "CMAKE_BUILD_TYPE": "Debug",
@@ -31,7 +30,6 @@
       "displayName": "release",
       "generator": "Ninja",
       "binaryDir": "${sourceDir}/build/release",
-      "toolchainFile": "${sourceDir}/cmake/toolchains/x86_64-linux-gnu.cmake",
       "cacheVariables": {
         "CMAKE_EXPORT_COMPILE_COMMANDS": "ON",
         "CMAKE_BUILD_TYPE": "Release",

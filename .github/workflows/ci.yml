@@ -1,0 +1,169 @@
+name: ci
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  gcc11:
+    runs-on: ubuntu-22.04
+    env:
+      CXX: g++-11
+    steps:
+      - uses: actions/checkout@v7
+      - name: Install OpenSSH
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y openssh-server openssh-client
+          sudo install -d -m 0755 /run/sshd
+          test -d /run/sshd
+          test -x /usr/sbin/sshd
+      - name: Versions
+        run: |
+          "$CXX" --version
+          openssl version
+          dpkg-query -W libssl-dev openssh-server openssh-client
+          { /usr/sbin/sshd -V 2>&1 || true; } | grep -m1 OpenSSH_ || true
+          cmake --version
+      - name: Configure
+        run: cmake --preset dev -DOPENSSL_ROOT_DIR= -DOPENSSL_USE_STATIC_LIBS=OFF -DYANTERM_SSH_INTEROP_TESTS=ON
+      - name: Build
+        run: cmake --build --preset dev
+      - name: Check test list
+        run: |
+          ctest --preset dev -N | tee ctest-list.txt
+          for t in yanterm_ssh_tests yanterm_ssh_openssh_interop; do
+            grep -Eq "Test +#[0-9]+: ${t}\$" ctest-list.txt || { echo "::error::test not registered: ${t}"; exit 1; }
+          done
+      - name: Test
+        run: ctest --preset dev
+
+  clang18-tongsuo:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+      - name: Install OpenSSH and clang-tools-18
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y openssh-server openssh-client clang-tools-18
+          sudo install -d -m 0755 /run/sshd
+          test -d /run/sshd
+          test -x /usr/sbin/sshd
+      - name: Tongsuo cache key
+        id: tongsuo-key
+        run: |
+          echo "image=${ImageOS}" >> "$GITHUB_OUTPUT"
+          echo "gcc=$(gcc -dumpfullversion)" >> "$GITHUB_OUTPUT"
+      - name: Restore Tongsuo
+        uses: actions/cache@v6
+        with:
+          path: .deps/openssl
+          key: tongsuo-8.5.0-${{ runner.os }}-${{ steps.tongsuo-key.outputs.image }}-gcc${{ steps.tongsuo-key.outputs.gcc }}-${{ hashFiles('scripts/bootstrap-openssl.sh') }}
+      - name: Build Tongsuo
+        run: scripts/bootstrap-openssl.sh
+      - name: Versions
+        run: |
+          /usr/lib/llvm-18/bin/clang++ --version
+          dpkg-query -W clang-tools-18 openssh-server openssh-client
+          .deps/openssl/bin/openssl version
+          grep -E '# *define (TONGSUO|OPENSSL)_VERSION_TEXT' .deps/openssl/include/openssl/opensslv.h
+          { /usr/sbin/sshd -V 2>&1 || true; } | grep -m1 OpenSSH_ || true
+          cmake --version
+      - name: Configure
+        run: cmake --preset clang -DYANTERM_SSH_INTEROP_TESTS=ON
+      - name: Build
+        run: cmake --build --preset clang
+      - name: Check test list
+        run: |
+          ctest --preset clang -N | tee ctest-list.txt
+          for t in yanterm_ssh_tests yanterm_ssh_openssh_interop yanterm_ssh_module_corral yanterm_ssh_module_openssl yanterm_ssh_module_mixed; do
+            grep -Eq "Test +#[0-9]+: ${t}\$" ctest-list.txt || { echo "::error::test not registered: ${t}"; exit 1; }
+          done
+      - name: Test
+        run: ctest --preset clang
+
+  gcc15:
+    runs-on: ubuntu-26.04
+    steps:
+      - uses: actions/checkout@v7
+      - name: Install OpenSSH
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y openssh-server openssh-client
+          sudo install -d -m 0755 /run/sshd
+          test -d /run/sshd
+          test -x /usr/sbin/sshd
+      - name: Versions
+        run: |
+          c++ --version
+          openssl version
+          dpkg-query -W libssl-dev openssh-server openssh-client
+          { /usr/sbin/sshd -V 2>&1 || true; } | grep -m1 OpenSSH_ || true
+          cmake --version
+      - name: Configure (dev)
+        run: cmake --preset dev -DOPENSSL_ROOT_DIR= -DOPENSSL_USE_STATIC_LIBS=OFF -DYANTERM_SSH_INTEROP_TESTS=ON
+      - name: Build (dev)
+        run: cmake --build --preset dev
+      - name: Check test list (dev)
+        run: |
+          ctest --preset dev -N | tee ctest-list.txt
+          for t in yanterm_ssh_tests yanterm_ssh_openssh_interop; do
+            grep -Eq "Test +#[0-9]+: ${t}\$" ctest-list.txt || { echo "::error::test not registered: ${t}"; exit 1; }
+          done
+      - name: Test (dev)
+        run: ctest --preset dev
+      - name: Configure (release)
+        run: cmake --preset release -DOPENSSL_ROOT_DIR= -DOPENSSL_USE_STATIC_LIBS=OFF -DYANTERM_SSH_INTEROP_TESTS=ON
+      - name: Build (release)
+        run: cmake --build --preset release
+      - name: Check test list (release)
+        run: |
+          ctest --test-dir build/release -N | tee ctest-list-release.txt
+          for t in yanterm_ssh_tests yanterm_ssh_openssh_interop; do
+            grep -Eq "Test +#[0-9]+: ${t}\$" ctest-list-release.txt || { echo "::error::test not registered: ${t}"; exit 1; }
+          done
+      - name: Test (release)
+        run: ctest --test-dir build/release --output-on-failure
+
+  gcc15-asan:
+    runs-on: ubuntu-26.04
+    steps:
+      - uses: actions/checkout@v7
+      - name: Install OpenSSH
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y openssh-server openssh-client
+          sudo install -d -m 0755 /run/sshd
+          test -d /run/sshd
+          test -x /usr/sbin/sshd
+      - name: Versions
+        run: |
+          c++ --version
+          openssl version
+          dpkg-query -W libssl-dev openssh-server openssh-client
+          { /usr/sbin/sshd -V 2>&1 || true; } | grep -m1 OpenSSH_ || true
+          cmake --version
+      - name: Configure
+        run: cmake --preset asan -DOPENSSL_ROOT_DIR= -DOPENSSL_USE_STATIC_LIBS=OFF -DYANTERM_SSH_INTEROP_TESTS=ON
+      - name: Build
+        run: cmake --build --preset asan
+      - name: Check test list
+        run: |
+          ctest --preset asan -N | tee ctest-list.txt
+          for t in yanterm_ssh_tests yanterm_ssh_openssh_interop; do
+            grep -Eq "Test +#[0-9]+: ${t}\$" ctest-list.txt || { echo "::error::test not registered: ${t}"; exit 1; }
+          done
+      - name: Test
+        run: ctest --preset asan

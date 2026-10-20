@@ -79,6 +79,7 @@ if(OpenSSL_FOUND)
     set_tests_properties(yanterm_ssh_openssh_interop PROPERTIES
         LABELS "interop"
         DISABLED $<NOT:$<BOOL:${YANTERM_SSH_INTEROP_TESTS}>>
+        SKIP_RETURN_CODE 77
         ENVIRONMENT
             "YANTERM_SSH_BUILD_DIR=${PROJECT_BINARY_DIR};YANTERM_SSH_CORPUS_DIR=${PROJECT_SOURCE_DIR}/corpus;YANTERM_SSH_INTEROP_TOOL=$<TARGET_FILE:yanterm-ssh-interop-handshake>;YANTERM_SSH_INTEROP_AUTH_TOOL=$<TARGET_FILE:yanterm-ssh-interop-auth>;YANTERM_SSH_INTEROP_CHAN_TOOL=$<TARGET_FILE:yanterm-ssh-interop-channels>"
     )
