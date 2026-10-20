@@ -16,8 +16,8 @@ if [[ ! -x "$TOOL" ]]; then
   exit 1
 fi
 if [[ ! -x "$SSHD_BIN" ]]; then
-  echo "sshd not found: $SSHD_BIN" >&2
-  exit 1
+  echo "sshd not found: $SSHD_BIN; skipping" >&2
+  exit 77
 fi
 
 # OpenSSH version string for corpus filenames (host may be 8.9p1, not 9.6).
