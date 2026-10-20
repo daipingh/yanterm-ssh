@@ -19,9 +19,13 @@ using namespace yanterm::ssh;
 
 namespace {
 
-crypto::provider prov() {
+crypto::openssl_backend &backend() {
     static crypto::openssl_backend backend;
-    return crypto::provider::wrap(backend);
+    return backend;
+}
+
+crypto::provider prov() {
+    return crypto::provider::wrap(backend());
 }
 
 std::vector<std::byte> unhex(std::string_view s) {
@@ -72,8 +76,9 @@ const auto k_qs = unhex(
     return prov().new_signing_key(key);
 }
 
-// Fixed-key agreement through kex_group_agree, the function provider::kex_agree
-// calls. Role comes from kex_id. signing_key owns the key; the kex only borrows it.
+// Fixed-key agreement through the backend's kex_agree, the function
+// provider::kex_agree calls. Role comes from kex_id. signing_key owns the key;
+// the kex only borrows it.
 [[nodiscard]] bool fixed_key_agree(const crypto::signing_key& self, crypto::kex_id id,
                                    std::span<const std::byte> peer, unsigned char out[32]) {
     auto* sk = static_cast<crypto::detail::openssl_signing_key*>(self.get());
@@ -82,7 +87,7 @@ const auto k_qs = unhex(
     kex.id = id;
     kex.pkey = sk->pkey;
     std::size_t len = 0;
-    const bool ok = crypto::detail::ossl::kex_group_agree(
+    const bool ok = backend().kex_agree(
         &kex, peer.data(), peer.size(), reinterpret_cast<std::byte*>(out), 32, &len);
     kex.pkey = nullptr;
     return ok && len == 32;

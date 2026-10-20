@@ -19,14 +19,12 @@
 #include <cstring>
 #include <new>
 #include <span>
-#include <type_traits>
 
 namespace yanterm::ssh::crypto {
 
-// Shared OpenSSL primitives and helpers used by both detail/ossl3.hpp and
-// detail/ossl1_1.hpp. Everything in this header must compile cleanly on
-// OpenSSL 1.1.1+ AND without deprecation warnings on OpenSSL 3.0+.
-struct openssl_backend;
+// Shared OpenSSL primitives and helpers used by both openssl3.hpp and
+// openssl11.hpp. Everything in this header must compile cleanly on OpenSSL
+// 1.1.1+ AND without deprecation warnings on OpenSSL 3.0+.
 
 namespace detail {
 
@@ -96,49 +94,6 @@ struct openssl_cipher {
     cipher_id id{};
 };
 
-[[nodiscard]] inline bool aead_partial_overlap(const std::byte* in, std::byte* out,
-                                               std::size_t len) noexcept {
-    if (len == 0 || in == out) return false;
-    const auto* in_u = reinterpret_cast<const unsigned char*>(in);
-    auto* out_u = reinterpret_cast<unsigned char*>(out);
-    return in_u < out_u + len && out_u < in_u + len;
-}
-
-[[nodiscard]] inline bool aead_begin(EVP_CIPHER_CTX* ctx, bool encrypt,
-                                     const std::byte* iv, std::size_t ivlen,
-                                     const std::byte* aad, std::size_t aadlen) noexcept {
-    if (ctx == nullptr || ivlen != 12) return false;
-    if (aadlen > static_cast<std::size_t>(INT_MAX)) return false;
-    const unsigned char* ivp = reinterpret_cast<const unsigned char*>(iv);
-    if (encrypt) {
-        if (EVP_EncryptInit_ex(ctx, nullptr, nullptr, nullptr, ivp) != 1) return false;
-    } else if (EVP_DecryptInit_ex(ctx, nullptr, nullptr, nullptr, ivp) != 1) {
-        return false;
-    }
-    if (aadlen == 0) return true;
-    int aad_outl = 0;
-    const unsigned char* aadp = reinterpret_cast<const unsigned char*>(aad);
-    if (encrypt) {
-        return EVP_EncryptUpdate(ctx, nullptr, &aad_outl, aadp, static_cast<int>(aadlen)) == 1;
-    }
-    return EVP_DecryptUpdate(ctx, nullptr, &aad_outl, aadp, static_cast<int>(aadlen)) == 1;
-}
-
-[[nodiscard]] inline bool aead_update(EVP_CIPHER_CTX* ctx, bool encrypt,
-                                      const std::byte* in, std::byte* out,
-                                      std::size_t len) noexcept {
-    if (ctx == nullptr) return false;
-    if (len == 0) return true;
-    if (len > static_cast<std::size_t>(INT_MAX)) return false;
-    if (aead_partial_overlap(in, out, len)) return false;
-    int n = 0;
-    auto* outp = reinterpret_cast<unsigned char*>(out);
-    const auto* inp = reinterpret_cast<const unsigned char*>(in);
-    const int ok = encrypt
-                       ? EVP_EncryptUpdate(ctx, outp, &n, inp, static_cast<int>(len))
-                       : EVP_DecryptUpdate(ctx, outp, &n, inp, static_cast<int>(len));
-    return ok == 1 && static_cast<std::size_t>(n) == len;
-}
 
 [[nodiscard]] inline int ec_curve_nid(kex_id id) noexcept {
     switch (id) {
@@ -322,24 +277,6 @@ struct openssl_signing_key {
     BN_clear_free(p1);
     BN_CTX_free(ctx);
     return ok;
-}
-
-// Derives uncompressed EC public point bytes from private scalar d on curve nid.
-[[nodiscard]] inline std::size_t ec_derive_uncompressed_pub(int nid, const BIGNUM* d,
-                                                            unsigned char* out,
-                                                            std::size_t cap) noexcept {
-    if (nid == NID_undef || d == nullptr || out == nullptr) return 0;
-    EC_GROUP* group = EC_GROUP_new_by_curve_name(nid);
-    EC_POINT* point = group != nullptr ? EC_POINT_new(group) : nullptr;
-    std::size_t pub_len = 0;
-    if (group != nullptr && point != nullptr
-        && EC_POINT_mul(group, point, d, nullptr, nullptr, nullptr) == 1) {
-        pub_len = EC_POINT_point2oct(group, point, POINT_CONVERSION_UNCOMPRESSED,
-                                     out, cap, nullptr);
-    }
-    EC_POINT_free(point);
-    EC_GROUP_free(group);
-    return pub_len;
 }
 
 // RFC 4253 §8: require 1 < f < p - 1 for finite-field DH peer public values.
@@ -625,28 +562,6 @@ err:
     return ret == 1;
 }
 
-// ECDH x-coordinate on SM2 using EC_POINT_mul directly.
-[[nodiscard]] inline bool sm2_ecdh_x_points(unsigned char out[32], const EC_GROUP* group,
-                                            const BIGNUM* d, const EC_POINT* peer) noexcept {
-    if (out == nullptr || group == nullptr || d == nullptr || peer == nullptr) return false;
-    BN_CTX* ctx = BN_CTX_new();
-    EC_POINT* p = EC_POINT_new(group);
-    BIGNUM* x = BN_new();
-    int ok = 0;
-    if (ctx != nullptr && p != nullptr && x != nullptr
-        && EC_POINT_mul(group, p, nullptr, peer, d, ctx) == 1
-        && EC_POINT_is_at_infinity(group, p) != 1
-        && EC_POINT_get_affine_coordinates(group, p, x, nullptr, ctx) == 1
-        && BN_bn2binpad(x, out, static_cast<int>(sm2_field_bytes))
-               == static_cast<int>(sm2_field_bytes)) {
-        ok = 1;
-    }
-    BN_clear_free(x);
-    EC_POINT_clear_free(p);
-    BN_CTX_free(ctx);
-    return ok == 1;
-}
-
 [[nodiscard]] inline bool generate_ed25519(private_key_material* out, std::byte* storage,
                                            std::size_t cap, std::size_t& used) noexcept {
     EVP_PKEY_CTX* c = EVP_PKEY_CTX_new_id(EVP_PKEY_ED25519, nullptr);
@@ -890,66 +805,165 @@ err:
     return false;
 }
 
-#define YANTERM_SSH_ASSERT_OPENSSL_OPS(NS)                                                 \
-    static_assert(sizeof(NS::openssl_hmac) > 0);                                           \
-    static_assert(sizeof(NS::openssl_kex) > 0);                                            \
-    static_assert(std::is_same_v<decltype(&NS::openssl_supports),                          \
-                                 bool (*)(primitive_kind, std::uint8_t) noexcept>);        \
-    static_assert(std::is_same_v<decltype(&NS::hmac_new),                                  \
-                                 void* (*)(hash_id, const std::byte*, std::size_t) noexcept>); \
-    static_assert(std::is_same_v<decltype(&NS::hmac_free), void (*)(void*) noexcept>);     \
-    static_assert(std::is_same_v<decltype(&NS::hmac_update),                               \
-                                 void (*)(void*, const std::byte*, std::size_t) noexcept>); \
-    static_assert(std::is_same_v<decltype(&NS::hmac_final),                                \
-                                 bool (*)(void*, std::byte*) noexcept>);                   \
-    static_assert(std::is_same_v<decltype(&NS::poly1305),                                  \
-                                 bool (*)(const std::byte*, const std::byte*, std::size_t, \
-                                          std::byte*) noexcept>);                          \
-    static_assert(std::is_same_v<decltype(&NS::aead_init_cipher),                          \
-                                 bool (*)(EVP_CIPHER_CTX*, const EVP_CIPHER*,              \
-                                          const unsigned char*, bool) noexcept>);          \
-    static_assert(std::is_same_v<decltype(&NS::aead_get_tag),                              \
-                                 bool (*)(EVP_CIPHER_CTX*, std::byte*) noexcept>);         \
-    static_assert(std::is_same_v<decltype(&NS::aead_set_tag),                              \
-                                 bool (*)(EVP_CIPHER_CTX*, std::byte*) noexcept>);         \
-    static_assert(std::is_same_v<decltype(&NS::sm2_za_digest_init),                        \
-                                 bool (*)(EVP_MD_CTX*, EVP_PKEY*, bool,                    \
-                                          EVP_PKEY_CTX**) noexcept>);                      \
-    static_assert(std::is_same_v<decltype(&NS::kex_init_group),                            \
-                                 bool (*)(NS::openssl_kex*, kex_id) noexcept>);            \
-    static_assert(std::is_same_v<decltype(&NS::kex_cleanup),                               \
-                                 void (*)(NS::openssl_kex*) noexcept>);                    \
-    static_assert(std::is_same_v<decltype(&NS::kex_group_public),                          \
-                                 bool (*)(NS::openssl_kex*, std::byte*, std::size_t,       \
-                                          std::size_t*) noexcept>);                        \
-    static_assert(std::is_same_v<decltype(&NS::kex_group_agree),                           \
-                                 bool (*)(NS::openssl_kex*, const std::byte*, std::size_t, \
-                                          std::byte*, std::size_t, std::size_t*) noexcept>); \
-    static_assert(std::is_same_v<decltype(&NS::generate_ecdsa),                            \
-                                 bool (*)(sig_id, private_key_material*, std::byte*,       \
-                                          std::size_t, std::size_t&) noexcept>);           \
-    static_assert(std::is_same_v<decltype(&NS::generate_rsa),                              \
-                                 bool (*)(std::uint32_t, private_key_material*, std::byte*, \
-                                          std::size_t, std::size_t&) noexcept>);           \
-    static_assert(std::is_same_v<decltype(&NS::ecdsa_signing_key_new),                     \
-                                 void* (*)(const private_key_material*) noexcept>);        \
-    static_assert(std::is_same_v<decltype(&NS::rsa_signing_key_new),                       \
-                                 void* (*)(const private_key_material*) noexcept>);        \
-    static_assert(std::is_same_v<decltype(&NS::ec_sig_from_public),                        \
-                                 EVP_PKEY* (*)(sig_id, std::span<const std::byte>) noexcept>); \
-    static_assert(std::is_same_v<decltype(&NS::rsa_from_public),                           \
-                                 EVP_PKEY* (*)(std::span<const std::byte>,                 \
-                                               std::span<const std::byte>) noexcept>);     \
-    static_assert(std::is_same_v<decltype(&NS::set_rsa_pkcs1_pad),                         \
-                                 bool (*)(EVP_PKEY_CTX*) noexcept>);                       \
-    static_assert(std::is_same_v<decltype(&NS::verify_sm2_ecdsa),                          \
-                                 bool (*)(std::span<const std::byte>, const std::byte*,    \
-                                          std::size_t, std::span<const std::byte>,         \
-                                          std::span<const std::byte>) noexcept>);          \
-    static_assert(std::is_same_v<decltype(&NS::sign_sm2_ecdsa),                            \
-                                 bool (*)(openssl_signing_key*, const std::byte*,          \
-                                          std::size_t, std::byte*, std::size_t,            \
-                                          std::size_t*) noexcept>)
+// Members both OpenSSL API generations implement identically; ossl3 and
+// ossl1_1 openssl_backend derive from it. Stateless: OpenSSL keeps its own
+// global state. The derived types exist so callers own an object whose
+// lifetime bounds the provider handle.
+struct openssl_backend_base {
+    bool random_bytes(std::byte* out, std::size_t len) noexcept {
+        return RAND_bytes(reinterpret_cast<unsigned char*>(out),
+                          static_cast<int>(len)) == 1;
+    }
+
+    bool constant_time_eq(const std::byte* a, const std::byte* b, std::size_t len) noexcept {
+        return CRYPTO_memcmp(a, b, len) == 0;
+    }
+
+    void* hash_new(hash_id id) noexcept {
+        const EVP_MD* md = evp_md(id);
+        if (md == nullptr) return nullptr;
+        auto* h = new (std::nothrow) openssl_hash{};
+        if (h == nullptr) return nullptr;
+        h->ctx = EVP_MD_CTX_new();
+        h->md = md;
+        if (h->ctx == nullptr || EVP_DigestInit_ex(h->ctx, md, nullptr) != 1) {
+            if (h->ctx != nullptr) EVP_MD_CTX_free(h->ctx);
+            delete h;
+            return nullptr;
+        }
+        return h;
+    }
+
+    void hash_free(void* ctx) noexcept {
+        auto* h = static_cast<openssl_hash*>(ctx);
+        if (h == nullptr) return;
+        if (h->ctx != nullptr) EVP_MD_CTX_free(h->ctx);
+        delete h;
+    }
+
+    void hash_update(void* ctx, const std::byte* in, std::size_t len) noexcept {
+        auto* h = static_cast<openssl_hash*>(ctx);
+        EVP_DigestUpdate(h->ctx, in, len);
+    }
+
+    bool hash_final(void* ctx, std::byte* out) noexcept {
+        auto* h = static_cast<openssl_hash*>(ctx);
+        unsigned int n = 0;
+        if (EVP_DigestFinal_ex(h->ctx, reinterpret_cast<unsigned char*>(out), &n) != 1) {
+            return false;
+        }
+        // EVP_DigestFinal_ex leaves the context unusable; re-init with the
+        // cached md so the handle can hash again.
+        return EVP_DigestInit_ex(h->ctx, h->md, nullptr) == 1;
+    }
+
+    void* cipher_new(cipher_id id, const std::byte* key, std::size_t keylen,
+                     bool encrypt) noexcept {
+        const EVP_CIPHER* stream = evp_stream_cipher(id);
+        const EVP_CIPHER* cbc_evp = evp_cbc_cipher(id);
+        const EVP_CIPHER* c = stream != nullptr ? stream : cbc_evp;
+        if (c == nullptr || keylen != cipher_key_size(id)) return nullptr;
+        auto* st = new (std::nothrow) openssl_cipher{};
+        if (st == nullptr) return nullptr;
+        st->ctx = EVP_CIPHER_CTX_new();
+        st->encrypt = encrypt;
+        st->id = id;
+        const auto* k = reinterpret_cast<const unsigned char*>(key);
+        const bool cbc = cbc_evp != nullptr;
+        const int ok = (cbc ? (encrypt ? EVP_EncryptInit_ex(st->ctx, c, nullptr, k, nullptr)
+                                       : EVP_DecryptInit_ex(st->ctx, c, nullptr, k, nullptr))
+                            : EVP_EncryptInit_ex(st->ctx, c, nullptr, k, nullptr));
+        if (st->ctx == nullptr || ok != 1 || EVP_CIPHER_CTX_set_padding(st->ctx, 0) != 1) {
+            if (st->ctx != nullptr) EVP_CIPHER_CTX_free(st->ctx);
+            delete st;
+            return nullptr;
+        }
+        return st;
+    }
+
+    void cipher_free(void* ctx) noexcept {
+        auto* st = static_cast<openssl_cipher*>(ctx);
+        if (st == nullptr) return;
+        if (st->ctx != nullptr) EVP_CIPHER_CTX_free(st->ctx);
+        delete st;
+    }
+
+    bool cipher_set_iv(void* ctx, const std::byte* iv, std::size_t ivlen) noexcept {
+        auto* st = static_cast<openssl_cipher*>(ctx);
+        if (st == nullptr || st->ctx == nullptr || ivlen != 16) return false;
+        const auto* ivp = reinterpret_cast<const unsigned char*>(iv);
+        const bool cbc = evp_cbc_cipher(st->id) != nullptr;
+        if (cbc && !st->encrypt) {
+            return EVP_DecryptInit_ex(st->ctx, nullptr, nullptr, nullptr, ivp) == 1;
+        }
+        return EVP_EncryptInit_ex(st->ctx, nullptr, nullptr, nullptr, ivp) == 1;
+    }
+
+    bool cipher_update(void* ctx, const std::byte* in, std::byte* out,
+                       std::size_t len) noexcept {
+        auto* st = static_cast<openssl_cipher*>(ctx);
+        if (st == nullptr || st->ctx == nullptr) return false;
+        if (len == 0) return true;
+        if (len > static_cast<std::size_t>(INT_MAX)) return false;
+        if (evp_cbc_cipher(st->id) != nullptr && len % 16u != 0) return false;
+        int n = 0;
+        auto* outp = reinterpret_cast<unsigned char*>(out);
+        const auto* inp = reinterpret_cast<const unsigned char*>(in);
+        const bool cbc_dec = evp_cbc_cipher(st->id) != nullptr && !st->encrypt;
+        const int ok = cbc_dec
+                           ? EVP_DecryptUpdate(st->ctx, outp, &n, inp, static_cast<int>(len))
+                           : EVP_EncryptUpdate(st->ctx, outp, &n, inp, static_cast<int>(len));
+        return ok == 1 && static_cast<std::size_t>(n) == len;
+    }
+
+    void aead_free(void* ctx) noexcept {
+        auto* a = static_cast<openssl_aead*>(ctx);
+        if (a == nullptr) return;
+        if (a->ctx != nullptr) EVP_CIPHER_CTX_free(a->ctx);
+        delete a;
+    }
+
+    bool aead_begin(void* ctx, const std::byte* iv, std::size_t ivlen,
+                    const std::byte* aad, std::size_t aadlen) noexcept {
+        auto* a = static_cast<openssl_aead*>(ctx);
+        if (a == nullptr || a->ctx == nullptr || ivlen != 12) return false;
+        if (aadlen > static_cast<std::size_t>(INT_MAX)) return false;
+        const auto* ivp = reinterpret_cast<const unsigned char*>(iv);
+        if (a->encrypt) {
+            if (EVP_EncryptInit_ex(a->ctx, nullptr, nullptr, nullptr, ivp) != 1) return false;
+        } else if (EVP_DecryptInit_ex(a->ctx, nullptr, nullptr, nullptr, ivp) != 1) {
+            return false;
+        }
+        if (aadlen == 0) return true;
+        int aad_outl = 0;
+        const auto* aadp = reinterpret_cast<const unsigned char*>(aad);
+        const int aadn = static_cast<int>(aadlen);
+        return (a->encrypt ? EVP_EncryptUpdate(a->ctx, nullptr, &aad_outl, aadp, aadn)
+                           : EVP_DecryptUpdate(a->ctx, nullptr, &aad_outl, aadp, aadn)) == 1;
+    }
+
+    bool aead_update(void* ctx, const std::byte* in, std::byte* out,
+                     std::size_t len) noexcept {
+        auto* a = static_cast<openssl_aead*>(ctx);
+        if (a == nullptr || a->ctx == nullptr) return false;
+        if (len == 0) return true;
+        if (len > static_cast<std::size_t>(INT_MAX)) return false;
+        int n = 0;
+        auto* outp = reinterpret_cast<unsigned char*>(out);
+        const auto* inp = reinterpret_cast<const unsigned char*>(in);
+        const int ok = a->encrypt
+                           ? EVP_EncryptUpdate(a->ctx, outp, &n, inp, static_cast<int>(len))
+                           : EVP_DecryptUpdate(a->ctx, outp, &n, inp, static_cast<int>(len));
+        return ok == 1 && static_cast<std::size_t>(n) == len;
+    }
+
+    void signing_key_free(void* handle) noexcept {
+        auto* sk = static_cast<openssl_signing_key*>(handle);
+        if (sk == nullptr) return;
+        if (sk->pkey != nullptr) EVP_PKEY_free(sk->pkey);
+        delete sk;
+    }
+};
 
 }  // namespace detail
 }  // namespace yanterm::ssh::crypto

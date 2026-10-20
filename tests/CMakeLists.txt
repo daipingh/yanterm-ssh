@@ -29,11 +29,12 @@ foreach(_hdr IN LISTS _yanterm_ssh_sc_headers)
     endif()
     # OpenSSL backends need OpenSSL headers. The OpenSSL 3 implementation does
     # not parse against 1.1.1, so skip it when the found Crypto is older.
-    if(NOT OpenSSL_FOUND AND _hdr MATCHES "/crypto/(openssl[.]hpp$|detail/openssl(3|11|_common)[.]hpp$)")
+    if(NOT OpenSSL_FOUND
+       AND _hdr MATCHES "/crypto/(openssl(3|11)?[.]hpp|detail/ossl[^/]*[.]hpp)$")
         continue()
     endif()
     if(OpenSSL_FOUND AND OPENSSL_VERSION VERSION_LESS "3.0.0"
-       AND _hdr MATCHES "/crypto/detail/ossl3[.]hpp$")
+       AND _hdr MATCHES "/crypto/openssl3[.]hpp$")
         continue()
     endif()
     file(RELATIVE_PATH _rel "${PROJECT_SOURCE_DIR}/include" "${_hdr}")
@@ -54,7 +55,7 @@ foreach(_hdr IN LISTS _yanterm_ssh_sc_headers)
     # deprecation warnings are the reason the 3.x backend exists; keep them
     # out of this TU so the selected public header stays the warning-free path.
     if(OpenSSL_FOUND AND OPENSSL_VERSION VERSION_GREATER_EQUAL "3.0.0"
-       AND _hdr MATCHES "/crypto/detail/ossl1_1[.]hpp$")
+       AND _hdr MATCHES "/crypto/openssl11[.]hpp$")
         set_source_files_properties("${_cpp}" PROPERTIES
             COMPILE_OPTIONS "-Wno-deprecated-declarations")
     endif()
@@ -164,6 +165,13 @@ if(OpenSSL_FOUND)
         test_session_cancel.cpp
         test_session_memory.cpp
     )
+    # Exercises ossl1_1::openssl_backend next to the default 3.x backend; the
+    # 1.1.1 API it uses is deprecated in OpenSSL 3.
+    if(OPENSSL_VERSION VERSION_GREATER_EQUAL "3.0.0")
+        target_sources(yanterm-ssh-tests PRIVATE test_openssl11_backend.cpp)
+        set_source_files_properties(test_openssl11_backend.cpp PROPERTIES
+            COMPILE_OPTIONS "-Wno-deprecated-declarations")
+    endif()
     target_include_directories(yanterm-ssh-tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
     target_compile_definitions(yanterm-ssh-tests PRIVATE
         YANTERM_SSH_FIXTURE_DIR="${CMAKE_CURRENT_SOURCE_DIR}/fixtures"

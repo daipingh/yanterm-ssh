@@ -495,6 +495,8 @@ encode_streamlocal_forward / decode_streamlocal_forward
 - [yanterm-ssh/crypto/secure_buffer.hpp](include/yanterm-ssh/crypto/secure_buffer.hpp)
 - [yanterm-ssh/crypto/provider.hpp](include/yanterm-ssh/crypto/provider.hpp)
 - [yanterm-ssh/crypto/openssl.hpp](include/yanterm-ssh/crypto/openssl.hpp)
+- [yanterm-ssh/crypto/openssl3.hpp](include/yanterm-ssh/crypto/openssl3.hpp)
+- [yanterm-ssh/crypto/openssl11.hpp](include/yanterm-ssh/crypto/openssl11.hpp)
 
 ### [yanterm-ssh/crypto/algorithms.hpp](include/yanterm-ssh/crypto/algorithms.hpp)
 
@@ -596,7 +598,23 @@ provider::hash
 ```
 namespace yanterm::ssh::crypto
 
-struct openssl_backend          // OpenSSL 后端；经 provider::wrap 接入
+using openssl_backend           // OpenSSL 后端；经 provider::wrap 接入；按编译时版本取 ossl3 或 ossl1_1 的实现
+```
+
+### [yanterm-ssh/crypto/openssl3.hpp](include/yanterm-ssh/crypto/openssl3.hpp)
+
+```
+namespace yanterm::ssh::crypto::ossl3
+
+using openssl_backend           // 基于 OpenSSL 3.x API；需要 OpenSSL 3.0+；上游 OpenSSL 3.x 下不提供 ecgm-sm2-sm3 与 sm2_ecdsa
+```
+
+### [yanterm-ssh/crypto/openssl11.hpp](include/yanterm-ssh/crypto/openssl11.hpp)
+
+```
+namespace yanterm::ssh::crypto::ossl1_1
+
+using openssl_backend           // 基于 OpenSSL 1.1.1 API；在 OpenSSL 3.x 下同样可用（有废弃告警），并提供 ecgm-sm2-sm3 与 sm2_ecdsa；可与 ossl3::openssl_backend 在同一进程并存
 ```
 
 ## 4. 密钥与文件格式

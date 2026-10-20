@@ -21,7 +21,7 @@ yanterm-ssh 实现了 SSH-2 的线上协议与密码学协商，但**自身不�
 - **传输层**：rekey（按字节数与包数阈值）、`ext-info`、strict kex（缓解 Terrapin 攻击）。
 - **密钥与文件格式**：OpenSSH 私钥的解析、生成与序列化（含 bcrypt-pbkdf 口令加密）、公钥、SHA-256 指纹、`known_hosts`、`authorized_keys`。
 - **可替换的加密后端**：自带 OpenSSL 后端；应用也可以自己实现加密后端，只需符合  `crypto::provider` 约束即可。
-- **国密算法**：后端支持时（例如 Tongsuo）可使用 SM2 / SM3 / SM4 相关算法。上游 OpenSSL 3.x 不允许在 SM2 曲线上做 ECDH 和普通 ECDSA，因此 `ecgm-sm2-sm3` 与 Kylin 的 SM2 签名格式仅在 Tongsuo（或 OpenSSL 1.1.1）下可用。
+- **国密算法**：后端支持时（例如 Tongsuo）可使用 SM2 / SM3 / SM4 相关算法。
 - **内存与安全**：明文和密文放在引用计数的页内存里；敏感数据用 `secure_bytes` 等类型承载，释放时擦除。
 - **三种交付形态**：header-only、静态库、C++20 模块（实验性）。
 
