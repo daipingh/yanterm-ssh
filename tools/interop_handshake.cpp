@@ -224,9 +224,9 @@ int main(int argc, char** argv) {
                     twp->resolve_line("accept");
                 }
                 conn.resolve(host->ticket, core::host_key_verdict::accept);
-                // resolve() may finish KEX and queue handshake_done while our
-                // NEWKEYS still sits in pending_output. Record/send it before
-                // emitting later events so traces stay ordered for replay.
+                // resolve() queues our NEWKEYS and SERVICE_REQUEST in
+                // pending_output. Record/send them before emitting later
+                // events so traces stay ordered for replay.
                 if (!flush_output(fd, conn, twp)) return false;
                 if (!pump_inbound(conn, inbound)) return false;
             } else if (std::holds_alternative<testing::recording_handler::handshake_done>(ev)) {

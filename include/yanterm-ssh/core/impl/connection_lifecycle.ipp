@@ -40,7 +40,6 @@ YANTERM_SSH_INLINE void connection::on_unwind() noexcept {
 
 YANTERM_SSH_INLINE std::error_code connection::disconnect(wire::disconnect_reason reason, std::string_view description) {
     if (phase_ == phase::dead) return failure_ ? failure_ : code::invalid_state;
-    if (auth_) auth_->wipe_secrets();
     auto ec = enqueue_disconnect(reason, description);
     phase_ = phase::dead;
     return ec;
@@ -51,7 +50,6 @@ YANTERM_SSH_INLINE std::error_code connection::fail(std::error_code ec, std::str
         failure_ = ec;
         failure_detail_ = detail::clip_failure_detail(std::move(detail));
     }
-    if (auth_) auth_->wipe_secrets();
     return failure_;
 }
 
@@ -71,22 +69,9 @@ YANTERM_SSH_INLINE std::error_code connection::dispatch_payload(memory::detail::
     if (bytes.empty()) return code::invalid_format;
     const auto id = static_cast<wire::msg>(std::to_integer<std::uint8_t>(bytes[0]));
 
-    // RFC 8308 §2.4: a client's EXT_INFO, and a server's first-opportunity
-    // one, is the very next packet after the sender's first NEWKEYS.
-    if (pending_handshake_done_) {
-        pending_handshake_done_ = false;
-        if (id == wire::msg::ext_info) {
-            // Same-flight NEWKEYS + EXT_INFO: apply before handshake_done so
-            // the event carries server_sig_algs.
-            if (auto err = apply_ext_info(bytes)) return err;
-            if (auto err = emit_handshake_done()) return err;
-            note_inbound_packet();
-            return {};
-        }
-        if (auto err = emit_handshake_done()) return err;
-    } else if (role_ == role::server && traffic_armed_ && !ext_info_closed_) {
-        // The server needs nothing from client EXT_INFO before handshake_done,
-        // so the slot stays open across feeds until the next packet arrives.
+    // RFC 8308 §2.4: a client's EXT_INFO may only be the very next packet
+    // after its first NEWKEYS, so the slot closes on whatever comes next.
+    if (role_ == role::server && traffic_armed_ && !ext_info_closed_) {
         ext_info_closed_ = true;
         if (id == wire::msg::ext_info && cfg_.advertise_ext_info) {
             if (auto err = apply_ext_info(bytes)) return err;
@@ -217,10 +202,7 @@ YANTERM_SSH_INLINE std::error_code connection::handle_payload(memory::detail::pa
 }
 
 YANTERM_SSH_INLINE std::error_code connection::emit_handshake_done() {
-    phase_ = phase::established;
-    finish_round();
-    traffic_armed_ = true;
-    reset_traffic_counters();
+    service_ready_ = true;
     notify([](handler& app, connection& self) { app.on_handshake_done(self); });
     return {};
 }
@@ -237,7 +219,11 @@ YANTERM_SSH_INLINE std::error_code connection::emit_rekey_done() {
     // and skipped when the callback already started another rekey.
     if (auto ec = flush_deferred_control()) return ec;
     if (!rekeying_) writes_paused_ = false;
-    notify([](handler& app, connection& self) { app.on_rekey_done(self); });
+    // A peer may rekey before ssh-userauth is accepted; on_rekey_done is only
+    // reported after on_handshake_done.
+    if (service_ready_) {
+        notify([](handler& app, connection& self) { app.on_rekey_done(self); });
+    }
     if (!rekeying_) resume_writes();
     return {};
 }
@@ -264,8 +250,16 @@ YANTERM_SSH_INLINE std::error_code connection::dispatch_app(std::span<const std:
                     detail::format_unexpected_message(static_cast<std::uint8_t>(id),
                                                       static_cast<std::uint8_t>(phase_)));
     };
+    if (!service_ready_) {
+        if (id != wire::msg::service_request && id != wire::msg::service_accept) {
+            return unexpected();
+        }
+        note_inbound_packet();
+        return on_service_message(id, payload);
+    }
     if (is_userauth_or_service(id)) {
-        if (authenticated()) {
+        if (authenticated() || id == wire::msg::service_request
+            || id == wire::msg::service_accept) {
             return unexpected();
         }
         note_inbound_packet();

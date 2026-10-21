@@ -481,16 +481,6 @@ TEST_CASE("second auth_password while outstanding is invalid_state", "[auth][pas
     REQUIRE(ec == code::invalid_state);
     REQUIRE_FALSE(client.conn.failure());
 
-    const auto service_request = collect_output(client.conn);
-    REQUIRE_FALSE(service_request.empty());
-    consume_pending_output(client.conn);
-    feed_bytes(server.conn, service_request);
-
-    const auto service_accept = collect_output(server.conn);
-    REQUIRE_FALSE(service_accept.empty());
-    consume_pending_output(server.conn);
-    feed_bytes(client.conn, service_accept);
-
     const auto userauth = collect_output(client.conn);
     REQUIRE_FALSE(userauth.empty());
     consume_pending_output(client.conn);
@@ -510,9 +500,6 @@ TEST_CASE("password changereq is unexpected_message", "[auth][password]") {
     s.handshake();
     REQUIRE_FALSE(s.sut.conn.auth_password("alice", "s3cret"));
     REQUIRE_FALSE(s.peer.exchange(s.sut));
-    REQUIRE(s.peer.take(wire::msg::service_request));
-    s.peer.send_msg(wire::detail::service_msg{wire::msg::service_accept, service_userauth});
-    REQUIRE_FALSE(s.peer.exchange(s.sut));
     REQUIRE(s.peer.take(wire::msg::userauth_request));
 
     wire::detail::userauth_pk_ok pk;      // 60 号在 password 上下文中是 CHANGEREQ
@@ -525,7 +512,7 @@ TEST_CASE("password changereq is unexpected_message", "[auth][password]") {
 
 TEST_CASE("unknown auth method still emits auth_request", "[auth]") {
     peer_session s{core::role::server};
-    s.peer.request_userauth_service(s.sut);
+    s.handshake();
     wire::writer uw;
     uw.write_byte(static_cast<std::uint8_t>(wire::msg::userauth_request));
     uw.write_string("alice");
@@ -547,7 +534,7 @@ TEST_CASE("unknown auth method still emits auth_request", "[auth]") {
 
 TEST_CASE("password change=true is unexpected_message", "[auth][password]") {
     peer_session s{core::role::server};
-    s.peer.request_userauth_service(s.sut);
+    s.handshake();
     s.sut.handler.events.clear();
     s.peer.send(password_request(true, {"old-secret", "new-secret"}));
     REQUIRE(s.peer.deliver(s.sut) == code::unexpected_message);
@@ -630,7 +617,7 @@ TEST_CASE("rejected password fields on the page are wiped", "[auth][password]") 
             for (auto sec : r.secrets) mr.watch(sec);
             {
                 peer_session s{core::role::server, scripted_peer::sut_config(), &mr};
-                s.peer.request_userauth_service(s.sut);
+                s.handshake();
                 s.sut.handler.events.clear();
                 s.peer.send(r.payload);
                 REQUIRE(s.peer.deliver(s.sut) == r.expect);
@@ -648,7 +635,7 @@ TEST_CASE("kbdint info response count mismatch wipes located secrets", "[auth][k
     mr.watch("beta-secret");
     {
         peer_session s{core::role::server, scripted_peer::sut_config(), &mr};
-        s.peer.request_userauth_service(s.sut);
+        s.handshake();
         wire::detail::userauth_request_kbdint hello;
         hello.user = "alice";
         s.peer.send_msg(hello);
@@ -671,51 +658,4 @@ TEST_CASE("kbdint info response count mismatch wipes located secrets", "[auth][k
     }
     REQUIRE(mr.returned_blocks() > 0);
     REQUIRE_FALSE(mr.leaked());
-}
-
-TEST_CASE("service accept during rekey flushes the retained password", "[auth][password]") {
-    auto p = prov();
-    auto hm = make_ed25519_host(p);
-    auto client = make_client(p);
-    auto server = make_server(p);
-    configure_server(server, hm);
-    handshake_capture cap;
-    REQUIRE(run_handshake(client, server, cap));
-
-    REQUIRE_FALSE(client.conn.auth_password("alice", "s3cret"));
-    REQUIRE_FALSE(client.conn.rekey());
-    const auto client_flight = collect_output(client.conn);
-    REQUIRE_FALSE(client_flight.empty());
-    consume_pending_output(client.conn);
-    feed_bytes(server.conn, client_flight);
-
-    const auto service_accept_and_kex = collect_output(server.conn);
-    REQUIRE_FALSE(service_accept_and_kex.empty());
-    consume_pending_output(server.conn);
-    REQUIRE(password_request(server.handler) == nullptr);
-    feed_bytes(client.conn, service_accept_and_kex);
-
-    const auto during_rekey = collect_output(client.conn);
-    REQUIRE_FALSE(during_rekey.empty());
-    consume_pending_output(client.conn);
-    server.handler.events.clear();
-    feed_bytes(server.conn, during_rekey);
-    REQUIRE(password_request(server.handler) == nullptr);
-
-    server.handler.events.clear();
-    client.handler.events.clear();
-    bool saw_password = false;
-    REQUIRE(run_loopback(
-        client.conn, client.handler, server.conn, server.handler, &client, &server,
-        [&](bool is_client, const recording_handler::recorded_event& ev) {
-            if (is_client) return;
-            if (const auto* req = std::get_if<recording_handler::auth_request>(&ev)) {
-                REQUIRE(req->method == "password");
-                REQUIRE(req->password == "s3cret");
-                saw_password = true;
-            }
-        }));
-    REQUIRE(saw_password);
-    REQUIRE_FALSE(client.conn.failure());
-    REQUIRE_FALSE(server.conn.failure());
 }

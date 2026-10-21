@@ -1,6 +1,7 @@
 #pragma once
 
 #include <yanterm-ssh/detail/config.hpp>
+#include <yanterm-ssh/detail/error.hpp>
 #include <yanterm-ssh/core/detail/auth_state.hpp>
 #include <yanterm-ssh/core/detail/channel_codec.hpp>
 #include <yanterm-ssh/core/detail/channel_slots.hpp>
@@ -399,12 +400,31 @@ private:
         return authenticated_ || (auth_ && auth_->authenticated());
     }
 
-    std::error_code auth_begin_request();
-    std::error_code auth_send_request();
-    std::error_code auth_send_none();
-    std::error_code auth_send_password();
-    std::error_code auth_send_publickey();
-    std::error_code auth_send_kbdint();
+    std::error_code send_service_request();
+    std::error_code on_service_message(wire::msg id, std::span<const std::byte> payload);
+
+    // invalid_state and unsupported_algorithm leave the connection usable.
+    template <class Fn>
+    [[nodiscard]] std::error_code auth_client_start(std::string_view method, bool query, Fn&& send) {
+        if (!auth_ || failure_ || !service_ready_ || phase_ != phase::established || rekeying_) {
+            return code::invalid_state;
+        }
+        if (role_ != role::client || auth_->phase != detail::auth_phase::ready) {
+            return code::invalid_state;
+        }
+        if (auto ec = send()) {
+            if (ec != code::invalid_state && ec != code::unsupported_algorithm) {
+                fail(ec);
+                phase_ = phase::dead;
+            }
+            return ec;
+        }
+        auth_->method.assign(method.begin(), method.end());
+        auth_->publickey_query = query;
+        auth_->phase = detail::auth_phase::wait_userauth_reply;
+        return {};
+    }
+
     std::error_code auth_send_failure(std::string_view methods, bool partial);
     void auth_notify_result();
     std::error_code auth_on_payload(std::span<const std::byte> payload,
@@ -444,7 +464,10 @@ private:
 
     std::deque<memory::detail::page_slice> out_segments_;
     std::size_t out_bytes_ = 0;
-    bool pending_handshake_done_ = false;
+    // ssh-userauth accepted (client: SERVICE_ACCEPT seen; server: ACCEPT
+    // written). Orthogonal to phase_ because a peer rekey may run between the
+    // first NEWKEYS and this point.
+    bool service_ready_ = false;
 
     struct kex_round {
         std::optional<detail::local_algorithms> local_algs;
@@ -470,7 +493,7 @@ private:
     // Server only: the packet right after the client's first NEWKEYS has been
     // seen, so no further client EXT_INFO is accepted.
     bool ext_info_closed_ = false;
-    bool traffic_armed_ = false;  // count volume only after first NEWKEYS completes
+    bool traffic_armed_ = false;  // count volume only after the first inbound NEWKEYS
 
     bool advertised_ssh_rsa() const noexcept;
 

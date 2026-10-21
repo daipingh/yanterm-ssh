@@ -18,7 +18,6 @@ YANTERM_SSH_INLINE std::error_code connection::feed(std::span<const std::byte> i
     assert(depth() == 0);
     accepted = 0;
     if (auth_ && auth_->authenticated()) {
-        auth_->wipe_secrets();
         auth_.reset();
         authenticated_ = true;
     }
@@ -65,14 +64,6 @@ YANTERM_SSH_INLINE std::error_code connection::feed(std::span<const std::byte> i
             break;
         }
         if (traffic_armed_) bytes_recv_ += n;
-    }
-
-    // EXT_INFO is optional: never hold handshake_done past this call.
-    if (pending_handshake_done_ && phase_ != phase::dead) {
-        pending_handshake_done_ = false;
-        if (auto err = emit_handshake_done()) {
-            result = fail(err);
-        }
     }
 
     if (traffic_armed_) maybe_auto_rekey();

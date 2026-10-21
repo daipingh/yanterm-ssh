@@ -12,19 +12,34 @@ using namespace yanterm::ssh::testing;
 using auth::auth_verdict;
 using auth::service_userauth;
 
-TEST_CASE("handshake does not send SERVICE_REQUEST", "[auth][service]") {
-    auto p = prov();
-    auto hm = make_ed25519_host(p);
-    auto client = make_client(p);
-    auto server = make_server(p);
-    configure_server(server, hm);
-    handshake_capture cap;
-    REQUIRE(run_handshake(client, server, cap));
-    REQUIRE(client.conn.pending_output_bytes() == 0);
-    REQUIRE(server.conn.pending_output_bytes() == 0);
+TEST_CASE("client requests ssh-userauth immediately after NEWKEYS", "[auth][service]") {
+    peer_session s{core::role::client};
+    s.exchange_keys();
+    const auto& ids = s.peer.seen_ids();
+    REQUIRE(ids.size() >= 2);
+    REQUIRE(ids[ids.size() - 2] == static_cast<std::uint8_t>(wire::msg::newkeys));
+    REQUIRE(ids.back() == static_cast<std::uint8_t>(wire::msg::service_request));
+    const auto req = s.peer.take(wire::msg::service_request);
+    REQUIRE(req);
+    wire::reader reader{*req};
+    wire::detail::service_msg msg;
+    msg.id = wire::msg::service_request;
+    REQUIRE(msg.decode(reader));
+    REQUIRE(reader.empty());
+    REQUIRE(msg.service_name == service_userauth);
+    REQUIRE(s.sut.handler.events.empty());
+
+    s.peer.send_msg(wire::detail::service_msg{wire::msg::service_accept, service_userauth});
+    REQUIRE_FALSE(s.peer.exchange(s.sut));
+    int dones = 0;
+    for (const auto& ev : s.sut.handler.events) {
+        if (std::holds_alternative<recording_handler::handshake_done>(ev)) ++dones;
+    }
+    REQUIRE(dones == 1);
+    REQUIRE_FALSE(s.sut.conn.failure());
 }
 
-TEST_CASE("auth_none triggers service request then none", "[auth][service][none]") {
+TEST_CASE("auth_none sends USERAUTH_REQUEST", "[auth][service][none]") {
     auto p = prov();
     auto hm = make_ed25519_host(p);
     auto client = make_client(p);
@@ -131,7 +146,7 @@ TEST_CASE("feed pauses on server auth_request until resolve", "[auth][service][p
 
 TEST_CASE("unknown service name disconnects service_not_available", "[auth][service]") {
     peer_session s{core::role::server};
-    s.handshake();
+    s.exchange_keys();
     s.peer.send_msg(wire::detail::service_msg{wire::msg::service_request, "ssh-connection"});
     REQUIRE(s.peer.deliver(s.sut) == code::unsupported_service);
     REQUIRE(s.sut.handler.events.empty());
@@ -156,37 +171,44 @@ TEST_CASE("configured auth_banner follows SERVICE_ACCEPT", "[auth][banner]") {
     auto p = prov();
     auto hm = make_ed25519_host(p);
 
-    SECTION("non-empty banner arrives before auth_response") {
+    SECTION("non-empty banner arrives after handshake_done") {
         core::config scfg;
         scfg.auth_banner = "Authorized use only.\n";
         auto client = make_client(p);
         auto server = make_server(p, scfg);
         configure_server(server, hm);
-        handshake_capture cap;
-        REQUIRE(run_handshake(client, server, cap));
+
+        std::vector<std::string_view> order;
+        std::string banner_text;
+        REQUIRE(run_loopback(client, server, [&](bool is_client, const recording_handler::recorded_event& ev) {
+            if (is_client) accept_client_host_key(client, ev);
+            if (!is_client) return;
+            if (std::holds_alternative<recording_handler::handshake_done>(ev)) {
+                order.push_back("handshake_done");
+            }
+            if (const auto* banner = std::get_if<recording_handler::auth_banner>(&ev)) {
+                order.push_back("auth_banner");
+                banner_text.assign(banner->text.begin(), banner->text.end());
+            }
+        }));
+        REQUIRE(order.size() == 2);
+        REQUIRE(order[0] == "handshake_done");
+        REQUIRE(order[1] == "auth_banner");
+        REQUIRE(banner_text == "Authorized use only.\n");
 
         REQUIRE_FALSE(client.conn.auth_none("alice"));
-
         bool saw_banner = false;
         bool saw_response = false;
-        std::string banner_text;
         REQUIRE(run_auth_loopback(client, server, [&](bool is_client, const recording_handler::recorded_event& ev) {
-            if (is_client && std::holds_alternative<recording_handler::auth_banner>(ev)) {
-                saw_banner = true;
-                banner_text.assign(std::get<recording_handler::auth_banner>(ev).text.begin(),
-                                   std::get<recording_handler::auth_banner>(ev).text.end());
-            }
-            if (is_client && std::holds_alternative<recording_handler::auth_response>(ev)) {
-                saw_response = true;
-            }
+            if (is_client && std::holds_alternative<recording_handler::auth_banner>(ev)) saw_banner = true;
+            if (is_client && std::holds_alternative<recording_handler::auth_response>(ev)) saw_response = true;
             if (!is_client && std::holds_alternative<recording_handler::auth_request>(ev)) {
                 server.conn.resolve(std::get<recording_handler::auth_request>(ev).ticket,
                                     auth_verdict::success());
             }
         }));
-        REQUIRE(saw_banner);
+        REQUIRE_FALSE(saw_banner);
         REQUIRE(saw_response);
-        REQUIRE(banner_text == "Authorized use only.\n");
         REQUIRE_FALSE(client.conn.failure());
         REQUIRE_FALSE(server.conn.failure());
     }
@@ -195,19 +217,15 @@ TEST_CASE("configured auth_banner follows SERVICE_ACCEPT", "[auth][banner]") {
         auto client = make_client(p);
         auto server = make_server(p);
         configure_server(server, hm);
-        handshake_capture cap;
-        REQUIRE(run_handshake(client, server, cap));
-
-        REQUIRE_FALSE(client.conn.auth_none("alice"));
-
         bool saw_banner = false;
-        REQUIRE(run_auth_loopback(client, server, [&](bool is_client, const recording_handler::recorded_event& ev) {
-            if (is_client && std::holds_alternative<recording_handler::auth_banner>(ev)) saw_banner = true;
-            if (!is_client && std::holds_alternative<recording_handler::auth_request>(ev)) {
-                server.conn.resolve(std::get<recording_handler::auth_request>(ev).ticket,
-                                    auth_verdict::success());
-            }
+        bool saw_done = false;
+        REQUIRE(run_loopback(client, server, [&](bool is_client, const recording_handler::recorded_event& ev) {
+            if (is_client) accept_client_host_key(client, ev);
+            if (!is_client) return;
+            if (std::holds_alternative<recording_handler::handshake_done>(ev)) saw_done = true;
+            if (std::holds_alternative<recording_handler::auth_banner>(ev)) saw_banner = true;
         }));
+        REQUIRE(saw_done);
         REQUIRE_FALSE(saw_banner);
         REQUIRE_FALSE(client.conn.failure());
         REQUIRE_FALSE(server.conn.failure());
@@ -217,7 +235,7 @@ TEST_CASE("configured auth_banner follows SERVICE_ACCEPT", "[auth][banner]") {
 TEST_CASE("SERVICE_REQUEST during a pending verdict stalls and is rejected after resolve",
           "[auth][service]") {
     peer_session s{core::role::server};
-    s.peer.request_userauth_service(s.sut);
+    s.handshake();
     s.peer.send_msg(wire::detail::userauth_request_none{"alice", "ssh-connection"});
     s.peer.send_msg(wire::detail::service_msg{wire::msg::service_request, service_userauth});
     REQUIRE_FALSE(s.peer.deliver(s.sut));
@@ -231,4 +249,110 @@ TEST_CASE("SERVICE_REQUEST during a pending verdict stalls and is rejected after
     s.peer.collect(s.sut);
     REQUIRE(s.peer.take(wire::msg::userauth_failure));   // 裁决未丢失
     REQUIRE(s.peer.deliver(s.sut) == code::unexpected_message);
+}
+
+namespace {
+
+int count_handshake_done(const recording_handler& handler) {
+    int n = 0;
+    for (const auto& ev : handler.events) {
+        if (std::holds_alternative<recording_handler::handshake_done>(ev)) ++n;
+    }
+    return n;
+}
+
+}  // namespace
+
+TEST_CASE("messages before userauth service is ready", "[auth][service]") {
+    SECTION("client rejects USERAUTH_BANNER") {
+        peer_session s{core::role::client};
+        s.exchange_keys();
+        s.peer.send_msg(wire::detail::userauth_banner{"early", {}});
+        REQUIRE(s.peer.deliver(s.sut) == code::unexpected_message);
+        REQUIRE(s.sut.conn.failure() == code::unexpected_message);
+    }
+    SECTION("client rejects USERAUTH_SUCCESS") {
+        peer_session s{core::role::client};
+        s.exchange_keys();
+        const auto ok = static_cast<std::byte>(wire::msg::userauth_success);
+        s.peer.send(std::span<const std::byte>{&ok, 1});
+        REQUIRE(s.peer.deliver(s.sut) == code::unexpected_message);
+        REQUIRE(s.sut.conn.failure() == code::unexpected_message);
+    }
+    SECTION("client rejects SERVICE_ACCEPT for another name") {
+        peer_session s{core::role::client};
+        s.exchange_keys();
+        s.peer.send_msg(wire::detail::service_msg{wire::msg::service_accept, "ssh-connection"});
+        REQUIRE(s.peer.deliver(s.sut) == code::unsupported_service);
+        REQUIRE(s.sut.conn.failure() == code::unsupported_service);
+    }
+    SECTION("client accepts IGNORE and still reaches handshake_done") {
+        peer_session s{core::role::client};
+        s.exchange_keys();
+        const std::byte data[] = {std::byte{1}};
+        s.peer.send_msg(wire::detail::ignore_msg{data});
+        REQUIRE_FALSE(s.peer.exchange(s.sut));
+        REQUIRE_FALSE(s.sut.conn.failure());
+        REQUIRE(count_handshake_done(s.sut.handler) == 0);
+        bool saw_ignore = false;
+        for (const auto& ev : s.sut.handler.events) {
+            if (std::holds_alternative<recording_handler::ignore_message>(ev)) saw_ignore = true;
+        }
+        REQUIRE(saw_ignore);
+        s.peer.send_msg(wire::detail::service_msg{wire::msg::service_accept, service_userauth});
+        REQUIRE_FALSE(s.peer.exchange(s.sut));
+        REQUIRE(count_handshake_done(s.sut.handler) == 1);
+        REQUIRE_FALSE(s.sut.conn.failure());
+    }
+    SECTION("client accepts DEBUG and still reaches handshake_done") {
+        peer_session s{core::role::client};
+        s.exchange_keys();
+        s.peer.send_msg(wire::detail::debug_msg{false, "hi", {}});
+        REQUIRE_FALSE(s.peer.exchange(s.sut));
+        REQUIRE_FALSE(s.sut.conn.failure());
+        REQUIRE(count_handshake_done(s.sut.handler) == 0);
+        s.peer.send_msg(wire::detail::service_msg{wire::msg::service_accept, service_userauth});
+        REQUIRE_FALSE(s.peer.exchange(s.sut));
+        REQUIRE(count_handshake_done(s.sut.handler) == 1);
+        REQUIRE_FALSE(s.sut.conn.failure());
+    }
+    SECTION("server rejects USERAUTH_REQUEST before SERVICE_REQUEST") {
+        peer_session s{core::role::server};
+        s.exchange_keys();
+        s.peer.send_msg(wire::detail::userauth_request_none{"alice", "ssh-connection"});
+        REQUIRE(s.peer.deliver(s.sut) == code::unexpected_message);
+        REQUIRE(s.sut.conn.failure() == code::unexpected_message);
+        REQUIRE(s.sut.handler.events.empty());
+    }
+    SECTION("server rejects CHANNEL_OPEN before SERVICE_REQUEST") {
+        peer_session s{core::role::server};
+        s.exchange_keys();
+        s.peer.send_msg(wire::detail::channel_open{"session", 1, 32768, 16384, {}});
+        REQUIRE(s.peer.deliver(s.sut) == code::unexpected_message);
+        REQUIRE(s.sut.conn.failure() == code::unexpected_message);
+        REQUIRE(s.sut.handler.events.empty());
+    }
+}
+
+TEST_CASE("auth and rekey before userauth service is ready return invalid_state", "[auth][service]") {
+    SECTION("client") {
+        peer_session s{core::role::client};
+        s.exchange_keys();
+        REQUIRE(s.sut.conn.auth_none("alice") == code::invalid_state);
+        REQUIRE(s.sut.conn.auth_password("alice", "s3cret") == code::invalid_state);
+        REQUIRE(s.sut.conn.auth_publickey("alice", {}, {}) == code::invalid_state);
+        REQUIRE(s.sut.conn.auth_publickey_query("alice", {}, "ssh-ed25519") == code::invalid_state);
+        REQUIRE(s.sut.conn.auth_keyboard_interactive("alice") == code::invalid_state);
+        REQUIRE(s.sut.conn.rekey() == code::invalid_state);
+        REQUIRE_FALSE(s.sut.conn.failure());
+        REQUIRE(count_handshake_done(s.sut.handler) == 0);
+    }
+    SECTION("server") {
+        peer_session s{core::role::server};
+        s.exchange_keys();
+        REQUIRE(s.sut.conn.rekey() == code::invalid_state);
+        REQUIRE(s.sut.conn.send_auth_banner("hi") == code::invalid_state);
+        REQUIRE_FALSE(s.sut.conn.failure());
+        REQUIRE(count_handshake_done(s.sut.handler) == 0);
+    }
 }
