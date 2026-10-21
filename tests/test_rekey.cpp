@@ -541,6 +541,76 @@ TEST_CASE("deferred control is flushed before on_rekey_done", "[rekey]") {
     REQUIRE_FALSE(server.conn.failure());
 }
 
+// RFC 4253 §7.1: userauth packets are held between KEXINIT and NEWKEYS, so the
+// call succeeds and the packet is delivered after the rekey.
+TEST_CASE("userauth packets issued during rekey are sent after NEWKEYS", "[rekey][auth]") {
+    crypto::provider p = prov();
+    auto hm = make_ed25519_host(p);
+    auto client = make_client(p);
+    auto server = make_server(p);
+    configure_server(server, hm);
+    REQUIRE(run_handshake(client, server));
+
+    int client_rekey_done = 0;
+    int server_rekey_done = 0;
+    auto count_rekey = [&](bool is_client, const recording_handler::recorded_event& ev) {
+        if (std::holds_alternative<recording_handler::rekey_done>(ev)) {
+            ++(is_client ? client_rekey_done : server_rekey_done);
+        }
+    };
+
+    SECTION("client auth request") {
+        REQUIRE_FALSE(client.conn.rekey());
+        const auto before = client.conn.pending_output_bytes();
+        REQUIRE_FALSE(client.conn.auth_password("alice", "s3cret"));
+        REQUIRE(client.conn.pending_output_bytes() == before);
+
+        bool saw_request = false;
+        bool saw_ok = false;
+        REQUIRE(run_loopback(client, server, [&](bool is_client, const recording_handler::recorded_event& ev) {
+            count_rekey(is_client, ev);
+            if (const auto* req = std::get_if<recording_handler::auth_request>(&ev)) {
+                // Flushed from on_rekey_done, so the sender has already finished this rekey.
+                REQUIRE(client_rekey_done == 1);
+                REQUIRE(req->password == "s3cret");
+                saw_request = true;
+                REQUIRE_FALSE(server.conn.resolve(req->ticket, auth::auth_verdict::success()));
+            }
+            if (const auto* res = std::get_if<recording_handler::auth_response>(&ev)) {
+                REQUIRE(res->success);
+                saw_ok = true;
+            }
+        }));
+        REQUIRE(saw_request);
+        REQUIRE(saw_ok);
+    }
+
+    SECTION("server banner") {
+        REQUIRE_FALSE(server.conn.rekey());
+        const auto before = server.conn.pending_output_bytes();
+        REQUIRE_FALSE(server.conn.send_auth_banner("welcome"));
+        REQUIRE(server.conn.pending_output_bytes() == before);
+
+        bool saw_banner = false;
+        REQUIRE(run_loopback(client, server, [&](bool is_client, const recording_handler::recorded_event& ev) {
+            count_rekey(is_client, ev);
+            if (const auto* banner = std::get_if<recording_handler::auth_banner>(&ev)) {
+                // Flushed from on_rekey_done, so the sender has already finished this rekey.
+                REQUIRE(server_rekey_done == 1);
+                REQUIRE(is_client);
+                REQUIRE(banner->text == "welcome");
+                saw_banner = true;
+            }
+        }));
+        REQUIRE(saw_banner);
+    }
+
+    REQUIRE(client_rekey_done == 1);
+    REQUIRE(server_rekey_done == 1);
+    REQUIRE_FALSE(client.conn.failure());
+    REQUIRE_FALSE(server.conn.failure());
+}
+
 TEST_CASE("peer rekey before userauth service does not report rekey_done", "[rekey][service]") {
     auto count = [](const recording_handler& handler, auto match) {
         int n = 0;

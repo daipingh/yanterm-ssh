@@ -82,10 +82,10 @@ YANTERM_SSH_INLINE bool auth_resolve_error_is_fatal(std::error_code ec) noexcept
 }
 
 YANTERM_SSH_INLINE std::error_code connection::resolve(auth_ticket ticket, const auth::auth_verdict& v) {
-    if (!auth_ || failure_ || role_ != role::server) return code::invalid_state;
-    // During rekey, phase_ is a KEX state. The verdict is a control packet and
-    // write_control_packet holds it until NEWKEYS, so the callback may resolve.
-    if (phase_ != phase::established && !rekeying_) return code::invalid_state;
+    // Auth packets are control packets: during rekey write_control_packet holds
+    // them until NEWKEYS, so auth calls and resolves are accepted then too.
+    if (!auth_ || !app_traffic_ok()) return code::invalid_state;
+    if (role_ != role::server) return code::invalid_state;
     if (auto ec = auth_resolve_verdict(ticket.seq_, v)) {
         if (auth_resolve_error_is_fatal(ec)) {
             fail(ec);
@@ -97,10 +97,7 @@ YANTERM_SSH_INLINE std::error_code connection::resolve(auth_ticket ticket, const
 }
 
 YANTERM_SSH_INLINE std::error_code connection::resolve(kbdint_ticket ticket, std::span<const std::string_view> responses) {
-    if (!auth_) return code::invalid_state;
-    if (failure_ || phase_ != phase::established || rekeying_) {
-        return code::invalid_state;
-    }
+    if (!auth_ || !app_traffic_ok()) return code::invalid_state;
     if (auto ec = auth_resolve_kbdint(ticket.seq_, responses)) {
         if (auth_resolve_error_is_fatal(ec)) {
             fail(ec);
@@ -195,10 +192,7 @@ YANTERM_SSH_INLINE std::error_code connection::auth_password(std::string_view us
 }
 
 YANTERM_SSH_INLINE std::error_code connection::send_auth_banner(std::string_view text, std::string_view language) {
-    if (!auth_) return code::invalid_state;
-    if (failure_ || !service_ready_ || phase_ != phase::established || rekeying_) {
-        return code::invalid_state;
-    }
+    if (!auth_ || !service_ready_ || !app_traffic_ok()) return code::invalid_state;
     if (role_ != role::server) return code::invalid_state;
     const auto ap = auth_->phase;
     if (ap != detail::auth_phase::ready && ap != detail::auth_phase::wait_app
@@ -210,7 +204,7 @@ YANTERM_SSH_INLINE std::error_code connection::send_auth_banner(std::string_view
     msg.language = language;
     wire::writer payload;
     msg.encode(payload);
-    return write_packet(payload.data());
+    return write_control_packet(payload.data());
 }
 
 YANTERM_SSH_INLINE std::error_code connection::auth_publickey(std::string_view user, std::span<const std::byte> public_blob,

@@ -406,9 +406,7 @@ private:
     // invalid_state and unsupported_algorithm leave the connection usable.
     template <class Fn>
     [[nodiscard]] std::error_code auth_client_start(std::string_view method, bool query, Fn&& send) {
-        if (!auth_ || failure_ || !service_ready_ || phase_ != phase::established || rekeying_) {
-            return code::invalid_state;
-        }
+        if (!auth_ || !service_ready_ || !app_traffic_ok()) return code::invalid_state;
         if (role_ != role::client || auth_->phase != detail::auth_phase::ready) {
             return code::invalid_state;
         }
