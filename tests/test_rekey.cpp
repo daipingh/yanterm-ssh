@@ -14,6 +14,7 @@
 #include "hex_util.hpp"
 #include "loopback.hpp"
 #include "recording_handler.hpp"
+#include "scripted_peer.hpp"
 
 #include <cstddef>
 #include <cstdint>
@@ -294,7 +295,8 @@ TEST_CASE("strict kex resets sequence after rekey NEWKEYS", "[rekey]") {
     REQUIRE_FALSE(client.conn.send_ignore(std::as_bytes(std::span{"a", 1})));
     rekey_capture cap;
     REQUIRE(drive_rekey(client, server, cap));
-    REQUIRE(client.conn.outbound_sequence_number() == 1);
+    // Handshake leaves the client at seq 1 (SERVICE_REQUEST); this IGNORE uses it.
+    REQUIRE(client.conn.outbound_sequence_number() == 2);
 
     REQUIRE_FALSE(client.conn.rekey());
     cap = {};
@@ -537,5 +539,72 @@ TEST_CASE("deferred control is flushed before on_rekey_done", "[rekey]") {
     REQUIRE(globals == 1);
     REQUIRE_FALSE(client.failure());
     REQUIRE_FALSE(server.conn.failure());
+}
+
+TEST_CASE("peer rekey before userauth service does not report rekey_done", "[rekey][service]") {
+    auto count = [](const recording_handler& handler, auto match) {
+        int n = 0;
+        for (const auto& ev : handler.events) {
+            if (match(ev)) ++n;
+        }
+        return n;
+    };
+    auto handshake_n = [&](const recording_handler& handler) {
+        return count(handler, [](const recording_handler::recorded_event& ev) {
+            return std::holds_alternative<recording_handler::handshake_done>(ev);
+        });
+    };
+    auto rekey_n = [&](const recording_handler& handler) {
+        return count(handler, [](const recording_handler::recorded_event& ev) {
+            return std::holds_alternative<recording_handler::rekey_done>(ev);
+        });
+    };
+
+    SECTION("client sees KEXINIT before SERVICE_ACCEPT") {
+        peer_session s{core::role::client};
+        s.exchange_keys();
+        s.peer.start_rekey();
+        REQUIRE_FALSE(s.peer.exchange(s.sut));
+        REQUIRE_FALSE(s.peer.kex_in_progress());
+        REQUIRE_FALSE(s.sut.conn.failure());
+        REQUIRE(handshake_n(s.sut.handler) == 0);
+        REQUIRE(rekey_n(s.sut.handler) == 0);
+
+        s.peer.send_msg(wire::detail::service_msg{wire::msg::service_accept, "ssh-userauth"});
+        REQUIRE_FALSE(s.peer.exchange(s.sut));
+        REQUIRE(handshake_n(s.sut.handler) == 1);
+        REQUIRE(rekey_n(s.sut.handler) == 0);
+
+        s.sut.handler.events.clear();
+        REQUIRE_FALSE(s.sut.conn.rekey());
+        REQUIRE_FALSE(s.peer.exchange(s.sut));
+        REQUIRE(rekey_n(s.sut.handler) == 1);
+        REQUIRE(handshake_n(s.sut.handler) == 0);
+        REQUIRE_FALSE(s.sut.conn.failure());
+    }
+
+    SECTION("server sees KEXINIT before SERVICE_REQUEST") {
+        peer_session s{core::role::server};
+        s.exchange_keys();
+        s.peer.start_rekey();
+        REQUIRE_FALSE(s.peer.exchange(s.sut));
+        REQUIRE_FALSE(s.peer.kex_in_progress());
+        REQUIRE_FALSE(s.sut.conn.failure());
+        REQUIRE(handshake_n(s.sut.handler) == 0);
+        REQUIRE(rekey_n(s.sut.handler) == 0);
+
+        s.peer.send_msg(wire::detail::service_msg{wire::msg::service_request, "ssh-userauth"});
+        REQUIRE_FALSE(s.peer.exchange(s.sut));
+        REQUIRE(s.peer.take(wire::msg::service_accept));
+        REQUIRE(handshake_n(s.sut.handler) == 1);
+        REQUIRE(rekey_n(s.sut.handler) == 0);
+
+        s.sut.handler.events.clear();
+        REQUIRE_FALSE(s.sut.conn.rekey());
+        REQUIRE_FALSE(s.peer.exchange(s.sut));
+        REQUIRE(rekey_n(s.sut.handler) == 1);
+        REQUIRE(handshake_n(s.sut.handler) == 0);
+        REQUIRE_FALSE(s.sut.conn.failure());
+    }
 }
 

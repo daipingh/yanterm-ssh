@@ -100,6 +100,11 @@ YANTERM_SSH_INLINE std::error_code connection::resolve(host_key_ticket ticket, h
         phase_ = phase::dead;
         return err;
     }
+    if (auto err = send_service_request()) {
+        fail(err);
+        phase_ = phase::dead;
+        return err;
+    }
 
     phase_ = phase::wait_newkeys;
     return {};
@@ -107,7 +112,7 @@ YANTERM_SSH_INLINE std::error_code connection::resolve(host_key_ticket ticket, h
 
 YANTERM_SSH_INLINE std::error_code connection::rekey() {
     if (failure_) return failure_;
-    if (phase_ != phase::established) return code::invalid_state;
+    if (!service_ready_ || phase_ != phase::established) return code::invalid_state;
     return begin_rekey();
 }
 
@@ -132,7 +137,7 @@ YANTERM_SSH_INLINE void connection::reset_traffic_counters() noexcept {
 }
 
 YANTERM_SSH_INLINE void connection::maybe_auto_rekey() {
-    if (phase_ != phase::established || rekeying_ || failure_) return;
+    if (!service_ready_ || phase_ != phase::established || rekeying_ || failure_) return;
     if (bytes_sent_ < cfg_.rekey_bytes && bytes_recv_ < cfg_.rekey_bytes
         && packets_sent_ < cfg_.rekey_packets && packets_recv_ < cfg_.rekey_packets) {
         return;
@@ -532,14 +537,12 @@ YANTERM_SSH_INLINE std::error_code connection::on_newkeys() {
 
     if (rekeying_) return emit_rekey_done();
 
-    // RFC 8308 EXT_INFO is MAY. Defer handshake_done just long enough to see
-    // whether the very next unit in this feed is EXT_INFO; feed() emits it
-    // unconditionally before returning.
-    if (role_ == role::client) {
-        pending_handshake_done_ = true;
-        return {};
-    }
-    return emit_handshake_done();
+    // Keys are live both ways; handshake_done waits for ssh-userauth.
+    phase_ = phase::established;
+    finish_round();
+    traffic_armed_ = true;
+    reset_traffic_counters();
+    return {};
 }
 
 YANTERM_SSH_INLINE bool connection::app_traffic_ok() const noexcept {

@@ -8,7 +8,9 @@
 #include <yanterm-ssh/wire/message_ids.hpp>
 #include <yanterm-ssh/wire/detail/messages.hpp>
 #include <yanterm-ssh/wire/types.hpp>
+#include <yanterm-ssh/crypto/algorithms.hpp>
 #include <yanterm-ssh/crypto/openssl.hpp>
+#include <yanterm-ssh/keys/public_key.hpp>
 #include <yanterm-ssh/error.hpp>
 #include <yanterm-ssh/detail/error.hpp>
 
@@ -18,6 +20,7 @@
 #include "recording_handler.hpp"
 #include "scripted_peer.hpp"
 
+#include <array>
 #include <cstddef>
 #include <cstdint>
 #include <fstream>
@@ -189,7 +192,23 @@ TEST_CASE("peer without strict marker accepts IGNORE during initial KEX", "[stri
     REQUIRE(got_ignore);
 
     client.conn.resolve(pending, core::host_key_verdict::accept);
-    REQUIRE(run_handshake(client, server));
+    // The injected IGNORE was not written by the client, so it advances only
+    // the server's inbound sequence. NEWKEYS is still plaintext and must be
+    // accepted; the encrypted SERVICE_REQUEST that follows would fail its MAC.
+    const auto client_out = collect_output(client.conn);
+    REQUIRE(client_out.size() >= 5);
+    const auto pkt_len = (std::uint32_t{std::to_integer<unsigned char>(client_out[0])} << 24)
+                         | (std::uint32_t{std::to_integer<unsigned char>(client_out[1])} << 16)
+                         | (std::uint32_t{std::to_integer<unsigned char>(client_out[2])} << 8)
+                         | std::uint32_t{std::to_integer<unsigned char>(client_out[3])};
+    const auto newkeys_n = std::size_t{4} + pkt_len;
+    REQUIRE(newkeys_n < client_out.size());
+    std::error_code feed_ec;
+    const auto n = feed_all(server.conn, std::span{client_out}.first(newkeys_n), feed_ec);
+    REQUIRE_FALSE(feed_ec);
+    REQUIRE(n == newkeys_n);
+    REQUIRE_FALSE(server.conn.failure());
+    REQUIRE_FALSE(client.conn.failure());
     REQUIRE_FALSE(client.conn.negotiated()->strict_kex);
 }
 
@@ -201,14 +220,14 @@ TEST_CASE("strict kex resets outbound sequence after NEWKEYS", "[strict_kex]") {
     configure_server(server, hm);
     REQUIRE(run_handshake(client, server));
     REQUIRE(client.conn.negotiated()->strict_kex);
-    // After NEWKEYS + reset, the next outbound packet uses sequence 0.
-    // Client has not sent anything after NEWKEYS → still 0.
-    // Server sent EXT_INFO immediately after NEWKEYS at seq 0 → now 1.
-    REQUIRE(client.conn.outbound_sequence_number() == 0);
-    REQUIRE(server.conn.outbound_sequence_number() == 1);
+    // Strict KEX resets the sequence at NEWKEYS. The handshake then sends one
+    // more packet each way: the client's SERVICE_REQUEST (seq 0) and the
+    // server's SERVICE_ACCEPT after EXT_INFO (seq 0 then seq 1).
+    REQUIRE(client.conn.outbound_sequence_number() == 1);
+    REQUIRE(server.conn.outbound_sequence_number() == 2);
 
     REQUIRE_FALSE(client.conn.send_ignore(std::as_bytes(std::span{"z", 1})));
-    REQUIRE(client.conn.outbound_sequence_number() == 1);
+    REQUIRE(client.conn.outbound_sequence_number() == 2);
 
     bool got = false;
     REQUIRE(run_loopback(
@@ -404,7 +423,17 @@ TEST_CASE("Terrapin: IGNORE before NEWKEYS rejected iff strict", "[strict_kex]")
         REQUIRE(got);
 
         client.conn.resolve(pending, core::host_key_verdict::accept);
-        REQUIRE(run_loopback(client, server));
+        const auto client_out = collect_output(client.conn);
+        REQUIRE(client_out.size() >= 5);
+        const auto pkt_len = (std::uint32_t{std::to_integer<unsigned char>(client_out[0])} << 24)
+                             | (std::uint32_t{std::to_integer<unsigned char>(client_out[1])} << 16)
+                             | (std::uint32_t{std::to_integer<unsigned char>(client_out[2])} << 8)
+                             | std::uint32_t{std::to_integer<unsigned char>(client_out[3])};
+        const auto newkeys_n = std::size_t{4} + pkt_len;
+        REQUIRE(newkeys_n < client_out.size());
+        const auto n = feed_all(server.conn, std::span{client_out}.first(newkeys_n), ec);
+        REQUIRE_FALSE(ec);
+        REQUIRE(n == newkeys_n);
         REQUIRE_FALSE(client.conn.failure());
         REQUIRE_FALSE(server.conn.failure());
     }
@@ -465,7 +494,7 @@ TEST_CASE("server accepts client EXT_INFO only right after first NEWKEYS", "[str
 
     SECTION("next packet after NEWKEYS") {
         peer_session s{core::role::server};
-        s.handshake();
+        s.exchange_keys();
         s.peer.send_msg(ext);
         s.peer.send_msg(service_request);
         REQUIRE_FALSE(s.peer.exchange(s.sut));
@@ -475,7 +504,7 @@ TEST_CASE("server accepts client EXT_INFO only right after first NEWKEYS", "[str
     }
     SECTION("after another packet") {
         peer_session s{core::role::server};
-        s.handshake();
+        s.exchange_keys();
         s.peer.send_msg(service_request);
         s.peer.send_msg(ext);
         (void)s.peer.exchange(s.sut);
@@ -505,9 +534,6 @@ TEST_CASE("client accepts server EXT_INFO until USERAUTH_SUCCESS", "[strict_kex]
     REQUIRE(s.sut.conn.server_sig_algs() == "ssh-ed25519");
 
     REQUIRE_FALSE(s.sut.conn.auth_none("alice"));
-    REQUIRE_FALSE(s.peer.exchange(s.sut));
-    REQUIRE(s.peer.take(wire::msg::service_request));
-    s.peer.send_msg(wire::detail::service_msg{wire::msg::service_accept, "ssh-userauth"});
     REQUIRE_FALSE(s.peer.exchange(s.sut));
     REQUIRE(s.peer.take(wire::msg::userauth_request));
     send_ext(s.peer, "rsa-sha2-256");
@@ -585,4 +611,131 @@ TEST_CASE("EXT_INFO before NEWKEYS is unexpected_message", "[strict_kex][ext_inf
     { std::size_t _n = 0; ec = server.conn.feed(ext, _n); }
     REQUIRE(server.conn.failure() == code::unexpected_message);
     REQUIRE_FALSE(server.conn.failure_detail().empty());
+}
+
+namespace {
+
+struct ext_flight {
+    std::vector<std::byte> bytes;
+    std::size_t newkeys = 0;
+    std::size_t ext = 0;
+};
+
+ext_flight queue_ext_then_accept(peer_session& s, std::string_view algs) {
+    REQUIRE_FALSE(s.peer.exchange(s.sut));
+    const recording_handler::verify_host_key* host = nullptr;
+    for (const auto& ev : s.sut.handler.events) {
+        if (const auto* found = std::get_if<recording_handler::verify_host_key>(&ev)) host = found;
+    }
+    REQUIRE(host != nullptr);
+    ext_flight flight;
+    flight.newkeys = s.peer.pending_bytes();
+    REQUIRE(flight.newkeys > 0);
+    REQUIRE_FALSE(s.sut.conn.resolve(host->ticket, core::host_key_verdict::accept));
+    s.sut.handler.events.clear();
+
+    const wire::detail::ext_info::entry entries[] = {
+        {"server-sig-algs", std::as_bytes(std::span{algs.data(), algs.size()})}};
+    wire::detail::ext_info msg;
+    msg.entries = entries;
+    s.peer.send_msg(msg);
+    flight.ext = s.peer.pending_bytes();
+    s.peer.send_msg(wire::detail::service_msg{wire::msg::service_accept, auth::service_userauth});
+    flight.bytes = s.peer.take_pending();
+    REQUIRE(flight.ext > flight.newkeys);
+    REQUIRE(flight.bytes.size() > flight.ext);
+    return flight;
+}
+
+void feed_all_units(core::connection& conn, std::span<const std::byte> bytes) {
+    std::size_t off = 0;
+    while (off < bytes.size()) {
+        std::size_t n = 0;
+        REQUIRE_FALSE(conn.feed(bytes.subspan(off), n));
+        REQUIRE(n > 0);
+        off += n;
+    }
+}
+
+void feed_bytewise(core::connection& conn, std::span<const std::byte> bytes) {
+    std::vector<std::byte> pending;
+    pending.reserve(bytes.size());
+    for (const auto b : bytes) {
+        pending.push_back(b);
+        std::size_t n = 0;
+        REQUIRE_FALSE(conn.feed(pending, n));
+        REQUIRE(n <= pending.size());
+        if (n > 0) {
+            pending.erase(pending.begin(), pending.begin() + static_cast<std::ptrdiff_t>(n));
+        }
+    }
+    REQUIRE(pending.empty());
+}
+
+void feed_split(core::connection& conn, const ext_flight& flight, int mode) {
+    if (mode == 0) {
+        feed_all_units(conn, flight.bytes);
+        return;
+    }
+    if (mode == 1) {
+        feed_all_units(conn, std::span{flight.bytes}.first(flight.newkeys));
+        feed_all_units(conn, std::span{flight.bytes}.subspan(flight.newkeys));
+        return;
+    }
+    feed_bytewise(conn, flight.bytes);
+}
+
+std::string handshake_sig_algs(const recording_handler& handler) {
+    int dones = 0;
+    std::string algs;
+    for (const auto& ev : handler.events) {
+        if (const auto* done = std::get_if<recording_handler::handshake_done>(&ev)) {
+            ++dones;
+            algs = done->server_sig_algs;
+        }
+    }
+    REQUIRE(dones == 1);
+    return algs;
+}
+
+}  // namespace
+
+TEST_CASE("handshake_done server_sig_algs ignores packet splits", "[strict_kex][ext_info]") {
+    const std::string_view algs = "rsa-sha2-512,ssh-ed25519";
+    for (const auto mode : {0, 1, 2}) {
+        DYNAMIC_SECTION("mode " << mode) {
+            peer_session s{core::role::client};
+            const auto flight = queue_ext_then_accept(s, algs);
+            feed_split(s.sut.conn, flight, mode);
+            REQUIRE(handshake_sig_algs(s.sut.handler) == algs);
+            REQUIRE(s.sut.conn.server_sig_algs() == algs);
+            REQUIRE_FALSE(s.sut.conn.failure());
+        }
+    }
+}
+
+TEST_CASE("publickey signature algorithm follows split EXT_INFO", "[auth][publickey][ext_info]") {
+    const std::string_view algs = "rsa-sha2-512";
+    peer_session s{core::role::client};
+    const auto flight = queue_ext_then_accept(s, algs);
+    feed_split(s.sut.conn, flight, 1);
+    REQUIRE(handshake_sig_algs(s.sut.handler) == algs);
+
+    std::array<std::byte, crypto::max_generated_key_storage> storage{};
+    crypto::private_key_material priv{};
+    REQUIRE(s.p.generate_keypair(crypto::sig_id::rsa_pkcs1_sha256, 2048, priv, storage));
+    crypto::public_key_material pub{crypto::sig_id::rsa_pkcs1_sha256, priv.n, priv.e};
+    keys::public_key pk;
+    REQUIRE_FALSE(keys::public_key::from_material(pub, pk));
+    REQUIRE_FALSE(s.sut.conn.auth_publickey("alice", pk.blob(), priv));
+    REQUIRE_FALSE(s.peer.exchange(s.sut));
+    const auto raw = s.peer.take(wire::msg::userauth_request);
+    REQUIRE(raw);
+    wire::reader reader{*raw};
+    wire::detail::userauth_request_publickey req;
+    REQUIRE(req.decode(reader));
+    REQUIRE(reader.empty());
+    REQUIRE(req.has_signature);
+    REQUIRE(req.algorithm == "rsa-sha2-512");
+    REQUIRE_FALSE(s.sut.conn.failure());
 }

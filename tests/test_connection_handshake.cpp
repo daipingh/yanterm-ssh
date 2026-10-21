@@ -233,7 +233,6 @@ TEST_CASE("host-key callback verdict controls same-feed continuation",
 
         if (inline_accept) {
             REQUIRE(accepted == server_flight.size());
-            REQUIRE(handshake != events.end());
         } else {
             REQUIRE(accepted < server_flight.size());
             REQUIRE(handshake == events.end());
@@ -246,8 +245,12 @@ TEST_CASE("host-key callback verdict controls same-feed continuation",
             handshake = std::find_if(events.begin(), events.end(), [](const auto& event) {
                 return std::holds_alternative<recording_handler::handshake_done>(event);
             });
-            REQUIRE(handshake != events.end());
         }
+        // NEWKEYS and EXT_INFO are in this flight. SERVICE_ACCEPT is not: the
+        // server emits it only after the client's SERVICE_REQUEST.
+        REQUIRE(handshake == events.end());
+        REQUIRE_FALSE(client.session_id().empty());
+        REQUIRE_FALSE(client.server_sig_algs().empty());
 
         REQUIRE(client.negotiated() != nullptr);
         return result{collect_output(client), accepted, server_flight.size()};

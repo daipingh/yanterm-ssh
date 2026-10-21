@@ -77,18 +77,15 @@ YANTERM_SSH_INLINE void push_service_packet(wire::msg id, std::string_view name,
 
 namespace yanterm::ssh::core {
 
-YANTERM_SSH_INLINE bool auth_start_error_is_fatal(std::error_code ec) noexcept {
-    return ec && ec != code::invalid_state && ec != code::unsupported_algorithm;
-}
-
 YANTERM_SSH_INLINE bool auth_resolve_error_is_fatal(std::error_code ec) noexcept {
     return ec && ec != code::invalid_state;
 }
 
 YANTERM_SSH_INLINE std::error_code connection::resolve(auth_ticket ticket, const auth::auth_verdict& v) {
-    if (!auth_ || failure_ || role_ != role::server || phase_ != phase::established) {
-        return code::invalid_state;
-    }
+    if (!auth_ || failure_ || role_ != role::server) return code::invalid_state;
+    // During rekey, phase_ is a KEX state. The verdict is a control packet and
+    // write_control_packet holds it until NEWKEYS, so the callback may resolve.
+    if (phase_ != phase::established && !rekeying_) return code::invalid_state;
     if (auto ec = auth_resolve_verdict(ticket.seq_, v)) {
         if (auth_resolve_error_is_fatal(ec)) {
             fail(ec);
@@ -114,66 +111,92 @@ YANTERM_SSH_INLINE std::error_code connection::resolve(kbdint_ticket ticket, std
     return {};
 }
 
+YANTERM_SSH_INLINE std::error_code connection::send_service_request() {
+    std::vector<std::byte> scratch;
+    detail::push_service_packet(wire::msg::service_request, auth::service_userauth, scratch);
+    return write_control_packet(scratch);
+}
+
+YANTERM_SSH_INLINE std::error_code connection::on_service_message(wire::msg id,
+                                                                 std::span<const std::byte> payload) {
+    assert(auth_);
+    const wire::msg expected =
+        role_ == role::client ? wire::msg::service_accept : wire::msg::service_request;
+    if (id != expected) return code::unexpected_message;
+    wire::detail::service_msg msg;
+    msg.id = id;
+    wire::reader r{payload};
+    if (!msg.decode(r) || !r.empty()) return code::invalid_format;
+
+    if (role_ == role::client) {
+        if (msg.service_name != auth::service_userauth) return code::unsupported_service;
+        return emit_handshake_done();
+    }
+
+    if (msg.service_name != auth::service_userauth) {
+        wire::detail::disconnect_msg disc;
+        disc.reason = wire::disconnect_reason::service_not_available;
+        disc.description = "unsupported service";
+        wire::writer w;
+        disc.encode(w);
+        if (auto ec = write_control_packet(w.data())) return ec;
+        return code::unsupported_service;
+    }
+    std::vector<std::byte> scratch;
+    detail::push_service_packet(wire::msg::service_accept, auth::service_userauth, scratch);
+    if (auto ec = write_control_packet(scratch)) return ec;
+    if (!auth_->banner.empty()) {
+        wire::detail::userauth_banner banner;
+        banner.message = auth_->banner;
+        banner.language = auth_->banner_language;
+        wire::writer w;
+        banner.encode(w);
+        if (auto ec = write_control_packet(w.data())) return ec;
+    }
+    return emit_handshake_done();
+}
+
 YANTERM_SSH_INLINE std::error_code connection::auth_none(std::string_view user) {
-    if (!auth_) return code::invalid_state;
-    if (failure_ || phase_ != phase::established || rekeying_) {
-        return code::invalid_state;
-    }
-    const std::error_code ec = [&]() -> std::error_code {
-        if (role_ != role::client) return code::invalid_state;
-        if (auth_->phase != detail::auth_phase::idle && auth_->phase != detail::auth_phase::ready) {
-            return code::invalid_state;
-        }
-        auth_->user.assign(user.begin(), user.end());
-        auth_->method.assign(auth::method_none.begin(), auth::method_none.end());
-        auth_->publickey_query = false;
-        auth_->clear_pk_fields();
-        return auth_begin_request();
-    }();
-    if (ec) {
-        if (auth_start_error_is_fatal(ec)) {
-            fail(ec);
-            phase_ = phase::dead;
-        }
-        return ec;
-    }
-    return {};
+    return auth_client_start(auth::method_none, false, [&]() -> std::error_code {
+        wire::detail::userauth_request_none msg;
+        msg.user = user;
+        msg.service = auth::service_connection;
+        wire::writer w;
+        msg.encode(w);
+        return write_control_packet(w.data());
+    });
 }
 
 YANTERM_SSH_INLINE std::error_code connection::auth_password(std::string_view user, std::string_view password) {
-    if (!auth_) return code::invalid_state;
-    if (failure_ || phase_ != phase::established || rekeying_) {
-        return code::invalid_state;
-    }
-    const std::error_code ec = [&]() -> std::error_code {
-        if (role_ != role::client) return code::invalid_state;
-        if (auth_->phase != detail::auth_phase::idle && auth_->phase != detail::auth_phase::ready) {
-            return code::invalid_state;
-        }
-        auth_->user.assign(user.begin(), user.end());
-        auth_->password.assign(password);
-        auth_->method.assign(auth::method_password.begin(), auth::method_password.end());
-        auth_->publickey_query = false;
-        auth_->clear_pk_fields();
-        if (auto err = auth_begin_request()) {
-            auth_->wipe_secrets();
-            return err;
-        }
-        return {};
-    }();
-    if (ec) {
-        if (auth_start_error_is_fatal(ec)) {
-            fail(ec);
-            phase_ = phase::dead;
-        }
-        return ec;
-    }
-    return {};
+    return auth_client_start(auth::method_password, false, [&]() -> std::error_code {
+        wire::detail::userauth_request_password msg;
+        msg.user = user;
+        msg.service = auth::service_connection;
+        msg.password = password;
+        constexpr std::string_view method = "password";
+        const std::size_t encoded_bytes = 1u
+            + wire::encoded_string_size(user.size())
+            + wire::encoded_string_size(auth::service_connection.size())
+            + wire::encoded_string_size(method.size())
+            + 1u
+            + wire::encoded_string_size(password.size());
+        struct wiping_writer {
+            wire::writer w;
+            ~wiping_writer() {
+                auto held = w.take();
+                crypto::secure_zero(std::span<std::byte>{held});
+            }
+        } enc;
+        enc.w.reserve(encoded_bytes);
+        msg.encode(enc.w);
+        assert(enc.w.size() <= encoded_bytes);
+        return write_control_packet(enc.w.data());
+    });
 }
 
 YANTERM_SSH_INLINE std::error_code connection::send_auth_banner(std::string_view text, std::string_view language) {
     if (!auth_) return code::invalid_state;
-    if (failure_ || phase_ != phase::established || rekeying_) {
+    if (failure_ || !service_ready_ || phase_ != phase::established || rekeying_) {
         return code::invalid_state;
     }
     if (role_ != role::server) return code::invalid_state;
@@ -192,15 +215,7 @@ YANTERM_SSH_INLINE std::error_code connection::send_auth_banner(std::string_view
 
 YANTERM_SSH_INLINE std::error_code connection::auth_publickey(std::string_view user, std::span<const std::byte> public_blob,
                                const crypto::private_key_material& priv) {
-    if (!auth_) return code::invalid_state;
-    if (failure_ || phase_ != phase::established || rekeying_) {
-        return code::invalid_state;
-    }
-    const std::error_code ec = [&]() -> std::error_code {
-        if (role_ != role::client) return code::invalid_state;
-        if (auth_->phase != detail::auth_phase::idle && auth_->phase != detail::auth_phase::ready) {
-            return code::invalid_state;
-        }
+    return auth_client_start(auth::method_publickey, false, [&]() -> std::error_code {
         std::string alg;
         std::vector<std::byte> signature;
         if (auto err = detail::sign_userauth_publickey(
@@ -208,186 +223,53 @@ YANTERM_SSH_INLINE std::error_code connection::auth_publickey(std::string_view u
                 sm2_userauth_sig_, alg, signature)) {
             return err;
         }
-        auth_->user.assign(user.begin(), user.end());
-        auth_->method.assign(auth::method_publickey.begin(), auth::method_publickey.end());
-        auth_->pk_blob.assign(public_blob.begin(), public_blob.end());
-        auth_->pk_alg = std::move(alg);
-        auth_->pk_signature = std::move(signature);
-        auth_->pk_has_signature = true;
-        auth_->publickey_query = false;
-        return auth_begin_request();
-    }();
-    if (ec) {
-        if (auth_start_error_is_fatal(ec)) {
-            fail(ec);
-            phase_ = phase::dead;
-        }
-        return ec;
-    }
-    return {};
+        wire::detail::userauth_request_publickey msg;
+        msg.user = user;
+        msg.service = auth::service_connection;
+        msg.has_signature = true;
+        msg.algorithm = alg;
+        msg.blob = public_blob;
+        msg.signature = signature;
+        wire::writer w;
+        msg.encode(w);
+        return write_control_packet(w.data());
+    });
 }
 
 YANTERM_SSH_INLINE std::error_code connection::auth_publickey_query(std::string_view user, std::span<const std::byte> public_blob,
                                      std::string_view algorithm) {
-    if (!auth_) return code::invalid_state;
-    if (failure_ || phase_ != phase::established || rekeying_) {
-        return code::invalid_state;
-    }
-    const std::error_code ec = [&]() -> std::error_code {
-        if (role_ != role::client) return code::invalid_state;
-        if (auth_->phase != detail::auth_phase::idle && auth_->phase != detail::auth_phase::ready) {
-            return code::invalid_state;
-        }
-        auth_->user.assign(user.begin(), user.end());
-        auth_->method.assign(auth::method_publickey.begin(), auth::method_publickey.end());
-        auth_->pk_blob.assign(public_blob.begin(), public_blob.end());
-        auth_->pk_alg.assign(algorithm.begin(), algorithm.end());
-        auth_->pk_signature.clear();
-        auth_->pk_has_signature = false;
-        auth_->publickey_query = true;
-        return auth_begin_request();
-    }();
-    if (ec) {
-        if (auth_start_error_is_fatal(ec)) {
-            fail(ec);
-            phase_ = phase::dead;
-        }
-        return ec;
-    }
-    return {};
+    return auth_client_start(auth::method_publickey, true, [&]() -> std::error_code {
+        wire::detail::userauth_request_publickey msg;
+        msg.user = user;
+        msg.service = auth::service_connection;
+        msg.has_signature = false;
+        msg.algorithm = algorithm;
+        msg.blob = public_blob;
+        wire::writer w;
+        msg.encode(w);
+        return write_control_packet(w.data());
+    });
 }
 
 YANTERM_SSH_INLINE std::error_code connection::auth_keyboard_interactive(std::string_view user,
                                           std::string_view language,
                                           std::span<const std::string_view> submethods) {
-    if (!auth_) return code::invalid_state;
-    if (failure_ || phase_ != phase::established || rekeying_) {
-        return code::invalid_state;
-    }
-    const std::error_code ec = [&]() -> std::error_code {
-        if (role_ != role::client) return code::invalid_state;
-        if (auth_->phase != detail::auth_phase::idle && auth_->phase != detail::auth_phase::ready) {
-            return code::invalid_state;
-        }
-        auth_->user.assign(user.begin(), user.end());
-        auth_->method.assign(auth::method_kbdint.begin(), auth::method_kbdint.end());
-        auth_->kbdint_language.assign(language.begin(), language.end());
-        auth_->kbdint_submethods.clear();
-        auth_->kbdint_submethods.reserve(submethods.size());
-        for (std::string_view s : submethods) {
-            auth_->kbdint_submethods.emplace_back(s.begin(), s.end());
-        }
-        auth_->publickey_query = false;
-        auth_->clear_pk_fields();
-        return auth_begin_request();
-    }();
-    if (ec) {
-        if (auth_start_error_is_fatal(ec)) {
-            fail(ec);
-            phase_ = phase::dead;
-        }
-        return ec;
-    }
-    return {};
+    return auth_client_start(auth::method_kbdint, false, [&]() -> std::error_code {
+        wire::detail::userauth_request_kbdint msg;
+        msg.user = user;
+        msg.service = auth::service_connection;
+        msg.language = language;
+        msg.out_submethods = submethods;
+        wire::writer w;
+        msg.encode(w);
+        return write_control_packet(w.data());
+    });
 }
 
 YANTERM_SSH_INLINE std::error_code connection::auth_bump_seq(std::uint64_t& seq) {
     if (seq == std::numeric_limits<std::uint64_t>::max()) return code::invalid_state;
     ++seq;
     return {};
-}
-
-YANTERM_SSH_INLINE std::error_code connection::auth_begin_request() {
-    if (auto ec = auth_bump_seq(auth_->auth_seq)) return ec;
-    if (auth_->phase == detail::auth_phase::idle) {
-        std::vector<std::byte> scratch;
-        detail::push_service_packet(wire::msg::service_request, auth::service_userauth, scratch);
-        if (auto ec = write_control_packet(scratch)) return ec;
-        auth_->phase = detail::auth_phase::wait_service_accept;
-        return {};
-    }
-    if (auto ec = auth_send_request()) return ec;
-    auth_->phase = detail::auth_phase::wait_userauth_reply;
-    return {};
-}
-
-YANTERM_SSH_INLINE std::error_code connection::auth_send_request() {
-    if (auth_->method == auth::method_password) {
-        return auth_send_password();
-    }
-    if (auth_->method == auth::method_publickey) {
-        return auth_send_publickey();
-    }
-    if (auth_->method == auth::method_kbdint) {
-        return auth_send_kbdint();
-    }
-    return auth_send_none();
-}
-
-YANTERM_SSH_INLINE std::error_code connection::auth_send_none() {
-    wire::detail::userauth_request_none msg;
-    msg.user = auth_->user;
-    msg.service = auth::service_connection;
-    wire::writer w;
-    msg.encode(w);
-    return write_control_packet(w.data());
-}
-
-YANTERM_SSH_INLINE std::error_code connection::auth_send_password() {
-    wire::detail::userauth_request_password msg;
-    msg.user = auth_->user;
-    msg.service = auth::service_connection;
-    msg.password = auth_->password.view();
-    constexpr std::string_view method = "password";
-    const std::size_t encoded_bytes = 1u
-        + wire::encoded_string_size(auth_->user.size())
-        + wire::encoded_string_size(auth::service_connection.size())
-        + wire::encoded_string_size(method.size())
-        + 1u
-        + wire::encoded_string_size(auth_->password.size());
-    struct wiping_writer {
-        wire::writer w;
-        ~wiping_writer() {
-            auto held = w.take();
-            crypto::secure_zero(std::span<std::byte>{held});
-        }
-    } enc;
-    enc.w.reserve(encoded_bytes);
-    msg.encode(enc.w);
-    assert(enc.w.size() <= encoded_bytes);
-    if (auto ec = write_control_packet(enc.w.data())) {
-        if (role_ == role::client) auth_->wipe_secrets();
-        return ec;
-    }
-    if (role_ == role::client) auth_->wipe_secrets();
-    return {};
-}
-
-YANTERM_SSH_INLINE std::error_code connection::auth_send_publickey() {
-    wire::detail::userauth_request_publickey msg;
-    msg.user = auth_->user;
-    msg.service = auth::service_connection;
-    msg.has_signature = auth_->pk_has_signature;
-    msg.algorithm = auth_->pk_alg;
-    msg.blob = auth_->pk_blob;
-    msg.signature = auth_->pk_signature;
-    wire::writer w;
-    msg.encode(w);
-    return write_control_packet(w.data());
-}
-
-YANTERM_SSH_INLINE std::error_code connection::auth_send_kbdint() {
-    std::vector<std::string_view> names;
-    names.reserve(auth_->kbdint_submethods.size());
-    for (const auto& s : auth_->kbdint_submethods) names.emplace_back(s);
-    wire::detail::userauth_request_kbdint msg;
-    msg.user = auth_->user;
-    msg.service = auth::service_connection;
-    msg.language = auth_->kbdint_language;
-    msg.out_submethods = names;
-    wire::writer w;
-    msg.encode(w);
-    return write_control_packet(w.data());
 }
 
 YANTERM_SSH_INLINE std::error_code connection::auth_send_failure(std::string_view methods, bool partial) {
@@ -413,7 +295,6 @@ YANTERM_SSH_INLINE std::error_code connection::auth_resolve_verdict(std::uint64_
     if (verdict.kind == auth::verdict_kind::info && auth_->method != auth::method_kbdint) {
         return code::invalid_state;
     }
-    auth_->wipe_secrets();
     if (verdict.kind == auth::verdict_kind::success) {
         if (auth_->method == auth::method_publickey && !auth_->pk_has_signature) {
             wire::detail::userauth_pk_ok msg;
@@ -508,7 +389,7 @@ YANTERM_SSH_INLINE std::error_code connection::auth_on_client_payload(
     wire::msg id, std::span<const std::byte> payload, memory::detail::page_slice* page) {
     (void)page;
     if (id == wire::msg::userauth_banner) {
-        if (auth_->phase == detail::auth_phase::idle || auth_->phase == detail::auth_phase::authenticated) {
+        if (auth_->phase == detail::auth_phase::authenticated) {
             return code::unexpected_message;
         }
         wire::reader r{payload};
@@ -517,22 +398,6 @@ YANTERM_SSH_INLINE std::error_code connection::auth_on_client_payload(
         notify([&](handler& app, connection& self) {
             app.on_auth_banner(self, msg.message, msg.language);
         });
-        return {};
-    }
-
-    if (id == wire::msg::service_accept) {
-        if (auth_->phase != detail::auth_phase::wait_service_accept) {
-            return code::unexpected_message;
-        }
-        wire::detail::service_msg msg;
-        msg.id = wire::msg::service_accept;
-        wire::reader r{payload};
-        if (!msg.decode(r) || !r.empty()) return code::invalid_format;
-        if (msg.service_name != auth::service_userauth) {
-            return code::unsupported_service;
-        }
-        if (auto ec = auth_send_request()) return ec;
-        auth_->phase = detail::auth_phase::wait_userauth_reply;
         return {};
     }
 
@@ -594,38 +459,6 @@ YANTERM_SSH_INLINE std::error_code connection::auth_on_client_payload(
 
 YANTERM_SSH_INLINE std::error_code connection::auth_on_server_payload(
     wire::msg id, std::span<const std::byte> payload, memory::detail::page_slice* page) {
-    if (id == wire::msg::service_request) {
-        wire::detail::service_msg msg;
-        msg.id = wire::msg::service_request;
-        wire::reader r{payload};
-        if (!msg.decode(r) || !r.empty()) return code::invalid_format;
-        if (msg.service_name == auth::service_userauth) {
-            if (auth_->phase == detail::auth_phase::idle) {
-                std::vector<std::byte> scratch;
-                detail::push_service_packet(wire::msg::service_accept, auth::service_userauth, scratch);
-                if (auto ec = write_control_packet(scratch)) return ec;
-                if (!auth_->banner.empty()) {
-                    wire::detail::userauth_banner banner;
-                    banner.message = auth_->banner;
-                    banner.language = auth_->banner_language;
-                    wire::writer w;
-                    banner.encode(w);
-                    if (auto ec = write_control_packet(w.data())) return ec;
-                }
-                auth_->phase = detail::auth_phase::ready;
-                return {};
-            }
-            return code::unexpected_message;
-        }
-        wire::detail::disconnect_msg disc;
-        disc.reason = wire::disconnect_reason::service_not_available;
-        disc.description = "unsupported service";
-        wire::writer w;
-        disc.encode(w);
-        if (auto ec = write_control_packet(w.data())) return ec;
-        return code::unsupported_service;
-    }
-
     if (id == wire::msg::userauth_request) {
         if (auth_->phase != detail::auth_phase::ready) return code::unexpected_message;
         wire::reader r{payload};
@@ -684,7 +517,6 @@ YANTERM_SSH_INLINE std::error_code connection::auth_on_server_payload(
             auth_->pk_has_signature = has_sig;
             auth_->pk_alg.assign(alg.begin(), alg.end());
             auth_->pk_blob.assign(blob.begin(), blob.end());
-            auth_->pk_signature.clear();
             if (has_sig) {
                 if (detail::verify_userauth_publickey(p_, session_id_, auth_->user, auth_->service,
                                                       auth_->pk_alg, auth_->pk_blob, signature)) {

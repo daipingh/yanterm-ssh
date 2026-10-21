@@ -482,6 +482,13 @@ std::vector<std::byte> client_handshake_output(bool inline_accept) {
             (void)deliver_output(server, client);
             drain_client();
             measured = collect_output(client);
+            // SERVICE_ACCEPT is what completes the handshake; it is not part
+            // of the bytes queued by resolve().
+            if (!client_done && !measured.empty()) {
+                REQUIRE(deliver_output(client, server));
+                (void)deliver_output(server, client);
+                drain_client();
+            }
             break;
         }
         if (!progress) break;
@@ -561,11 +568,6 @@ std::vector<std::byte> server_auth_output(bool resolve_inline, auth_wire_scenari
     } else {
         REQUIRE_FALSE(client.conn.auth_password("alice", "s3cret"));
     }
-    // Service request / accept are already pending before the auth verdict.
-    REQUIRE(deliver_output(client.conn, server.conn));
-    server.handler.events.clear();
-    REQUIRE(deliver_output(server.conn, client.conn));
-
     const auto mark = collect_output(server.conn);
     const auto request = collect_output(client.conn);
     REQUIRE_FALSE(request.empty());
@@ -624,13 +626,11 @@ std::vector<std::byte> client_kbdint_output(bool inline_kbdint_resolve) {
             }
         }));
     REQUIRE_FALSE(client.auth_keyboard_interactive("alice"));
-    // Service request, service accept, then USERAUTH_REQUEST. None of that is
-    // the info-response flight this helper measures.
+    // USERAUTH_REQUEST is already queued; the info-response flight is what
+    // this helper measures.
     REQUIRE(deliver_output(client, server.conn));
-    REQUIRE(deliver_output(server.conn, client));
     server.handler.events.clear();
     client_handler.events.clear();
-    REQUIRE(deliver_output(client, server.conn));
 
     const auto mark = collect_output(client);
     const auto info = collect_output(server.conn);

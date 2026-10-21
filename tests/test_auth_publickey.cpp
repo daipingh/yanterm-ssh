@@ -294,9 +294,6 @@ TEST_CASE("empty-methods USERAUTH_FAILURE is not pk_ok", "[auth][publickey][pkok
     const std::byte blob[] = {std::byte{1}};
     REQUIRE_FALSE(s.sut.conn.auth_publickey_query("alice", blob, "ssh-ed25519"));
     REQUIRE_FALSE(s.peer.exchange(s.sut));
-    REQUIRE(s.peer.take(wire::msg::service_request));
-    s.peer.send_msg(wire::detail::service_msg{wire::msg::service_accept, service_userauth});
-    REQUIRE_FALSE(s.peer.exchange(s.sut));
     REQUIRE(s.peer.take(wire::msg::userauth_request));
 
     wire::detail::userauth_failure fail;
@@ -325,9 +322,6 @@ TEST_CASE("signed publickey treats PK_OK as unexpected_message", "[auth][publick
     peer_session s{core::role::client};
     s.handshake();
     REQUIRE_FALSE(s.sut.conn.auth_publickey("alice", pk.blob(), priv));
-    REQUIRE_FALSE(s.peer.exchange(s.sut));
-    REQUIRE(s.peer.take(wire::msg::service_request));
-    s.peer.send_msg(wire::detail::service_msg{wire::msg::service_accept, service_userauth});
     REQUIRE_FALSE(s.peer.exchange(s.sut));
     REQUIRE(s.peer.take(wire::msg::userauth_request));
 

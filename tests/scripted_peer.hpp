@@ -49,12 +49,16 @@ public:
     void collect(wired_connection& sut);
     std::error_code exchange(wired_connection& sut, int max_rounds = 64);
 
+    // KEX through both NEWKEYS. The client SUT has already emitted
+    // SERVICE_REQUEST; the server SUT has not been offered a service yet.
+    void exchange_keys(wired_connection& sut);
     void handshake(wired_connection& sut);
     void authenticate(wired_connection& sut);
-    // 握手后发 SERVICE_REQUEST ssh-userauth 并交换到收到 SERVICE_ACCEPT。
-    void request_userauth_service(wired_connection& sut);
+    void start_rekey();
 
     std::optional<std::vector<std::byte>> take(wire::msg id);
+    std::vector<std::byte> take_pending();
+    [[nodiscard]] const std::vector<std::uint8_t>& seen_ids() const noexcept { return seen_ids_; }
     [[nodiscard]] const std::vector<std::vector<std::byte>>& received() const noexcept { return received_; }
     void clear_received() noexcept { received_.clear(); }
     [[nodiscard]] bool kex_in_progress() const noexcept { return kex_running_; }
@@ -91,6 +95,7 @@ private:
     std::vector<std::byte> out_;
     std::vector<std::byte> in_;
     std::vector<std::vector<std::byte>> received_;
+    std::vector<std::uint8_t> seen_ids_;
 };
 
 struct peer_session {
@@ -103,6 +108,7 @@ struct peer_session {
                  const core::config& cfg = scripted_peer::sut_config(),
                  std::pmr::memory_resource* mr = std::pmr::get_default_resource());
 
+    void exchange_keys() { peer.exchange_keys(sut); }
     void handshake() { peer.handshake(sut); }
     void authenticate() { peer.authenticate(sut); }
 };
@@ -208,10 +214,10 @@ inline std::error_code scripted_peer::exchange(wired_connection& sut, int max_ro
     return code::invalid_state;
 }
 
-inline void scripted_peer::handshake(wired_connection& sut) {
+inline void scripted_peer::exchange_keys(wired_connection& sut) {
     REQUIRE_FALSE(exchange(sut));
     // Peer role server means the SUT is the client and must accept the host key
-    // before it will consume NEWKEYS.
+    // before it will emit NEWKEYS and SERVICE_REQUEST.
     if (role_ == core::role::server) {
         bool resolved = false;
         for (const auto& ev : sut.handler.events) {
@@ -227,6 +233,33 @@ inline void scripted_peer::handshake(wired_connection& sut) {
     REQUIRE_FALSE(kex_in_progress());
     REQUIRE_FALSE(sut.conn.failure());
     sut.handler.events.clear();
+}
+
+inline void scripted_peer::handshake(wired_connection& sut) {
+    exchange_keys(sut);
+    if (role_ == core::role::server) {
+        const auto req = take(wire::msg::service_request);
+        REQUIRE(req);
+        wire::reader reader{*req};
+        wire::detail::service_msg msg;
+        msg.id = wire::msg::service_request;
+        REQUIRE(msg.decode(reader));
+        REQUIRE(reader.empty());
+        REQUIRE(msg.service_name == "ssh-userauth");
+        send_msg(wire::detail::service_msg{wire::msg::service_accept, "ssh-userauth"});
+        REQUIRE_FALSE(exchange(sut));
+    } else {
+        send_msg(wire::detail::service_msg{wire::msg::service_request, "ssh-userauth"});
+        REQUIRE_FALSE(exchange(sut));
+        REQUIRE(take(wire::msg::service_accept));
+    }
+    int dones = 0;
+    for (const auto& ev : sut.handler.events) {
+        if (std::holds_alternative<recording_handler::handshake_done>(ev)) ++dones;
+    }
+    REQUIRE(dones == 1);
+    REQUIRE_FALSE(sut.conn.failure());
+    sut.handler.events.clear();
     clear_received();
 }
 
@@ -234,12 +267,6 @@ inline void scripted_peer::authenticate(wired_connection& sut) {
     handshake(sut);
     if (role_ == core::role::server) {
         REQUIRE_FALSE(sut.conn.auth_none("alice"));
-        REQUIRE_FALSE(exchange(sut));
-        REQUIRE(take(wire::msg::service_request));
-        wire::detail::service_msg accept;
-        accept.id = wire::msg::service_accept;
-        accept.service_name = "ssh-userauth";
-        send_msg(accept);
         REQUIRE_FALSE(exchange(sut));
         REQUIRE(take(wire::msg::userauth_request));
         const auto ok = static_cast<std::byte>(wire::msg::userauth_success);
@@ -253,10 +280,6 @@ inline void scripted_peer::authenticate(wired_connection& sut) {
         }
         REQUIRE(saw_success);
     } else {
-        wire::detail::service_msg req;
-        req.id = wire::msg::service_request;
-        req.service_name = "ssh-userauth";
-        send_msg(req);
         wire::detail::userauth_request_none none;
         none.user = "alice";
         none.service = "ssh-connection";
@@ -278,11 +301,15 @@ inline void scripted_peer::authenticate(wired_connection& sut) {
     clear_received();
 }
 
-inline void scripted_peer::request_userauth_service(wired_connection& sut) {
-    handshake(sut);
-    send_msg(wire::detail::service_msg{wire::msg::service_request, "ssh-userauth"});
-    REQUIRE_FALSE(exchange(sut));
-    REQUIRE(take(wire::msg::service_accept));
+inline void scripted_peer::start_rekey() {
+    REQUIRE_FALSE(kex_running_);
+    send_kexinit();
+}
+
+inline std::vector<std::byte> scripted_peer::take_pending() {
+    std::vector<std::byte> out;
+    out.swap(out_);
+    return out;
 }
 
 inline std::optional<std::vector<std::byte>> scripted_peer::take(wire::msg id) {
@@ -323,6 +350,7 @@ inline void scripted_peer::send_kexinit() {
 
 inline void scripted_peer::on_payload(std::span<const std::byte> payload) {
     REQUIRE(!payload.empty());
+    seen_ids_.push_back(std::to_integer<std::uint8_t>(payload[0]));
     const auto id = static_cast<wire::msg>(std::to_integer<std::uint8_t>(payload[0]));
     if (id == wire::msg::kexinit) {
         on_kexinit(payload);
