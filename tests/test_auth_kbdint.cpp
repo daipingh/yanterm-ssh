@@ -176,6 +176,60 @@ TEST_CASE("kbdint response count mismatch is invalid_state", "[auth][kbdint]") {
     REQUIRE_FALSE(server.conn.failure());
 }
 
+// RFC 4253 §7.1: no INFO_RESPONSE between KEXINIT and NEWKEYS, so resolve
+// during rekey succeeds and the response is held until the new keys.
+TEST_CASE("kbdint resolve during rekey is sent after NEWKEYS", "[auth][kbdint][rekey]") {
+    auto p = prov();
+    auto hm = make_ed25519_host(p);
+    auto client = make_client(p);
+    auto server = make_server(p);
+    configure_server(server, hm);
+    handshake_capture cap;
+    REQUIRE(run_handshake(client, server, cap));
+
+    REQUIRE_FALSE(client.conn.auth_keyboard_interactive("alice"));
+
+    bool saw_info_resp = false;
+    bool saw_ok = false;
+    int client_rekey_done = 0;
+    int server_rekey_done = 0;
+    REQUIRE(run_auth_loopback(client, server, [&](bool is_client, const recording_handler::recorded_event& ev) {
+        if (std::holds_alternative<recording_handler::rekey_done>(ev)) {
+            ++(is_client ? client_rekey_done : server_rekey_done);
+        }
+        if (!is_client && std::holds_alternative<recording_handler::auth_request>(ev)) {
+            const kbdint_prompt prompts[] = {{"Password:", false}};
+            server.conn.resolve(std::get<recording_handler::auth_request>(ev).ticket, auth_verdict::info("login", "hi", prompts));
+        }
+        if (is_client && std::holds_alternative<recording_handler::auth_info_request>(ev)) {
+            REQUIRE_FALSE(client.conn.rekey());
+            const auto before = client.conn.pending_output_bytes();
+            const std::string_view answers[] = {"s3cret"};
+            REQUIRE_FALSE(client.conn.resolve(std::get<recording_handler::auth_info_request>(ev).ticket, answers));
+            REQUIRE(client.conn.pending_output_bytes() == before);
+        }
+        if (!is_client && std::holds_alternative<recording_handler::auth_info_response>(ev)) {
+            // Flushed from on_rekey_done, so the sender has already finished this rekey.
+            REQUIRE(client_rekey_done == 1);
+            const auto& info_resp = std::get<recording_handler::auth_info_response>(ev);
+            REQUIRE(info_resp.responses.size() == 1);
+            REQUIRE(info_resp.responses[0] == "s3cret");
+            saw_info_resp = true;
+            server.conn.resolve(info_resp.ticket, auth_verdict::success());
+        }
+        if (is_client && std::holds_alternative<recording_handler::auth_response>(ev)) {
+            REQUIRE(std::get<recording_handler::auth_response>(ev).success);
+            saw_ok = true;
+        }
+    }));
+    REQUIRE(saw_info_resp);
+    REQUIRE(saw_ok);
+    REQUIRE(client_rekey_done == 1);
+    REQUIRE(server_rekey_done == 1);
+    REQUIRE_FALSE(client.conn.failure());
+    REQUIRE_FALSE(server.conn.failure());
+}
+
 TEST_CASE("kbdint failure after info", "[auth][kbdint]") {
     auto p = prov();
     auto hm = make_ed25519_host(p);

@@ -546,7 +546,8 @@ YANTERM_SSH_INLINE std::error_code connection::on_newkeys() {
 }
 
 YANTERM_SSH_INLINE bool connection::app_traffic_ok() const noexcept {
-    return !failure_ && (phase_ == phase::established || rekeying_);
+    // disconnect() during rekey leaves rekeying_ set.
+    return !failure_ && phase_ != phase::dead && (phase_ == phase::established || rekeying_);
 }
 
 YANTERM_SSH_INLINE connection::kex_round& connection::ensure_round() {
