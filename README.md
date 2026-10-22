@@ -32,7 +32,7 @@ yanterm-ssh 实现了 SSH-2 的线上协议与密码学协商，但**自身不�
 - **认证**：`gssapi-with-mic`（Kerberos）、`hostbased`。
 - **OpenSSH 证书**：`*-cert-v01@openssh.com` 用户与主机证书，以及基于 CA 的信任（`@cert-authority`）。
 - **硬件密钥**：FIDO/U2F 安全密钥（`sk-ssh-ed25519@openssh.com`、`sk-ecdsa-sha2-nistp256@openssh.com`）。
-- **外部签名**：ssh-agent 与 PKCS#11/智能卡签名；公钥认证目前要求私钥材料位于进程内。
+- **外部签名**：已提供外部签名接口，但未内置 ssh-agent 与 PKCS#11/智能卡客户端。
 - **agent 转发**：`auth-agent-req@openssh.com` 及对应通道。
 - **压缩**：`zlib@openssh.com` / `zlib`，目前只协商 `none`。
 - **后量子密钥交换**：`mlkem768x25519-sha256`、`sntrup761x25519-sha512@openssh.com`。

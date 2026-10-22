@@ -66,6 +66,7 @@ using auth_result
 using auth_verdict
 using verdict_kind              // auth_verdict::kind
 using kbdint_prompt
+using publickey_sign_request
 using channel_id
 using channel_open_reason
 using channel_type
@@ -138,7 +139,8 @@ session::negotiated
 client_session::handshake
 client_session::auth_none
 client_session::auth_password
-client_session::auth_publickey
+client_session::auth_publickey_query  // 询问公钥是否可用（USERAUTH_PK_OK）
+client_session::auth_publickey  // 两个重载：进程内私钥 / 公钥 + 外部 signer
 client_session::auth_keyboard_interactive
 
 server_session::handshake
@@ -226,6 +228,7 @@ namespace yanterm::ssh::core
 
 enum class role                 // client / server
 enum class host_key_verdict     // 主机密钥裁决
+struct publickey_sign_request   // 公钥认证待签请求：algorithm、crypto::sig_id 与公钥 blob
 ```
 
 ### [yanterm-ssh/core/config.hpp](include/yanterm-ssh/core/config.hpp)
@@ -296,7 +299,9 @@ connection::resolve
 
 connection::auth_none
 connection::auth_password
-connection::auth_publickey
+connection::auth_publickey          // 用户公钥认证（进程内私钥）
+connection::auth_publickey_sign_request
+connection::auth_publickey_signed   // 用户公钥认证（外部私钥，如 auth agent）
 connection::auth_publickey_query
 connection::auth_keyboard_interactive
 connection::send_auth_banner

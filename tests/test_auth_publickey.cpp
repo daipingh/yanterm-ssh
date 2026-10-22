@@ -134,7 +134,7 @@ TEST_CASE("unsigned probe PK_OK then signed success", "[auth][publickey][pkok]")
     user_key uk;
     generate_user_key(p, crypto::sig_id::ed25519, 0, uk);
 
-    REQUIRE_FALSE(client.conn.auth_publickey_query("alice", uk.blob(), "ssh-ed25519"));
+    REQUIRE_FALSE(client.conn.auth_publickey_query("alice", uk.blob()));
 
     bool saw_query = false;
     bool saw_pk_ok = false;
@@ -190,7 +190,7 @@ TEST_CASE("unsigned probe rejected", "[auth][publickey][pkok]") {
     user_key uk;
     generate_user_key(p, crypto::sig_id::ed25519, 0, uk);
 
-    REQUIRE_FALSE(client.conn.auth_publickey_query("alice", uk.blob(), "ssh-ed25519"));
+    REQUIRE_FALSE(client.conn.auth_publickey_query("alice", uk.blob()));
 
     bool saw_resp = false;
     REQUIRE(run_auth_loopback(client, server, [&](bool is_client, const recording_handler::recorded_event& ev) {
@@ -253,7 +253,44 @@ TEST_CASE("rsa-sha2-256 userauth uses server-sig-algs", "[auth][publickey][rsa]"
     REQUIRE_FALSE(server.conn.failure());
 }
 
-TEST_CASE("empty pick_userauth_sig_alg is unsupported_algorithm", "[auth][publickey][rsa]") {
+TEST_CASE("rsa publickey query uses rsa-sha2-256", "[auth][publickey][rsa][pkok]") {
+    auto p = prov();
+    user_key host;
+    generate_user_key(p, crypto::sig_id::rsa_pkcs1_sha256, 2048, host);
+    std::vector<std::byte> host_blob(host.blob().begin(), host.blob().end());
+    auto client = make_client(p);
+    auto server = make_server(p);
+    REQUIRE_FALSE(server.conn.set_host_key(host_blob, host.priv));
+    handshake_capture cap;
+    REQUIRE(run_handshake(client, server, cap));
+
+    user_key uk;
+    generate_user_key(p, crypto::sig_id::rsa_pkcs1_sha256, 2048, uk);
+    REQUIRE_FALSE(client.conn.auth_publickey_query("alice", uk.blob()));
+
+    bool saw_query = false;
+    bool saw_pk_ok = false;
+    REQUIRE(run_auth_loopback(client, server, [&](bool is_client, const recording_handler::recorded_event& ev) {
+        if (!is_client && std::holds_alternative<recording_handler::auth_request>(ev)) {
+            const auto& req = std::get<recording_handler::auth_request>(ev);
+            REQUIRE(req.method == "publickey");
+            REQUIRE_FALSE(req.has_signature);
+            REQUIRE(req.algorithm == "rsa-sha2-256");
+            saw_query = true;
+            server.conn.resolve(req.ticket, auth_verdict::success());
+        }
+        if (is_client && std::holds_alternative<recording_handler::auth_response>(ev)) {
+            REQUIRE(std::get<recording_handler::auth_response>(ev).pk_ok);
+            saw_pk_ok = true;
+        }
+    }));
+    REQUIRE(saw_query);
+    REQUIRE(saw_pk_ok);
+    REQUIRE_FALSE(client.conn.failure());
+    REQUIRE_FALSE(server.conn.failure());
+}
+
+TEST_CASE("rsa key without rsa-sha2 in server-sig-algs is unsupported_algorithm", "[auth][publickey][rsa]") {
     auto p = prov();
     auto hm = make_ed25519_host(p);
     auto client = make_client(p);
@@ -289,10 +326,11 @@ TEST_CASE("empty pick_userauth_sig_alg is unsupported_algorithm", "[auth][public
 }
 
 TEST_CASE("empty-methods USERAUTH_FAILURE is not pk_ok", "[auth][publickey][pkok]") {
+    user_key uk;
+    generate_user_key(prov(), crypto::sig_id::ed25519, 0, uk);
     peer_session s{core::role::client};
     s.handshake();
-    const std::byte blob[] = {std::byte{1}};
-    REQUIRE_FALSE(s.sut.conn.auth_publickey_query("alice", blob, "ssh-ed25519"));
+    REQUIRE_FALSE(s.sut.conn.auth_publickey_query("alice", uk.blob()));
     REQUIRE_FALSE(s.peer.exchange(s.sut));
     REQUIRE(s.peer.take(wire::msg::userauth_request));
 

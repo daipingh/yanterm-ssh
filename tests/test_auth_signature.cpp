@@ -15,17 +15,7 @@
 using namespace yanterm::ssh;
 using namespace yanterm::ssh::testing;
 
-using core::detail::pick_userauth_sig_alg;
 using core::detail::write_publickey_signed_data;
-
-TEST_CASE("pick rsa-sha2-256 from server-sig-algs", "[auth][signature]") {
-    REQUIRE(pick_userauth_sig_alg("ssh-rsa", "rsa-sha2-512,rsa-sha2-256", false)
-            == "rsa-sha2-256");
-    REQUIRE(pick_userauth_sig_alg("ssh-rsa", "", false) == "rsa-sha2-256");
-    REQUIRE(pick_userauth_sig_alg("ssh-rsa", "ssh-rsa", false).empty());
-    REQUIRE(pick_userauth_sig_alg("ssh-rsa", "ssh-rsa", true) == "ssh-rsa");
-    REQUIRE(pick_userauth_sig_alg("ssh-ed25519", "", false) == "ssh-ed25519");
-}
 
 TEST_CASE("publickey signed data verifies with provider", "[auth][signature]") {
     auto p = prov();
