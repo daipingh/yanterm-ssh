@@ -29,6 +29,7 @@ using auth_result = auth::auth_result;
 using auth_verdict = auth::auth_verdict;
 using verdict_kind = auth::verdict_kind;
 using kbdint_prompt = auth::kbdint_prompt;
+using publickey_sign_request = core::publickey_sign_request;
 using channel_id = channels::channel_id;
 using channel_open_reason = channels::channel_open_reason;
 using channel_type = channels::channel_type;

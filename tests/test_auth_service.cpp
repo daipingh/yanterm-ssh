@@ -341,7 +341,7 @@ TEST_CASE("auth and rekey before userauth service is ready return invalid_state"
         REQUIRE(s.sut.conn.auth_none("alice") == code::invalid_state);
         REQUIRE(s.sut.conn.auth_password("alice", "s3cret") == code::invalid_state);
         REQUIRE(s.sut.conn.auth_publickey("alice", {}, {}) == code::invalid_state);
-        REQUIRE(s.sut.conn.auth_publickey_query("alice", {}, "ssh-ed25519") == code::invalid_state);
+        REQUIRE(s.sut.conn.auth_publickey_query("alice", {}) == code::invalid_state);
         REQUIRE(s.sut.conn.auth_keyboard_interactive("alice") == code::invalid_state);
         REQUIRE(s.sut.conn.rekey() == code::invalid_state);
         REQUIRE_FALSE(s.sut.conn.failure());

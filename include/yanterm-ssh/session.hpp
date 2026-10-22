@@ -2,8 +2,32 @@
 
 #include <yanterm-ssh/detail/session_impl.hpp>
 #include <yanterm-ssh/channel.hpp>
+#include <yanterm-ssh/core/types.hpp>
+#include <yanterm-ssh/keys/public_key.hpp>
+#include <yanterm-ssh/wire/types.hpp>
+
+#include <corral/concepts.h>
+
+#include <concepts>
+#include <cstddef>
+#include <span>
+#include <system_error>
+#include <tuple>
+#include <type_traits>
+#include <utility>
+#include <vector>
 
 namespace yanterm::ssh {
+
+// Called as an lvalue with the chosen algorithm and the data to sign. The
+// awaited result is either an error or an SSH signature blob (string
+// algorithm, string signature), the format of an ssh-agent SIGN_RESPONSE.
+template <class S>
+concept publickey_signer =
+    std::invocable<S&, const core::publickey_sign_request&, std::span<const std::byte>>
+    && corral::Awaitable<
+        std::invoke_result_t<S&, const core::publickey_sign_request&, std::span<const std::byte>>,
+        std::tuple<std::error_code, std::vector<std::byte>>>;
 
 class session {
 public:
@@ -85,8 +109,14 @@ public:
     corral::Task<std::tuple<std::error_code, auth_result>> auth_none(std::string_view user);
     corral::Task<std::tuple<std::error_code, auth_result>> auth_password(std::string_view user,
                                                                         std::string_view password);
+    // auth_result::pk_ok reports whether the server would accept `key`.
+    corral::Task<std::tuple<std::error_code, auth_result>> auth_publickey_query(
+        std::string_view user, const keys::public_key& key);
     corral::Task<std::tuple<std::error_code, auth_result>> auth_publickey(
         std::string_view user, const keys::private_key& key);
+    template <publickey_signer Signer>
+    corral::Task<std::tuple<std::error_code, auth_result>> auth_publickey(
+        std::string_view user, const keys::public_key& key, Signer signer);
     template <class Responder>
     corral::Task<std::tuple<std::error_code, auth_result>> auth_keyboard_interactive(
         std::string_view user, Responder responder);
@@ -606,6 +636,19 @@ inline corral::Task<std::tuple<std::error_code, auth_result>> client_session::au
     co_return co_await self.wait_auth_response();
 }
 
+inline corral::Task<std::tuple<std::error_code, auth_result>> client_session::auth_publickey_query(
+    std::string_view user, const keys::public_key& key) {
+    if (auto ec = ready_or_closed()) co_return {ec, {}};
+    auto& self = *impl_;
+    if (!self.auth_) co_return {code::invalid_state, {}};
+    if (!self.auth_->client_auth_outstanding) {
+        if (auto ec = self.core_.auth_publickey_query(user, key.blob())) co_return {ec, {}};
+        self.auth_->client_auth_outstanding = true;
+        self.write_lot_.unparkAll();
+    }
+    co_return co_await self.wait_auth_response();
+}
+
 inline corral::Task<std::tuple<std::error_code, auth_result>> client_session::auth_publickey(
     std::string_view user, const keys::private_key& key) {
     if (auto ec = ready_or_closed()) co_return {ec, {}};
@@ -613,6 +656,37 @@ inline corral::Task<std::tuple<std::error_code, auth_result>> client_session::au
     if (!self.auth_) co_return {code::invalid_state, {}};
     if (!self.auth_->client_auth_outstanding) {
         if (auto ec = self.core_.auth_publickey(user, key.pub().blob(), key.material())) {
+            co_return {ec, {}};
+        }
+        self.auth_->client_auth_outstanding = true;
+        self.write_lot_.unparkAll();
+    }
+    co_return co_await self.wait_auth_response();
+}
+
+template <publickey_signer Signer>
+inline corral::Task<std::tuple<std::error_code, auth_result>> client_session::auth_publickey(
+    std::string_view user, const keys::public_key& key, Signer signer) {
+    if (auto ec = ready_or_closed()) co_return {ec, {}};
+    auto& self = *impl_;
+    if (!self.auth_) co_return {code::invalid_state, {}};
+    if (!self.auth_->client_auth_outstanding) {
+        core::publickey_sign_request req;
+        wire::writer data;
+        if (auto ec = self.core_.auth_publickey_sign_request(user, key.blob(), req, data)) {
+            co_return {ec, {}};
+        }
+        std::tuple<std::error_code, std::vector<std::byte>> outcome =
+            co_await signer(std::as_const(req), data.data());
+        auto& [sign_ec, signature] = outcome;
+        if (sign_ec) co_return {sign_ec, {}};
+        // The session may have closed, or another call may have started or
+        // finished authentication, while the signer was suspended.
+        if (auto ec = ready_or_closed()) co_return {ec, {}};
+        if (!self.auth_ || self.auth_->client_auth_outstanding) {
+            co_return {code::invalid_state, {}};
+        }
+        if (auto ec = self.core_.auth_publickey_signed(user, key.blob(), signature)) {
             co_return {ec, {}};
         }
         self.auth_->client_auth_outstanding = true;

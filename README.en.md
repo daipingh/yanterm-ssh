@@ -32,7 +32,7 @@ The following capabilities are common in mainstream implementations such as Open
 - **Authentication**: `gssapi-with-mic` (Kerberos), `hostbased`.
 - **OpenSSH certificates**: `*-cert-v01@openssh.com` user and host certificates, and CA-based trust (`@cert-authority`).
 - **Hardware keys**: FIDO/U2F security keys (`sk-ssh-ed25519@openssh.com`, `sk-ecdsa-sha2-nistp256@openssh.com`).
-- **External signing**: ssh-agent and PKCS#11/smart-card signing; publickey authentication currently requires the private key material to be in-process.
+- **External signing**: an external signing interface is provided, but no ssh-agent or PKCS#11/smart-card client is built in.
 - **Agent forwarding**: `auth-agent-req@openssh.com` and its channel.
 - **Compression**: `zlib@openssh.com` / `zlib`; only `none` is negotiated.
 - **Post-quantum key exchange**: `mlkem768x25519-sha256`, `sntrup761x25519-sha512@openssh.com`.

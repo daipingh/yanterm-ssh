@@ -14,8 +14,6 @@
 
 #include <array>
 #include <cstdint>
-#include <string>
-#include <vector>
 
 namespace yanterm::ssh::core::detail {
 
@@ -36,40 +34,23 @@ YANTERM_SSH_INLINE void write_publickey_signed_data(
     w.write_string(blob);
 }
 
-YANTERM_SSH_INLINE std::error_code sign_userauth_publickey(
-    crypto::provider p, std::span<const std::byte> session_id, std::string_view user,
-    std::span<const std::byte> public_blob, const crypto::private_key_material& priv,
-    std::string_view server_sig_algs, bool allow_ssh_rsa, crypto::sig_id sm2_encoding,
-    std::string& alg_out, std::vector<std::byte>& sig_out) {
-    host_key_view key;
-    if (auto ec = parse_host_key(public_blob, key)) return ec;
-    const auto alg = pick_userauth_sig_alg(key.algorithm_name, server_sig_algs, allow_ssh_rsa);
-    if (alg.empty()) return code::unsupported_algorithm;
-    const auto* entry = kex::detail::find_host_key(alg);
-    if (entry == nullptr) return code::unsupported_algorithm;
-    crypto::private_key_material signing = priv;
-    signing.algorithm = entry->id;
-    if (crypto::is_sm2_sig(entry->id)) {
-        signing.algorithm = (sm2_encoding == crypto::sig_id::sm2_ecdsa)
-                                ? crypto::sig_id::sm2_ecdsa
-                                : crypto::sig_id::sm2_za;
-    }
-    wire::writer data_w;
-    write_publickey_signed_data(data_w, session_id, user, auth::service_connection, alg,
-                                public_blob);
+YANTERM_SSH_INLINE std::error_code sign_publickey_data(crypto::provider p,
+                                                       const crypto::private_key_material& priv,
+                                                       std::string_view algorithm,
+                                                       crypto::sig_id sig,
+                                                       std::span<const std::byte> data,
+                                                       wire::writer& sig_blob) {
     if (!p) return code::crypto_backend_failure;
+    crypto::private_key_material signing = priv;
+    signing.algorithm = sig;
     auto sk = p.new_signing_key(signing);
     if (!sk) return code::sign_failure;
     std::array<std::byte, crypto::max_signature_size> raw{};
     std::size_t len = 0;
-    if (!sk.sign(data_w.data(), raw, len) || len == 0) {
+    if (!sk.sign(data, raw, len) || len == 0) {
         return code::sign_failure;
     }
-    wire::writer sig_w;
-    if (auto ec = encode_signature(alg, std::span{raw}.first(len), sig_w)) return ec;
-    alg_out.assign(alg.begin(), alg.end());
-    sig_out.assign(sig_w.data().begin(), sig_w.data().end());
-    return {};
+    return encode_signature(algorithm, std::span{raw}.first(len), sig_blob);
 }
 
 YANTERM_SSH_INLINE std::error_code verify_userauth_publickey(

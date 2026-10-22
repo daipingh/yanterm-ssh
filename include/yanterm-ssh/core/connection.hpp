@@ -128,8 +128,20 @@ public:
     std::error_code auth_publickey(std::string_view user, std::span<const std::byte> public_blob,
                                    const crypto::private_key_material& priv);
 
-    std::error_code auth_publickey_query(std::string_view user, std::span<const std::byte> public_blob,
-                                         std::string_view algorithm);
+    // Picks the signature algorithm and appends the RFC 4252 section 7 data to
+    // sign to `out` without sending or changing state.
+    std::error_code auth_publickey_sign_request(std::string_view user,
+                                                std::span<const std::byte> public_blob,
+                                                publickey_sign_request& req,
+                                                wire::writer& out) const;
+
+    // `signature` is an SSH signature blob (string algorithm, string signature).
+    std::error_code auth_publickey_signed(std::string_view user,
+                                          std::span<const std::byte> public_blob,
+                                          std::span<const std::byte> signature);
+
+    // Sends the unsigned request with the algorithm auth_publickey_sign_request would choose.
+    std::error_code auth_publickey_query(std::string_view user, std::span<const std::byte> public_blob);
 
     std::error_code auth_keyboard_interactive(std::string_view user,
                                               std::string_view language = {},
@@ -423,6 +435,8 @@ private:
         return {};
     }
 
+    std::error_code auth_select_publickey_sig(std::span<const std::byte> public_blob,
+                                              publickey_sign_request& req) const;
     std::error_code auth_send_failure(std::string_view methods, bool partial);
     void auth_notify_result();
     std::error_code auth_on_payload(std::span<const std::byte> payload,

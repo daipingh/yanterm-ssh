@@ -7,6 +7,7 @@
 #endif
 
 #include <yanterm-ssh/core/detail/auth_signature.hpp>
+#include <yanterm-ssh/core/detail/host_key.hpp>
 #include <yanterm-ssh/wire/detail/messages.hpp>
 #include <yanterm-ssh/wire/types.hpp>
 #include <yanterm-ssh/detail/error.hpp>
@@ -209,19 +210,80 @@ YANTERM_SSH_INLINE std::error_code connection::send_auth_banner(std::string_view
 
 YANTERM_SSH_INLINE std::error_code connection::auth_publickey(std::string_view user, std::span<const std::byte> public_blob,
                                const crypto::private_key_material& priv) {
-    return auth_client_start(auth::method_publickey, false, [&]() -> std::error_code {
-        std::string alg;
-        std::vector<std::byte> signature;
-        if (auto err = detail::sign_userauth_publickey(
-                p_, session_id_, user, public_blob, priv, server_sig_algs_, advertised_ssh_rsa(),
-                sm2_userauth_sig_, alg, signature)) {
-            return err;
+    publickey_sign_request req;
+    wire::writer data;
+    if (auto ec = auth_publickey_sign_request(user, public_blob, req, data)) return ec;
+    wire::writer signature;
+    if (auto ec = detail::sign_publickey_data(p_, priv, req.algorithm, req.sig, data.data(),
+                                              signature)) {
+        return ec;
+    }
+    return auth_publickey_signed(user, public_blob, signature.data());
+}
+
+YANTERM_SSH_INLINE std::error_code connection::auth_select_publickey_sig(
+    std::span<const std::byte> public_blob, publickey_sign_request& req) const {
+    detail::host_key_view key;
+    if (auto ec = detail::parse_host_key(public_blob, key)) return ec;
+    std::string_view alg = key.algorithm_name;
+    if (alg == "ssh-rsa") {
+        const wire::name_list algs{server_sig_algs_};
+        if (algs.contains("rsa-sha2-256") || server_sig_algs_.empty()) {
+            alg = "rsa-sha2-256";
+        } else if (algs.contains("rsa-sha2-512")) {
+            alg = "rsa-sha2-512";
+        } else if (!advertised_ssh_rsa() || !algs.contains("ssh-rsa")) {
+            return code::unsupported_algorithm;
         }
+    }
+    const auto* entry = kex::detail::find_host_key(alg);
+    if (entry == nullptr) return code::unsupported_algorithm;
+    crypto::sig_id sig = entry->id;
+    if (crypto::is_sm2_sig(entry->id)) {
+        sig = (sm2_userauth_sig_ == crypto::sig_id::sm2_ecdsa) ? crypto::sig_id::sm2_ecdsa : crypto::sig_id::sm2_za;
+    }
+    req.algorithm = entry->name;
+    req.sig = sig;
+    req.public_blob = public_blob;
+    return {};
+}
+
+YANTERM_SSH_INLINE std::error_code connection::auth_publickey_sign_request(
+    std::string_view user, std::span<const std::byte> public_blob, publickey_sign_request& req,
+    wire::writer& out) const {
+    if (!auth_ || !service_ready_ || !app_traffic_ok()) return code::invalid_state;
+    if (role_ != role::client || auth_->phase != detail::auth_phase::ready) {
+        return code::invalid_state;
+    }
+    if (auto ec = auth_select_publickey_sig(public_blob, req)) return ec;
+    detail::write_publickey_signed_data(out, session_id_, user, auth::service_connection,
+                                        req.algorithm, public_blob);
+    return {};
+}
+
+YANTERM_SSH_INLINE std::error_code connection::auth_publickey_signed(
+    std::string_view user, std::span<const std::byte> public_blob,
+    std::span<const std::byte> signature) {
+    if (!auth_ || !service_ready_ || !app_traffic_ok()) return code::invalid_state;
+    if (role_ != role::client || auth_->phase != detail::auth_phase::ready) {
+        return code::invalid_state;
+    }
+    publickey_sign_request req;
+    if (auto ec = auth_select_publickey_sig(public_blob, req)) return ec;
+    wire::reader r{signature};
+    std::string_view sig_alg;
+    std::span<const std::byte> sig_data;
+    if (!r.read_string(sig_alg) || !r.read_string(sig_data) || !r.empty()) {
+        return code::invalid_format;
+    }
+    // An agent that ignores the RSA SHA-2 flags answers with an ssh-rsa signature.
+    if (sig_alg != req.algorithm) return code::sign_failure;
+    return auth_client_start(auth::method_publickey, false, [&]() -> std::error_code {
         wire::detail::userauth_request_publickey msg;
         msg.user = user;
         msg.service = auth::service_connection;
         msg.has_signature = true;
-        msg.algorithm = alg;
+        msg.algorithm = req.algorithm;
         msg.blob = public_blob;
         msg.signature = signature;
         wire::writer w;
@@ -230,14 +292,20 @@ YANTERM_SSH_INLINE std::error_code connection::auth_publickey(std::string_view u
     });
 }
 
-YANTERM_SSH_INLINE std::error_code connection::auth_publickey_query(std::string_view user, std::span<const std::byte> public_blob,
-                                     std::string_view algorithm) {
+YANTERM_SSH_INLINE std::error_code connection::auth_publickey_query(std::string_view user,
+                                                                   std::span<const std::byte> public_blob) {
+    if (!auth_ || !service_ready_ || !app_traffic_ok()) return code::invalid_state;
+    if (role_ != role::client || auth_->phase != detail::auth_phase::ready) {
+        return code::invalid_state;
+    }
+    publickey_sign_request req;
+    if (auto ec = auth_select_publickey_sig(public_blob, req)) return ec;
     return auth_client_start(auth::method_publickey, true, [&]() -> std::error_code {
         wire::detail::userauth_request_publickey msg;
         msg.user = user;
         msg.service = auth::service_connection;
         msg.has_signature = false;
-        msg.algorithm = algorithm;
+        msg.algorithm = req.algorithm;
         msg.blob = public_blob;
         wire::writer w;
         msg.encode(w);

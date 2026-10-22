@@ -562,7 +562,7 @@ std::vector<std::byte> server_auth_output(bool resolve_inline, auth_wire_scenari
             if (is_client) accept_client_host_key(client, ev);
         }));
     if (scenario == auth_wire_scenario::pk_ok) {
-        REQUIRE_FALSE(client.conn.auth_publickey_query("alice", hm.blob, "ssh-ed25519"));
+        REQUIRE_FALSE(client.conn.auth_publickey_query("alice", hm.blob));
     } else if (scenario == auth_wire_scenario::kbdint_info) {
         REQUIRE_FALSE(client.conn.auth_keyboard_interactive("alice"));
     } else {
