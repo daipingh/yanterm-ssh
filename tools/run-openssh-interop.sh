@@ -100,6 +100,20 @@ KEXES=(
   "ecdh-sha2-nistp256"
   "diffie-hellman-group14-sha256"
 )
+# The hybrid PQ KEX joins only when both OpenSSH (9.9+) and the yanterm backend
+# (ML-KEM-768) offer it; an sshd that rejects the name would count as a failure.
+PQ_KEX="mlkem768x25519-sha256"
+PQ_KEX_OK=0
+OPENSSH_KEXES="$(ssh -Q kex 2>/dev/null || true)"
+YANTERM_KEXES="$("$TOOL" --list-kex 2>/dev/null | tr ',' '\n' || true)"
+if ! grep -qx "$PQ_KEX" <<<"$OPENSSH_KEXES"; then
+  echo "SKIP $PQ_KEX: OpenSSH $OPENSSH_TAG does not offer it" >&2
+elif ! grep -qx "$PQ_KEX" <<<"$YANTERM_KEXES"; then
+  echo "SKIP $PQ_KEX: yanterm backend has no ML-KEM-768" >&2
+else
+  KEXES+=("$PQ_KEX")
+  PQ_KEX_OK=1
+fi
 CIPHERS=(
   "chacha20-poly1305@openssh.com"
   "aes256-gcm@openssh.com"
@@ -124,6 +138,7 @@ trace_basename() {
   local kex="$1" cipher="$2" hostkey="$3"
   local k c h
   k="${kex%%@*}"
+  k="${k//mlkem768x25519-sha256/mlkem768x25519}"
   k="${k//curve25519-sha256/curve25519}"
   k="${k//ecdh-sha2-nistp256/ecdh-nistp256}"
   k="${k//diffie-hellman-group14-sha256/dh-g14}"
@@ -261,7 +276,7 @@ run_one() {
   stop_sshd || true
 }
 
-# Full matrix (3x3x3). Required combos always write into corpus/.
+# Full matrix (KEXES x CIPHERS x HOSTKEYS). Required combos always write into corpus/.
 for kex in "${KEXES[@]}"; do
   for cipher in "${CIPHERS[@]}"; do
     for hostkey in "${HOSTKEYS[@]}"; do
@@ -466,6 +481,31 @@ else
     else
       stop_auth_server
       FAILURES=$((FAILURES + 1))
+    fi
+
+    if [[ "$PQ_KEX_OK" -eq 1 ]]; then
+      # ssh_config takes the first value of an option, so replace rather than append.
+      SSH_PQ_OPTS=()
+      for opt in "${SSH_COMMON_OPTS[@]}"; do
+        if [[ "$opt" == "KexAlgorithms=curve25519-sha256" ]]; then
+          opt="KexAlgorithms=$PQ_KEX"
+        fi
+        SSH_PQ_OPTS+=("$opt")
+      done
+      echo "==> ssh -> yanterm server publickey $PQ_KEX (port $PORT2)" >&2
+      stop_auth_server
+      "$AUTH_TOOL" --mode server --listen "$PORT2" --host-key "$TMP/ssh_host_ed25519_key" \
+        --user "$USER" --authorized "$TMP/user.pub" --kex "$PQ_KEX" \
+        >"$TMP/auth-server.out" 2>"$TMP/auth-server.err" &
+      AUTH_SERVER_PID=$!
+      if wait_auth_listening "$TMP/auth-server.err"; then
+        run_ssh "$SSH_BIN" "${SSH_PQ_OPTS[@]}" -o PreferredAuthentications=publickey \
+          -i "$TMP/user" -p "$PORT2" "$USER@127.0.0.1" true >/dev/null 2>"$TMP/ssh-pq.err"
+        judge_auth_server "ssh -> yanterm publickey $PQ_KEX" "$TMP/auth-server.err"
+      else
+        stop_auth_server
+        FAILURES=$((FAILURES + 1))
+      fi
     fi
 
     cat >"$TMP/askpass" <<'EOF'

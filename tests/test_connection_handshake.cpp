@@ -70,8 +70,11 @@ TEST_CASE("full handshake agrees on session_id and kex", "[connection][handshake
     REQUIRE(run_handshake(client, server, cap));
     REQUIRE(cap.client_session_id == cap.server_session_id);
     REQUIRE_FALSE(cap.client_session_id.empty());
-    REQUIRE(cap.client_kex_name == "curve25519-sha256");
-    REQUIRE(cap.server_kex_name == "curve25519-sha256");
+    const std::string_view default_kex = p.supports(crypto::kex_id::mlkem768x25519)
+                                             ? "mlkem768x25519-sha256"
+                                             : "curve25519-sha256";
+    REQUIRE(cap.client_kex_name == default_kex);
+    REQUIRE(cap.server_kex_name == default_kex);
 }
 
 TEST_CASE("handshake event order", "[connection][handshake]") {

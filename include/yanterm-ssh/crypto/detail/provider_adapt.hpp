@@ -158,6 +158,33 @@ constexpr bool has_generate_keypair =
     };
 
 template <class T>
+constexpr bool has_kem_new = requires(T& t, kem_id id) {
+    { t.kem_new(id) } noexcept -> std::same_as<void*>;
+};
+template <class T>
+constexpr bool has_kem_free = requires(T& t, void* ctx) {
+    { t.kem_free(ctx) } noexcept;
+};
+template <class T>
+constexpr bool has_kem_public =
+    requires(T& t, void* ctx, std::byte* out, std::size_t cap, std::size_t* out_len) {
+        { t.kem_public(ctx, out, cap, out_len) } noexcept -> std::same_as<bool>;
+    };
+template <class T>
+constexpr bool has_kem_decaps = requires(T& t, void* ctx, const std::byte* ct, std::size_t ctlen,
+                                         std::byte* ss, std::size_t cap, std::size_t* ss_len) {
+    { t.kem_decaps(ctx, ct, ctlen, ss, cap, ss_len) } noexcept -> std::same_as<bool>;
+};
+template <class T>
+constexpr bool has_kem_encaps =
+    requires(T& t, kem_id id, const std::byte* pub, std::size_t publen, std::byte* ct,
+             std::size_t ctcap, std::size_t* ct_len, std::byte* ss, std::size_t sscap,
+             std::size_t* ss_len) {
+        { t.kem_encaps(id, pub, publen, ct, ctcap, ct_len, ss, sscap, ss_len) } noexcept
+            -> std::same_as<bool>;
+    };
+
+template <class T>
 constexpr bool has_inner = requires(const T& t) {
     { t.inner() } noexcept -> std::same_as<provider>;
 };
@@ -213,6 +240,13 @@ template <class T>
 constexpr bool any_generate_keypair = has_generate_keypair<T>;
 
 template <class T>
+constexpr bool all_kem = has_kem_new<T> && has_kem_free<T> && has_kem_public<T> &&
+                         has_kem_decaps<T> && has_kem_encaps<T>;
+template <class T>
+constexpr bool any_kem = has_kem_new<T> || has_kem_free<T> || has_kem_public<T> ||
+                         has_kem_decaps<T> || has_kem_encaps<T>;
+
+template <class T>
 constexpr void assert_groups() {
     static_assert(has_supports<T> && has_random_bytes<T>,
                   "wrap requires supports and random_bytes");
@@ -225,6 +259,7 @@ constexpr void assert_groups() {
     static_assert(!any_sig<T> || all_sig<T>, "signature group must be complete");
     static_assert(!any_generate_keypair<T> || all_generate_keypair<T>,
                   "generate_keypair group must be complete");
+    static_assert(!any_kem<T> || all_kem<T>, "kem group must be complete");
 }
 
 template <class T>
@@ -239,6 +274,7 @@ constexpr void assert_decorate_groups() {
     static_assert(!any_sig<T> || all_sig<T>, "signature group must be complete");
     static_assert(!any_generate_keypair<T> || all_generate_keypair<T>,
                   "generate_keypair group must be complete");
+    static_assert(!any_kem<T> || all_kem<T>, "kem group must be complete");
 }
 
 inline bool default_constant_time_eq(void*, const std::byte* a, const std::byte* b,
@@ -441,6 +477,41 @@ struct wrap_thunks {
         }
         return false;
     }
+
+    static void* kem_new(void* self, kem_id id) noexcept {
+        if constexpr (has_kem_new<T>) {
+            return static_cast<T*>(self)->kem_new(id);
+        }
+        return nullptr;
+    }
+    static void kem_free(void* self, void* ctx) noexcept {
+        if constexpr (has_kem_free<T>) {
+            static_cast<T*>(self)->kem_free(ctx);
+        }
+    }
+    static bool kem_public(void* self, void* ctx, std::byte* out, std::size_t cap,
+                           std::size_t* out_len) noexcept {
+        if constexpr (has_kem_public<T>) {
+            return static_cast<T*>(self)->kem_public(ctx, out, cap, out_len);
+        }
+        return false;
+    }
+    static bool kem_decaps(void* self, void* ctx, const std::byte* ct, std::size_t ctlen,
+                           std::byte* ss, std::size_t cap, std::size_t* ss_len) noexcept {
+        if constexpr (has_kem_decaps<T>) {
+            return static_cast<T*>(self)->kem_decaps(ctx, ct, ctlen, ss, cap, ss_len);
+        }
+        return false;
+    }
+    static bool kem_encaps(void* self, kem_id id, const std::byte* pub, std::size_t publen,
+                           std::byte* ct, std::size_t ctcap, std::size_t* ct_len, std::byte* ss,
+                           std::size_t sscap, std::size_t* ss_len) noexcept {
+        if constexpr (has_kem_encaps<T>) {
+            return static_cast<T*>(self)->kem_encaps(id, pub, publen, ct, ctcap, ct_len, ss,
+                                                     sscap, ss_len);
+        }
+        return false;
+    }
 };
 
 template <class T>
@@ -478,6 +549,11 @@ const provider_vtable* wrap_vtable() {
         .signing_key_free = all_sig<T> ? &wrap_thunks<T>::signing_key_free : nullptr,
         .sig_sign = all_sig<T> ? &wrap_thunks<T>::sig_sign : nullptr,
         .generate_keypair = all_generate_keypair<T> ? &wrap_thunks<T>::generate_keypair : nullptr,
+        .kem_new = all_kem<T> ? &wrap_thunks<T>::kem_new : nullptr,
+        .kem_free = all_kem<T> ? &wrap_thunks<T>::kem_free : nullptr,
+        .kem_public = all_kem<T> ? &wrap_thunks<T>::kem_public : nullptr,
+        .kem_decaps = all_kem<T> ? &wrap_thunks<T>::kem_decaps : nullptr,
+        .kem_encaps = all_kem<T> ? &wrap_thunks<T>::kem_encaps : nullptr,
     };
     return &vt;
 }
@@ -490,6 +566,10 @@ struct decorate_thunks {
             return t->supports(k, id);
         }
         provider inner = t->inner();
+        if constexpr (!all_kem<T>) {
+            // The forwarded kem slots are only usable if the inner group is.
+            if (k == primitive_kind::kem) return inner.supports(static_cast<kem_id>(id));
+        }
         const provider_vtable* vt = inner.vtable();
         if (vt == nullptr || vt->supports == nullptr) return false;
         return vt->supports(inner.self_ptr(), k, id);
@@ -815,6 +895,63 @@ struct decorate_thunks {
         return vt->generate_keypair(inner.self_ptr(), id, bits, out, storage, storage_cap,
                                     storage_used);
     }
+
+    static void* kem_new(void* self, kem_id id) noexcept {
+        auto* t = static_cast<T*>(self);
+        if constexpr (has_kem_new<T>) {
+            return t->kem_new(id);
+        }
+        provider inner = t->inner();
+        const provider_vtable* vt = inner.vtable();
+        if (vt == nullptr || vt->kem_new == nullptr) return nullptr;
+        return vt->kem_new(inner.self_ptr(), id);
+    }
+    static void kem_free(void* self, void* ctx) noexcept {
+        auto* t = static_cast<T*>(self);
+        if constexpr (has_kem_free<T>) {
+            t->kem_free(ctx);
+            return;
+        }
+        provider inner = t->inner();
+        const provider_vtable* vt = inner.vtable();
+        if (vt == nullptr || vt->kem_free == nullptr) return;
+        vt->kem_free(inner.self_ptr(), ctx);
+    }
+    static bool kem_public(void* self, void* ctx, std::byte* out, std::size_t cap,
+                           std::size_t* out_len) noexcept {
+        auto* t = static_cast<T*>(self);
+        if constexpr (has_kem_public<T>) {
+            return t->kem_public(ctx, out, cap, out_len);
+        }
+        provider inner = t->inner();
+        const provider_vtable* vt = inner.vtable();
+        if (vt == nullptr || vt->kem_public == nullptr) return false;
+        return vt->kem_public(inner.self_ptr(), ctx, out, cap, out_len);
+    }
+    static bool kem_decaps(void* self, void* ctx, const std::byte* ct, std::size_t ctlen,
+                           std::byte* ss, std::size_t cap, std::size_t* ss_len) noexcept {
+        auto* t = static_cast<T*>(self);
+        if constexpr (has_kem_decaps<T>) {
+            return t->kem_decaps(ctx, ct, ctlen, ss, cap, ss_len);
+        }
+        provider inner = t->inner();
+        const provider_vtable* vt = inner.vtable();
+        if (vt == nullptr || vt->kem_decaps == nullptr) return false;
+        return vt->kem_decaps(inner.self_ptr(), ctx, ct, ctlen, ss, cap, ss_len);
+    }
+    static bool kem_encaps(void* self, kem_id id, const std::byte* pub, std::size_t publen,
+                           std::byte* ct, std::size_t ctcap, std::size_t* ct_len, std::byte* ss,
+                           std::size_t sscap, std::size_t* ss_len) noexcept {
+        auto* t = static_cast<T*>(self);
+        if constexpr (has_kem_encaps<T>) {
+            return t->kem_encaps(id, pub, publen, ct, ctcap, ct_len, ss, sscap, ss_len);
+        }
+        provider inner = t->inner();
+        const provider_vtable* vt = inner.vtable();
+        if (vt == nullptr || vt->kem_encaps == nullptr) return false;
+        return vt->kem_encaps(inner.self_ptr(), id, pub, publen, ct, ctcap, ct_len, ss, sscap,
+                              ss_len);
+    }
 };
 
 template <class T>
@@ -851,6 +988,11 @@ const provider_vtable* decorate_vtable() {
         .signing_key_free = &decorate_thunks<T>::signing_key_free,
         .sig_sign = &decorate_thunks<T>::sig_sign,
         .generate_keypair = &decorate_thunks<T>::generate_keypair,
+        .kem_new = &decorate_thunks<T>::kem_new,
+        .kem_free = &decorate_thunks<T>::kem_free,
+        .kem_public = &decorate_thunks<T>::kem_public,
+        .kem_decaps = &decorate_thunks<T>::kem_decaps,
+        .kem_encaps = &decorate_thunks<T>::kem_encaps,
     };
     return &vt;
 }

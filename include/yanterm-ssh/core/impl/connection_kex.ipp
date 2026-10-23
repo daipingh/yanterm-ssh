@@ -470,7 +470,7 @@ YANTERM_SSH_INLINE std::error_code connection::finish_kex_and_send_newkeys(std::
         session_id_.assign(hash.begin(), hash.end());
     }
 
-    // Binding J: KDF takes the SSH mpint encoding of K.
+    // Binding J: KDF takes the SSH encoding of K, the same one H used.
     crypto::secure_bytes kbuf;
     {
         struct wiping_writer {
@@ -480,10 +480,9 @@ YANTERM_SSH_INLINE std::error_code connection::finish_kex_and_send_newkeys(std::
                 crypto::secure_zero(std::span<std::byte>{held});
             }
         } enc;
-        const auto secret = round_->exchange->shared_secret();
-        const auto encoded = wire::encoded_mpint_size(secret);
+        const auto encoded = round_->exchange->shared_secret_encoded_size();
         enc.w.reserve(encoded);
-        enc.w.write_mpint(secret);
+        round_->exchange->write_shared_secret(enc.w);
         assert(enc.w.size() <= encoded);
         kbuf.assign(enc.w.data());
         round_->exchange->consume_shared_secret();

@@ -435,9 +435,8 @@ inline void scripted_peer::finish_kex(std::span<const std::byte> hash) {
 
     crypto::secure_bytes kbuf;
     {
-        const auto secret = kx_->shared_secret();
         wire::writer enc;
-        enc.write_mpint(secret);
+        kx_->write_shared_secret(enc);
         kbuf.assign(enc.data());
         auto held = enc.take();
         crypto::secure_zero(std::span<std::byte>{held});

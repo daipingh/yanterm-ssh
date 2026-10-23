@@ -156,8 +156,9 @@ TEST_CASE("two default local name lists negotiate modern defaults", "[kex][nego]
 
     kex::negotiated out;
     REQUIRE_FALSE(core::detail::negotiate(p, core::role::client, ck, sk, out));
-    REQUIRE(out.kex_name == "curve25519-sha256");
-    REQUIRE(out.kex == crypto::kex_id::curve25519);
+    const bool pq = p.supports(crypto::kex_id::mlkem768x25519);
+    REQUIRE(out.kex_name == (pq ? "mlkem768x25519-sha256" : "curve25519-sha256"));
+    REQUIRE(out.kex == (pq ? crypto::kex_id::mlkem768x25519 : crypto::kex_id::curve25519));
     REQUIRE(out.host_key_name == "ssh-ed25519");
     REQUIRE(out.host_key == crypto::sig_id::ed25519);
     REQUIRE(out.cipher_c2s == crypto::cipher_id::chacha20);

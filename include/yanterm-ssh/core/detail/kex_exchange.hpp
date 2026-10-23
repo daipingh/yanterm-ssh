@@ -61,14 +61,31 @@ public:
                                 wire::writer& out,
                                 std::span<const std::byte>& hash);
 
-    // The raw shared secret K, as a canonical big-endian magnitude.
+    // The shared secret K. Its SSH encoding, used for both H and the key
+    // derivation, comes from write_shared_secret.
     [[nodiscard]] std::span<const std::byte> shared_secret() const noexcept {
         return secret_.span();
     }
 
+    // Appends K as an mpint, or as a string for mlkem768x25519-sha256
+    // (RFC 10042 section 2.5).
+    void write_shared_secret(wire::writer& out) const;
+    [[nodiscard]] std::size_t shared_secret_encoded_size() const noexcept;
+
     [[nodiscard]] crypto::sig_id host_sig_id() const noexcept { return host_sig_id_; }
 
 private:
+    [[nodiscard]] bool is_hybrid() const noexcept {
+        return n_.kex == crypto::kex_id::mlkem768x25519;
+    }
+    [[nodiscard]] std::size_t peer_public_size() const noexcept;
+
+    std::error_code start_hybrid();
+    std::error_code accept_hybrid_init();
+    std::error_code agree_hybrid_reply(std::span<const std::byte> server_reply);
+    std::error_code combine_hybrid_secret(std::span<const std::byte> k_pq,
+                                          std::span<const std::byte> k_cl);
+
     void store_shared_secret(std::span<const std::byte> raw);
 
     std::error_code agree_with_peer(std::span<const std::byte> peer);
@@ -81,6 +98,7 @@ private:
     ::yanterm::ssh::kex::negotiated n_;
     ::yanterm::ssh::core::role r_;
     crypto::kex_agreement kex_;
+    crypto::kem_keypair kem_;
     std::vector<std::byte> local_public_;
     std::vector<std::byte> peer_public_;
     crypto::secure_bytes secret_;

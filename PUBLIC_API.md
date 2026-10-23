@@ -512,6 +512,7 @@ enum class hash_id
 enum class cipher_id
 enum class mac_id
 enum class kex_id
+enum class kem_id
 enum class sig_id
 enum class primitive_kind
 struct public_key_material      // 验签用公钥分量
@@ -528,6 +529,9 @@ is_sm2_sig
 generated_key_storage_size
 kex_public_size
 kex_secret_size
+kem_public_size
+kem_ciphertext_size
+kem_secret_size
 secure_zero                     // span<std::byte>
 ```
 
@@ -564,6 +568,7 @@ class hmac_ctx
 class cipher
 class aead_cipher
 class kex_agreement
+class kem_keypair
 class signing_key
 class provider                  // 加密后端句柄
 
@@ -578,6 +583,8 @@ aead_cipher::update
 aead_cipher::final
 kex_agreement::public_value
 kex_agreement::agree
+kem_keypair::public_key
+kem_keypair::decapsulate
 signing_key::sign
 
 provider::wrap
@@ -590,6 +597,8 @@ provider::new_hmac
 provider::new_cipher
 provider::new_aead
 provider::new_kex
+provider::new_kem
+provider::encapsulate
 provider::new_signing_key
 provider::poly1305
 provider::verify
@@ -611,7 +620,7 @@ using openssl_backend           // OpenSSL 后端；经 provider::wrap 接入；
 ```
 namespace yanterm::ssh::crypto::ossl3
 
-using openssl_backend           // 基于 OpenSSL 3.x API；需要 OpenSSL 3.0+；上游 OpenSSL 3.x 下不提供 ecgm-sm2-sm3 与 sm2_ecdsa
+using openssl_backend           // 基于 OpenSSL 3.x API；需要 OpenSSL 3.0+
 ```
 
 ### [yanterm-ssh/crypto/openssl11.hpp](include/yanterm-ssh/crypto/openssl11.hpp)
@@ -619,7 +628,7 @@ using openssl_backend           // 基于 OpenSSL 3.x API；需要 OpenSSL 3.0+�
 ```
 namespace yanterm::ssh::crypto::ossl1_1
 
-using openssl_backend           // 基于 OpenSSL 1.1.1 API；在 OpenSSL 3.x 下同样可用（有废弃告警），并提供 ecgm-sm2-sm3 与 sm2_ecdsa；可与 ossl3::openssl_backend 在同一进程并存
+using openssl_backend           // 基于 OpenSSL 1.1.1 API；在 OpenSSL 3.x 下同样可用（有废弃告警）
 ```
 
 ## 4. 密钥与文件格式

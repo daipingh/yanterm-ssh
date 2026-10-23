@@ -4,6 +4,7 @@
 #include <yanterm-ssh/core/connection.hpp>
 #include <yanterm-ssh/core/types.hpp>
 #include <yanterm-ssh/crypto/openssl.hpp>
+#include <yanterm-ssh/kex/algorithms.hpp>
 
 #include "fixed_random_provider.hpp"
 #include "hex_util.hpp"
@@ -43,6 +44,7 @@ struct options {
     std::string hostkey = "ssh-ed25519";
     std::string mac = "hmac-sha2-256-etm@openssh.com";
     bool post_handshake_traffic = true;
+    bool list_kex = false;
 };
 
 void usage(const char* argv0) {
@@ -50,7 +52,8 @@ void usage(const char* argv0) {
         << "Usage: " << argv0
         << " --host HOST --port PORT --seed HEX [--trace PATH]\n"
         << "         [--kex NAME] [--cipher NAME] [--hostkey NAME] [--mac NAME]\n"
-        << "         [--no-traffic]\n";
+        << "         [--no-traffic]\n"
+        << "       " << argv0 << " --list-kex\n";
 }
 
 bool parse_args(int argc, char** argv, options& opt) {
@@ -83,6 +86,8 @@ bool parse_args(int argc, char** argv, options& opt) {
             if (!need(opt.mac)) return false;
         } else if (a == "--no-traffic") {
             opt.post_handshake_traffic = false;
+        } else if (a == "--list-kex") {
+            opt.list_kex = true;
         } else if (a == "--help" || a == "-h") {
             usage(argv[0]);
             std::exit(0);
@@ -170,6 +175,10 @@ int main(int argc, char** argv) {
     }
 
     crypto::openssl_backend backend;
+    if (opt.list_kex) {
+        std::cout << kex::supported_kex_algorithms(crypto::provider::wrap(backend)) << '\n';
+        return 0;
+    }
     testing::fixed_random_provider fr{crypto::provider::wrap(backend), opt.seed};
     crypto::provider p = fr.get();
 

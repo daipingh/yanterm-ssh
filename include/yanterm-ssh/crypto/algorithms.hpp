@@ -30,7 +30,13 @@ enum class kex_id : std::uint8_t {
     ecdh_sm2,       // wire: ecgm-sm2-sm3
     sm2_kap,        // wire: sm2-sm3 (initiator / client)
     sm2_kap_server, // sm2-sm3 responder; not advertised
+    // wire: mlkem768x25519-sha256. A composite of kem_id::mlkem768 and
+    // curve25519 assembled by the protocol core; never passed to a backend.
+    mlkem768x25519,
 };
+
+// Key encapsulation mechanisms (provider_vtable kem_* group).
+enum class kem_id : std::uint8_t { mlkem768 };
 
 enum class sig_id : std::uint8_t {
     ed25519,
@@ -67,7 +73,7 @@ enum class sig_id : std::uint8_t {
 }
 
 // Selects which capability table `provider_vtable::supports` consults.
-enum class primitive_kind : std::uint8_t { hash, cipher, mac, kex, signature };
+enum class primitive_kind : std::uint8_t { hash, cipher, mac, kex, signature, kem };
 
 [[nodiscard]] constexpr std::size_t hash_output_size(hash_id id) noexcept {
     switch (id) {
@@ -172,6 +178,7 @@ inline constexpr std::size_t max_signature_size = 1024;
     case kex_id::dh_group14:    return 256;   // 2048-bit modulus
     case kex_id::dh_group16:    return 512;   // 4096-bit
     case kex_id::dh_group18:    return 1024;  // 8192-bit
+    case kex_id::mlkem768x25519: return 0;    // no single DH public value
     }
     return 0;
 }
@@ -188,6 +195,29 @@ inline constexpr std::size_t max_signature_size = 1024;
     case kex_id::dh_group14:    return 256;
     case kex_id::dh_group16:    return 512;
     case kex_id::dh_group18:    return 1024;
+    case kex_id::mlkem768x25519: return 0;
+    }
+    return 0;
+}
+
+// Encapsulation key, ciphertext and shared secret sizes (FIPS 203 table 3).
+[[nodiscard]] constexpr std::size_t kem_public_size(kem_id id) noexcept {
+    switch (id) {
+    case kem_id::mlkem768: return 1184;
+    }
+    return 0;
+}
+
+[[nodiscard]] constexpr std::size_t kem_ciphertext_size(kem_id id) noexcept {
+    switch (id) {
+    case kem_id::mlkem768: return 1088;
+    }
+    return 0;
+}
+
+[[nodiscard]] constexpr std::size_t kem_secret_size(kem_id id) noexcept {
+    switch (id) {
+    case kem_id::mlkem768: return 32;
     }
     return 0;
 }

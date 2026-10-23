@@ -29,6 +29,73 @@ struct openssl_kex {
     EVP_PKEY* pkey = nullptr;
 };
 
+struct openssl_kem {
+    kem_id id{};
+    EVP_PKEY* pkey = nullptr;
+};
+
+// ML-KEM ships with OpenSSL 3.5 and Tongsuo 8.5; older 3.x builds lack it.
+[[nodiscard]] inline bool mlkem768_available() noexcept {
+    static const bool avail = []() noexcept {
+        ERR_set_mark();
+        EVP_KEM* kem = EVP_KEM_fetch(nullptr, "ML-KEM-768", nullptr);
+        EVP_KEYMGMT* mgmt = EVP_KEYMGMT_fetch(nullptr, "ML-KEM-768", nullptr);
+        ERR_pop_to_mark();
+        const bool ok = kem != nullptr && mgmt != nullptr;
+        EVP_KEM_free(kem);
+        EVP_KEYMGMT_free(mgmt);
+        return ok;
+    }();
+    return avail;
+}
+
+[[nodiscard]] inline bool kem_supported(kem_id id) noexcept {
+    switch (id) {
+    case kem_id::mlkem768: return mlkem768_available();
+    }
+    return false;
+}
+
+[[nodiscard]] inline const char* kem_name(kem_id id) noexcept {
+    switch (id) {
+    case kem_id::mlkem768: return "ML-KEM-768";
+    }
+    return nullptr;
+}
+
+// FIPS 203 section 7.2 input checks on an encapsulation key: the length is
+// checked by the caller; the modulus check requires ByteEncode12(ByteDecode12
+// (ek)) == ek. Providers are expected to reject such keys on import; the
+// re-export comparison backs that up for providers that re-encode from the
+// decoded coefficients.
+[[nodiscard]] inline EVP_PKEY* kem_import_public(kem_id id, const std::byte* pub,
+                                                 std::size_t publen) noexcept {
+    EVP_PKEY_CTX* c = EVP_PKEY_CTX_new_from_name(nullptr, kem_name(id), nullptr);
+    OSSL_PARAM params[2] = {
+        OSSL_PARAM_construct_octet_string(OSSL_PKEY_PARAM_PUB_KEY,
+                                          const_cast<std::byte*>(pub), publen),
+        OSSL_PARAM_construct_end(),
+    };
+    EVP_PKEY* pkey = nullptr;
+    if (c == nullptr || EVP_PKEY_fromdata_init(c) != 1
+        || EVP_PKEY_fromdata(c, &pkey, EVP_PKEY_PUBLIC_KEY, params) != 1) {
+        EVP_PKEY_free(pkey);
+        pkey = nullptr;
+    }
+    EVP_PKEY_CTX_free(c);
+    if (pkey == nullptr) return nullptr;
+    constexpr std::size_t reencoded_size = kem_public_size(kem_id::mlkem768);
+    unsigned char reencoded[reencoded_size];
+    std::size_t len = 0;
+    if (EVP_PKEY_get_octet_string_param(pkey, OSSL_PKEY_PARAM_ENCODED_PUBLIC_KEY, reencoded,
+                                        sizeof(reencoded), &len) != 1
+        || len != publen || std::memcmp(reencoded, pub, publen) != 0) {
+        EVP_PKEY_free(pkey);
+        return nullptr;
+    }
+    return pkey;
+}
+
 [[nodiscard]] inline bool sm2_primitives_available() noexcept {
     static const bool avail = []() noexcept {
         EVP_MD* sm3 = EVP_MD_fetch(nullptr, "SM3", nullptr);
@@ -467,6 +534,9 @@ struct openssl_backend : openssl_backend_base {
                 && static_cast<sig_id>(id) == sig_id::sm2_ecdsa)) {
             return sm2_curve_ec_keys_available();
         }
+        if (kind == primitive_kind::kem) {
+            return kem_supported(static_cast<kem_id>(id));
+        }
         return openssl_supports_common(sm2_primitives_available(), kind, id);
     }
 
@@ -768,6 +838,107 @@ struct openssl_backend : openssl_backend_base {
             return false;
         }
         *storage_used = used;
+        return true;
+    }
+
+    void* kem_new(kem_id id) noexcept {
+        if (!kem_supported(id)) return nullptr;
+        auto* k = new (std::nothrow) openssl_kem{};
+        if (k == nullptr) return nullptr;
+        k->id = id;
+        EVP_PKEY_CTX* c = EVP_PKEY_CTX_new_from_name(nullptr, kem_name(id), nullptr);
+        if (c == nullptr || EVP_PKEY_keygen_init(c) != 1
+            || EVP_PKEY_generate(c, &k->pkey) != 1) {
+            EVP_PKEY_free(k->pkey);
+            k->pkey = nullptr;
+        }
+        EVP_PKEY_CTX_free(c);
+        if (k->pkey == nullptr) {
+            delete k;
+            return nullptr;
+        }
+        return k;
+    }
+
+    void kem_free(void* ctx) noexcept {
+        auto* k = static_cast<openssl_kem*>(ctx);
+        if (k == nullptr) return;
+        if (k->pkey != nullptr) EVP_PKEY_free(k->pkey);
+        delete k;
+    }
+
+    bool kem_public(void* ctx, std::byte* out, std::size_t cap,
+                    std::size_t* out_len) noexcept {
+        auto* k = static_cast<openssl_kem*>(ctx);
+        if (k == nullptr || k->pkey == nullptr || out == nullptr || out_len == nullptr) {
+            return false;
+        }
+        const std::size_t want = kem_public_size(k->id);
+        if (cap < want) return false;
+        std::size_t len = 0;
+        if (EVP_PKEY_get_octet_string_param(k->pkey, OSSL_PKEY_PARAM_ENCODED_PUBLIC_KEY,
+                                            reinterpret_cast<unsigned char*>(out), want, &len)
+                != 1
+            || len != want) {
+            return false;
+        }
+        *out_len = want;
+        return true;
+    }
+
+    bool kem_decaps(void* ctx, const std::byte* ct, std::size_t ctlen, std::byte* ss,
+                    std::size_t cap, std::size_t* ss_len) noexcept {
+        auto* k = static_cast<openssl_kem*>(ctx);
+        if (k == nullptr || k->pkey == nullptr || ct == nullptr || ss == nullptr
+            || ss_len == nullptr) {
+            return false;
+        }
+        const std::size_t want = kem_secret_size(k->id);
+        if (ctlen != kem_ciphertext_size(k->id) || cap < want) return false;
+        EVP_PKEY_CTX* c = EVP_PKEY_CTX_new_from_pkey(nullptr, k->pkey, nullptr);
+        std::size_t len = want;
+        const bool ok = c != nullptr && EVP_PKEY_decapsulate_init(c, nullptr) == 1
+                        && EVP_PKEY_decapsulate(c, reinterpret_cast<unsigned char*>(ss), &len,
+                                                reinterpret_cast<const unsigned char*>(ct),
+                                                ctlen) == 1
+                        && len == want;
+        EVP_PKEY_CTX_free(c);
+        if (!ok) {
+            OPENSSL_cleanse(ss, want);
+            return false;
+        }
+        *ss_len = want;
+        return true;
+    }
+
+    bool kem_encaps(kem_id id, const std::byte* pub, std::size_t publen, std::byte* ct,
+                    std::size_t ctcap, std::size_t* ct_len, std::byte* ss, std::size_t sscap,
+                    std::size_t* ss_len) noexcept {
+        if (!kem_supported(id) || pub == nullptr || ct == nullptr || ct_len == nullptr
+            || ss == nullptr || ss_len == nullptr) {
+            return false;
+        }
+        const std::size_t ct_want = kem_ciphertext_size(id);
+        const std::size_t ss_want = kem_secret_size(id);
+        if (publen != kem_public_size(id) || ctcap < ct_want || sscap < ss_want) return false;
+        EVP_PKEY* peer = kem_import_public(id, pub, publen);
+        if (peer == nullptr) return false;
+        EVP_PKEY_CTX* c = EVP_PKEY_CTX_new_from_pkey(nullptr, peer, nullptr);
+        std::size_t clen = ct_want;
+        std::size_t slen = ss_want;
+        const bool ok = c != nullptr && EVP_PKEY_encapsulate_init(c, nullptr) == 1
+                        && EVP_PKEY_encapsulate(c, reinterpret_cast<unsigned char*>(ct), &clen,
+                                                reinterpret_cast<unsigned char*>(ss), &slen)
+                               == 1
+                        && clen == ct_want && slen == ss_want;
+        EVP_PKEY_CTX_free(c);
+        EVP_PKEY_free(peer);
+        if (!ok) {
+            OPENSSL_cleanse(ss, ss_want);
+            return false;
+        }
+        *ct_len = ct_want;
+        *ss_len = ss_want;
         return true;
     }
 };
