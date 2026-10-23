@@ -7,6 +7,7 @@
 #endif
 
 #include <yanterm-ssh/core/detail/detail_format.hpp>
+#include <yanterm-ssh/kex/detail/tables.hpp>
 #include <yanterm-ssh/wire/detail/messages.hpp>
 #include <yanterm-ssh/wire/types.hpp>
 #include <yanterm-ssh/detail/error.hpp>
@@ -29,6 +30,19 @@ YANTERM_SSH_INLINE connection::connection(role r, crypto::provider p, const conf
     auth_ = std::make_unique<detail::auth_state>();
     auth_->banner.assign(cfg.auth_banner);
     auth_->banner_language.assign(cfg.auth_banner_language);
+    if (r == role::server) {
+        if (cfg.accepted_publickey_algorithms.empty()) {
+            ext_info_sig_algs_wire_ = kex::default_host_key_algorithms(p_);
+        } else {
+            for (std::string_view name : wire::name_list{cfg.accepted_publickey_algorithms}) {
+                const auto* e = kex::detail::find_host_key(name);
+                if (!e || !kex::detail::provider_supports_host_key(p_, *e)) continue;
+                if (wire::name_list{ext_info_sig_algs_wire_}.contains(e->name)) continue;
+                if (!ext_info_sig_algs_wire_.empty()) ext_info_sig_algs_wire_.push_back(',');
+                ext_info_sig_algs_wire_.append(e->name);
+            }
+        }
+    }
     const auto banner = version_.outgoing();
     push_output_bytes(banner);
 }

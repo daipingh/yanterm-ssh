@@ -42,7 +42,8 @@ struct session_impl : core::handler {
                  session_options o, std::pmr::memory_resource* mr,
                  std::string auth_banner = {},
                  std::string auth_banner_language = {},
-                 std::function<void(std::string_view, std::string_view)> on_banner = {});
+                 std::function<void(std::string_view, std::string_view)> on_banner = {},
+                 std::string accepted_publickey_algorithms = {});
 
     void latch(std::error_code ec, std::string detail = {});
     [[nodiscard]] bool inbound_queue_full() const noexcept;
@@ -91,6 +92,7 @@ struct session_impl : core::handler {
     std::string preferred_host_key_;
     std::string preferred_cipher_;
     std::string preferred_mac_;
+    std::string accepted_publickey_algorithms_;
     std::size_t max_output_bytes_ = 256u * 1024u;
     std::pmr::memory_resource* mr_ = nullptr;
     crypto::provider provider_{};
@@ -244,12 +246,14 @@ struct session_impl : core::handler {
 inline session_impl::session_impl(
     core::role r, auv::stream stream, crypto::provider provider, session_options o,
     std::pmr::memory_resource* mr, std::string auth_banner, std::string auth_banner_language,
-    std::function<void(std::string_view, std::string_view)> on_banner)
+    std::function<void(std::string_view, std::string_view)> on_banner,
+    std::string accepted_publickey_algorithms)
     : software_(std::move(o.software))
     , preferred_kex_(std::move(o.preferred_kex))
     , preferred_host_key_(std::move(o.preferred_host_key))
     , preferred_cipher_(std::move(o.preferred_cipher))
     , preferred_mac_(std::move(o.preferred_mac))
+    , accepted_publickey_algorithms_(std::move(accepted_publickey_algorithms))
     , max_output_bytes_(o.max_output_bytes)
     , mr_(mr != nullptr ? mr : memory::default_page_resource())
     , provider_(provider)
@@ -271,6 +275,7 @@ inline session_impl::session_impl(
                 cfg.max_channels = o.max_channels;
                 cfg.auth_banner = auth_banner;
                 cfg.auth_banner_language = auth_banner_language;
+                cfg.accepted_publickey_algorithms = accepted_publickey_algorithms_;
                 return cfg;
             }(),
             *this, mr_)

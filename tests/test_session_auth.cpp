@@ -59,6 +59,7 @@ server_options rsa_sha2_512_only_server() {
     server_options so;
     so.host_keys.push_back(parse_host_key_file(prov(), "id_rsa"));
     so.preferred_host_key = "rsa-sha2-512";
+    so.accepted_publickey_algorithms = "rsa-sha2-512";
     return so;
 }
 
