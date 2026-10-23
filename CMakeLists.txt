@@ -17,6 +17,7 @@ option(YANTERM_SSH_BUILD_TESTS "Build yanterm-ssh tests" ${PROJECT_IS_TOP_LEVEL}
 option(YANTERM_SSH_INTEROP_TESTS "Enable OpenSSH interop CTest (requires sshd)" OFF)
 option(YANTERM_SSH_ENABLE_ASAN "Instrument with AddressSanitizer and UndefinedBehaviorSanitizer" OFF)
 option(YANTERM_SSH_STATIC_LIBSTDCXX "Statically link libgcc/libstdc++ into test and tool binaries" ON)
+option(YANTERM_SSH_BUILD_FUZZERS "Build libFuzzer targets (requires Clang and OpenSSL)" OFF)
 
 if(YANTERM_SSH_ENABLE_ASAN)
     if(NOT CMAKE_CXX_COMPILER_ID STREQUAL "GNU" AND NOT CMAKE_CXX_COMPILER_ID MATCHES "Clang")
@@ -28,6 +29,23 @@ if(YANTERM_SSH_ENABLE_ASAN)
         -fno-sanitize-recover=all
     )
     add_link_options(-fsanitize=address,undefined)
+endif()
+
+if(YANTERM_SSH_BUILD_FUZZERS)
+    if(NOT CMAKE_CXX_COMPILER_ID MATCHES "Clang")
+        message(FATAL_ERROR "YANTERM_SSH_BUILD_FUZZERS requires Clang")
+    endif()
+    add_compile_options(
+        -fsanitize=fuzzer-no-link,address,undefined
+        -fno-sanitize=vptr
+        -fno-omit-frame-pointer
+        -fno-sanitize-recover=all
+    )
+    add_link_options(
+        -fsanitize=address,undefined
+        -fno-sanitize=vptr
+        -fno-sanitize-recover=all
+    )
 endif()
 
 # ---- core target: sans-IO protocol core, no corral, no auv, no I/O ----
