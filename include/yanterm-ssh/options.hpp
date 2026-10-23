@@ -44,6 +44,7 @@ struct server_options : session_options {
     std::vector<keys::private_key> host_keys;
     std::string auth_banner;
     std::string auth_banner_language;
+    std::string accepted_publickey_algorithms{};
 };
 
 }  // namespace yanterm::ssh

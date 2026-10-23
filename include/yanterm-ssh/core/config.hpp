@@ -38,6 +38,12 @@ struct config {
     // USERAUTH_BANNER. The client role ignores these views.
     std::string_view auth_banner{};
     std::string_view auth_banner_language{};
+
+    // Server userauth "publickey" signature algorithm name-list (RFC 8308 §3.1,
+    // RFC 4252 §7). Empty = built-in host_key_table entries supported by the
+    // provider except "ssh-rsa". Non-empty = whole-class replace (provider-filtered).
+    // Resolved at construction; ignored by the client role.
+    std::string_view accepted_publickey_algorithms{};
 };
 
 }  // namespace yanterm::ssh::core

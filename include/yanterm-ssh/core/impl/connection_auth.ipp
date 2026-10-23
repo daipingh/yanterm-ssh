@@ -576,6 +576,15 @@ YANTERM_SSH_INLINE std::error_code connection::auth_on_server_payload(
                 return code::invalid_format;
             }
             if (!r.empty()) return code::invalid_format;
+            if (!wire::name_list{ext_info_sig_algs_wire_}.contains(alg)) {
+                auth_->clear_pk_fields();
+                const std::string_view methods =
+                    auth_->have_app_failure ? std::string_view{auth_->last_failure_methods}
+                                            : auth::method_publickey;
+                if (auto ec = auth_send_failure(methods, false)) return ec;
+                auth_->phase = detail::auth_phase::ready;
+                return {};
+            }
             auth_->pk_has_signature = has_sig;
             auth_->pk_alg.assign(alg.begin(), alg.end());
             auth_->pk_blob.assign(blob.begin(), blob.end());

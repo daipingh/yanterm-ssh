@@ -439,7 +439,7 @@ TEST_CASE("server advertises only installed host-key algorithm", "[connection][h
     REQUIRE_FALSE(client.conn.failure());
     REQUIRE_FALSE(server.conn.failure());
     REQUIRE(negotiated_host == "ssh-ed25519");
-    REQUIRE(server_sig_algs == "ssh-ed25519");
+    REQUIRE(server_sig_algs == kex::default_host_key_algorithms(p));
 }
 
 TEST_CASE("byte-at-a-time feed completes handshake", "[connection][handshake]") {

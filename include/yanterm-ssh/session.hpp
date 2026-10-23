@@ -272,9 +272,11 @@ inline server_session::server_session(auv::stream stream, crypto::provider provi
     auto keys = std::move(opts.host_keys);
     auto banner = std::move(opts.auth_banner);
     auto banner_lang = std::move(opts.auth_banner_language);
-    impl_ = std::make_shared<session_impl>(core::role::server, std::move(stream), provider,
-                                           std::move(opts), mr, std::move(banner),
-                                           std::move(banner_lang));
+    auto pubkey_algs = std::move(opts.accepted_publickey_algorithms);
+    impl_ = std::make_shared<session_impl>(
+        core::role::server, std::move(stream), provider, std::move(opts), mr, std::move(banner),
+        std::move(banner_lang), std::function<void(std::string_view, std::string_view)>{},
+        std::move(pubkey_algs));
     if (keys.empty()) {
         impl_->latch(code::invalid_state);
         return;

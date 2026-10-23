@@ -100,7 +100,7 @@ namespace yanterm::ssh
 default_max_pending_requests   // max_pending_requests == 0 时的钳制值
 struct session_options          // 握手与限流默认值
 struct client_options           // 另含 on_banner
-struct server_options           // 另含 host_keys 与认证横幅
+struct server_options           // 另含 host_keys、认证横幅与用户公钥认证算法列表
 ```
 
 ### [yanterm-ssh/session.hpp](include/yanterm-ssh/session.hpp)
