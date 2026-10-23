@@ -12,16 +12,39 @@
 
 #include <yanterm-ssh/crypto/secure_buffer.hpp>
 
+#include <algorithm>
 #include <array>
 #include <cassert>
+#include <cstddef>
 
 namespace yanterm::ssh::core::detail {
+
+// RFC 10042 section 2.1: C_INIT = C_PK2 || C_PK1, S_REPLY = S_CT2 || S_PK1.
+inline constexpr std::size_t mlkem768x25519_pq_public =
+    crypto::kem_public_size(crypto::kem_id::mlkem768);
+inline constexpr std::size_t mlkem768x25519_pq_ciphertext =
+    crypto::kem_ciphertext_size(crypto::kem_id::mlkem768);
+inline constexpr std::size_t mlkem768x25519_cl_public =
+    crypto::kex_public_size(crypto::kex_id::curve25519);
+inline constexpr std::size_t mlkem768x25519_init_size =
+    mlkem768x25519_pq_public + mlkem768x25519_cl_public;
+inline constexpr std::size_t mlkem768x25519_reply_size =
+    mlkem768x25519_pq_ciphertext + mlkem768x25519_cl_public;
 
 YANTERM_SSH_INLINE key_exchange::~key_exchange() { consume_shared_secret(); }
 
 YANTERM_SSH_INLINE void key_exchange::consume_shared_secret() noexcept {
     secret_.wipe();
     kex_.reset();
+    kem_.reset();
+}
+
+YANTERM_SSH_INLINE std::size_t key_exchange::peer_public_size() const noexcept {
+    if (is_hybrid()) {
+        return r_ == ::yanterm::ssh::core::role::client ? mlkem768x25519_reply_size
+                                                         : mlkem768x25519_init_size;
+    }
+    return crypto::kex_public_size(n_.kex);
 }
 
 [[nodiscard]] YANTERM_SSH_INLINE crypto::kex_id kex_backend_id(crypto::kex_id id,
@@ -37,13 +60,17 @@ YANTERM_SSH_INLINE std::error_code key_exchange::start(wire::writer& out) {
     if (!p_) return code::crypto_backend_failure;
     if (started_) return code::invalid_state;
 
-    kex_ = p_.new_kex(kex_backend_id(n_.kex, r_));
-    if (!kex_) return code::kex_failure;
+    if (is_hybrid()) {
+        if (auto ec = start_hybrid()) return ec;
+    } else {
+        kex_ = p_.new_kex(kex_backend_id(n_.kex, r_));
+        if (!kex_) return code::kex_failure;
 
-    local_public_.assign(crypto::kex_public_size(n_.kex), std::byte{0});
-    std::size_t len = 0;
-    if (!kex_.public_value(local_public_, len) || len != local_public_.size()) {
-        return code::kex_failure;
+        local_public_.assign(crypto::kex_public_size(n_.kex), std::byte{0});
+        std::size_t len = 0;
+        if (!kex_.public_value(local_public_, len) || len != local_public_.size()) {
+            return code::kex_failure;
+        }
     }
 
     if (kex::detail::uses_ecdh_messages(n_.kex)) {
@@ -76,7 +103,7 @@ YANTERM_SSH_INLINE std::error_code key_exchange::accept_reply(
         if (!msg.decode(r) || !r.empty()) {
             return code::invalid_kex_reply;
         }
-        if (msg.server_public.size() != crypto::kex_public_size(n_.kex)) {
+        if (msg.server_public.size() != peer_public_size()) {
             return code::invalid_kex_reply;
         }
         ks = msg.host_key;
@@ -96,7 +123,10 @@ YANTERM_SSH_INLINE std::error_code key_exchange::accept_reply(
 
     if (auto ec = parse_host_key(ks, host_key)) return ec;
 
-    if (auto ec = agree_with_peer(server_public)) return ec;
+    if (auto ec = is_hybrid() ? agree_hybrid_reply(server_public)
+                              : agree_with_peer(server_public)) {
+        return ec;
+    }
 
     if (auto ec = compute_hash(ctx, ks, local_public_, server_public)) return ec;
 
@@ -125,7 +155,7 @@ YANTERM_SSH_INLINE std::error_code key_exchange::accept_init(
         if (!msg.decode(r) || !r.empty()) {
             return code::invalid_kex_reply;
         }
-        if (msg.client_public.size() != crypto::kex_public_size(n_.kex)) {
+        if (msg.client_public.size() != peer_public_size()) {
             return code::invalid_kex_reply;
         }
         client_public = msg.client_public;
@@ -143,16 +173,20 @@ YANTERM_SSH_INLINE std::error_code key_exchange::accept_init(
     // but we also need local_public_ owned before encoding the reply.
     peer_public_.assign(client_public.begin(), client_public.end());
 
-    kex_ = p_.new_kex(kex_backend_id(n_.kex, r_));
-    if (!kex_) return code::kex_failure;
+    if (is_hybrid()) {
+        if (auto ec = accept_hybrid_init()) return ec;
+    } else {
+        kex_ = p_.new_kex(kex_backend_id(n_.kex, r_));
+        if (!kex_) return code::kex_failure;
 
-    local_public_.assign(crypto::kex_public_size(n_.kex), std::byte{0});
-    std::size_t len = 0;
-    if (!kex_.public_value(local_public_, len) || len != local_public_.size()) {
-        return code::kex_failure;
+        local_public_.assign(crypto::kex_public_size(n_.kex), std::byte{0});
+        std::size_t len = 0;
+        if (!kex_.public_value(local_public_, len) || len != local_public_.size()) {
+            return code::kex_failure;
+        }
+
+        if (auto ec = agree_with_peer(peer_public_)) return ec;
     }
-
-    if (auto ec = agree_with_peer(peer_public_)) return ec;
 
     if (auto ec = compute_hash(ctx, host_key_blob, peer_public_, local_public_)) return ec;
 
@@ -185,6 +219,107 @@ YANTERM_SSH_INLINE std::error_code key_exchange::accept_init(
     started_ = true;
     hash = hash_;
     return {};
+}
+
+YANTERM_SSH_INLINE std::error_code key_exchange::start_hybrid() {
+    kem_ = p_.new_kem(crypto::kem_id::mlkem768);
+    if (!kem_) return code::kex_failure;
+    kex_ = p_.new_kex(crypto::kex_id::curve25519);
+    if (!kex_) return code::kex_failure;
+
+    local_public_.assign(mlkem768x25519_init_size, std::byte{0});
+    const std::span<std::byte> out{local_public_};
+    std::size_t len = 0;
+    if (!kem_.public_key(out.first(mlkem768x25519_pq_public), len)
+        || len != mlkem768x25519_pq_public) {
+        return code::kex_failure;
+    }
+    if (!kex_.public_value(out.subspan(mlkem768x25519_pq_public), len)
+        || len != mlkem768x25519_cl_public) {
+        return code::kex_failure;
+    }
+    return {};
+}
+
+YANTERM_SSH_INLINE std::error_code key_exchange::accept_hybrid_init() {
+    assert(peer_public_.size() == mlkem768x25519_init_size);
+    const std::span<const std::byte> c_init{peer_public_};
+
+    local_public_.assign(mlkem768x25519_reply_size, std::byte{0});
+    const std::span<std::byte> out{local_public_};
+
+    constexpr std::size_t pq_secret = crypto::kem_secret_size(crypto::kem_id::mlkem768);
+    crypto::secure_bytes k_pq(pq_secret);
+    std::size_t ct_len = 0;
+    std::size_t ss_len = 0;
+    if (!p_.encapsulate(crypto::kem_id::mlkem768, c_init.first(mlkem768x25519_pq_public),
+                        out.first(mlkem768x25519_pq_ciphertext), ct_len, k_pq.span(), ss_len)
+        || ct_len != mlkem768x25519_pq_ciphertext || ss_len != pq_secret) {
+        return code::invalid_kex_reply;
+    }
+
+    kex_ = p_.new_kex(crypto::kex_id::curve25519);
+    if (!kex_) return code::kex_failure;
+    std::size_t len = 0;
+    if (!kex_.public_value(out.subspan(mlkem768x25519_pq_ciphertext), len)
+        || len != mlkem768x25519_cl_public) {
+        return code::kex_failure;
+    }
+
+    crypto::secure_bytes k_cl(crypto::kex_secret_size(crypto::kex_id::curve25519));
+    if (!kex_.agree(c_init.subspan(mlkem768x25519_pq_public), k_cl.span(), len)
+        || len != k_cl.size()) {
+        return code::weak_shared_secret;
+    }
+    return combine_hybrid_secret(k_pq.span(), k_cl.span());
+}
+
+YANTERM_SSH_INLINE std::error_code key_exchange::agree_hybrid_reply(
+    std::span<const std::byte> server_reply) {
+    assert(server_reply.size() == mlkem768x25519_reply_size);
+
+    constexpr std::size_t pq_secret = crypto::kem_secret_size(crypto::kem_id::mlkem768);
+    crypto::secure_bytes k_pq(pq_secret);
+    std::size_t len = 0;
+    const bool decapsulated =
+        kem_.decapsulate(server_reply.first(mlkem768x25519_pq_ciphertext), k_pq.span(), len)
+        && len == pq_secret;
+    kem_.reset();
+    if (!decapsulated) return code::kex_failure;
+
+    crypto::secure_bytes k_cl(crypto::kex_secret_size(crypto::kex_id::curve25519));
+    if (!kex_.agree(server_reply.subspan(mlkem768x25519_pq_ciphertext), k_cl.span(), len)
+        || len != k_cl.size()) {
+        return code::weak_shared_secret;
+    }
+    return combine_hybrid_secret(k_pq.span(), k_cl.span());
+}
+
+// RFC 10042 section 2.4: K = HASH(K_PQ || K_CL), with K_CL the 32-byte X25519
+// output taken as is rather than as a canonical mpint.
+YANTERM_SSH_INLINE std::error_code key_exchange::combine_hybrid_secret(
+    std::span<const std::byte> k_pq, std::span<const std::byte> k_cl) {
+    crypto::secure_bytes joined(k_pq.size() + k_cl.size());
+    const std::span<std::byte> buf = joined.span();
+    std::copy(k_pq.begin(), k_pq.end(), buf.begin());
+    std::copy(k_cl.begin(), k_cl.end(), buf.subspan(k_pq.size()).begin());
+    crypto::secure_bytes k(crypto::hash_output_size(n_.exchange_hash));
+    if (!p_.hash(n_.exchange_hash, joined.span(), k.span())) return code::hash_failure;
+    secret_.assign(k.span());
+    return {};
+}
+
+YANTERM_SSH_INLINE void key_exchange::write_shared_secret(wire::writer& out) const {
+    if (is_hybrid()) {
+        out.write_string(secret_.span());
+    } else {
+        out.write_mpint(secret_.span());
+    }
+}
+
+YANTERM_SSH_INLINE std::size_t key_exchange::shared_secret_encoded_size() const noexcept {
+    return is_hybrid() ? wire::encoded_string_size(secret_.size())
+                       : wire::encoded_mpint_size(secret_.span());
 }
 
 YANTERM_SSH_INLINE void key_exchange::store_shared_secret(std::span<const std::byte> raw) {
@@ -223,7 +358,7 @@ YANTERM_SSH_INLINE std::error_code key_exchange::compute_hash(const exchange_con
         hashed_bytes += wire::encoded_mpint_size(client_pub);
         hashed_bytes += wire::encoded_mpint_size(server_pub);
     }
-    hashed_bytes += wire::encoded_mpint_size(secret_.span());
+    hashed_bytes += shared_secret_encoded_size();
 
     struct wiping_writer {
         wire::writer w;
@@ -245,8 +380,8 @@ YANTERM_SSH_INLINE std::error_code key_exchange::compute_hash(const exchange_con
         enc.w.write_mpint(client_pub);
         enc.w.write_mpint(server_pub);
     }
-    // Binding J: K enters H as a canonical SSH mpint.
-    enc.w.write_mpint(secret_.span());
+    // Binding J: K enters H in the same encoding the key derivation uses.
+    write_shared_secret(enc.w);
     assert(enc.w.size() <= hashed_bytes);
 
     hash_.assign(crypto::hash_output_size(n_.exchange_hash), std::byte{0});

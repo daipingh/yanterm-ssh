@@ -35,7 +35,6 @@ yanterm-ssh 实现了 SSH-2 的线上协议与密码学协商，但**自身不�
 - **外部签名**：已提供外部签名接口，但未内置 ssh-agent 与 PKCS#11/智能卡客户端。
 - **agent 转发**：`auth-agent-req@openssh.com` 及对应通道。
 - **压缩**：`zlib@openssh.com` / `zlib`，目前只协商 `none`。
-- **后量子密钥交换**：`mlkem768x25519-sha256`、`sntrup761x25519-sha512@openssh.com`。
 - **SFTP / SCP**：未内置；可通过 `subsystem` 通道承载，但协议需自行实现。
 
 ## 支持的算法
@@ -44,7 +43,7 @@ yanterm-ssh 实现了 SSH-2 的线上协议与密码学协商，但**自身不�
 
 | 类别 | 默认启用 | 仅支持 |
 | --- | --- | --- |
-| 密钥交换 | `curve25519-sha256`、`curve25519-sha256@libssh.org`、`ecdh-sha2-nistp256/384/521`、`sm2-sm3`、`ecgm-sm2-sm3`、`diffie-hellman-group16-sha512`、`diffie-hellman-group14-sha256` | `diffie-hellman-group14-sha1` |
+| 密钥交换 | `mlkem768x25519-sha256`、`curve25519-sha256`、`curve25519-sha256@libssh.org`、`ecdh-sha2-nistp256/384/521`、`sm2-sm3`、`ecgm-sm2-sm3`、`diffie-hellman-group16-sha512`、`diffie-hellman-group14-sha256` | `diffie-hellman-group14-sha1` |
 | 主机密钥 | `ssh-ed25519`、`ecdsa-sha2-nistp256/384/521`、`sm2`、`rsa-sha2-512`、`rsa-sha2-256` | `ssh-rsa` |
 | 加密 | `chacha20-poly1305@openssh.com`、`aes256-gcm@openssh.com`、`aes128-gcm@openssh.com`、`aes256/192/128-ctr`、`sm4-ctr` | `sm4-cbc` |
 | MAC | `hmac-sha2-256-etm@openssh.com`、`hmac-sha2-512-etm@openssh.com`、`hmac-sha2-256`、`hmac-sha2-512`、`hmac-sm3` | `hmac-sha1` |

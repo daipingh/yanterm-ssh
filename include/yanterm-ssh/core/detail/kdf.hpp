@@ -21,9 +21,10 @@ namespace yanterm::ssh::core::detail {
 // `letter` is one of 'A'..'F'. `out` may be longer than one hash output, in
 // which case the extension rule below applies.
 //
-// `shared_secret_mpint` must already be the SSH mpint encoding of K (4-byte
-// length prefix plus payload, including any leading 0x00 pad). Do not pass the
-// raw magnitude.
+// `shared_secret_mpint` must already be the SSH encoding of K as written by
+// key_exchange::write_shared_secret: an mpint (4-byte length prefix plus
+// payload, including any leading 0x00 pad), or a string for
+// mlkem768x25519-sha256. Do not pass the raw value.
 std::error_code derive_key(crypto::provider p, crypto::hash_id h,
                             std::span<const std::byte> shared_secret_mpint,
                             std::span<const std::byte> exchange_hash,

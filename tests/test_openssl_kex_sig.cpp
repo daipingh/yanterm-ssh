@@ -160,6 +160,36 @@ TEST_CASE("kex public value rejects an undersized destination", "[crypto][openss
     REQUIRE_FALSE(a.public_value(too_small, len));
 }
 
+// FIPS 203 table 3 (ML-KEM-768): ek 1184 bytes, c 1088 bytes, K 32 bytes.
+TEST_CASE("ml-kem-768 encapsulation round-trips through the provider", "[crypto][openssl][kem]") {
+    crypto::provider p = prov();
+    if (!p.supports(crypto::kem_id::mlkem768)) {
+        SKIP("backend has no ML-KEM-768 (e.g. OpenSSL 3.0)");
+    }
+
+    crypto::kem_keypair keypair = p.new_kem(crypto::kem_id::mlkem768);
+    REQUIRE(static_cast<bool>(keypair));
+
+    std::vector<std::byte> ek(1184);
+    std::size_t ek_len = 0;
+    REQUIRE(keypair.public_key(ek, ek_len));
+    REQUIRE(ek_len == 1184);
+
+    std::vector<std::byte> ct(1088);
+    std::vector<std::byte> sender_secret(32);
+    std::size_t ct_len = 0;
+    std::size_t sender_len = 0;
+    REQUIRE(p.encapsulate(crypto::kem_id::mlkem768, ek, ct, ct_len, sender_secret, sender_len));
+    REQUIRE(ct_len == 1088);
+    REQUIRE(sender_len == 32);
+
+    std::vector<std::byte> receiver_secret(32);
+    std::size_t receiver_len = 0;
+    REQUIRE(keypair.decapsulate(ct, receiver_secret, receiver_len));
+    REQUIRE(receiver_len == 32);
+    REQUIRE(hex(receiver_secret) == hex(sender_secret));
+}
+
 // RFC 8032 section 7.1, TEST 1 and TEST 2.
 TEST_CASE("ed25519 verify matches RFC 8032 vectors", "[crypto][openssl][sig]") {
     crypto::provider p = prov();

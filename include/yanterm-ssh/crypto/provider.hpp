@@ -92,6 +92,25 @@ struct provider_vtable {
                              private_key_material* out,
                              std::byte* storage, std::size_t storage_cap,
                              std::size_t* storage_used) noexcept;
+
+    // --- key encapsulation ------------------------------------------------
+    // kem_new generates a decapsulation keypair (nullptr on failure); all
+    // randomness comes from this provider.
+    void* (*kem_new)(void* self, kem_id id) noexcept;
+    // Frees the keypair and wipes its private part.
+    void  (*kem_free)(void* self, void* ctx) noexcept;
+    // Writes the encoded encapsulation key; false if cap is too small.
+    bool  (*kem_public)(void* self, void* ctx, std::byte* out, std::size_t cap,
+                        std::size_t* out_len) noexcept;
+    // FIPS 203 implicit rejection: a ciphertext of the right length always
+    // decapsulates, a tampered one to an unrelated secret.
+    bool  (*kem_decaps)(void* self, void* ctx, const std::byte* ct, std::size_t ctlen,
+                        std::byte* ss, std::size_t cap, std::size_t* ss_len) noexcept;
+    // Stateless. Must run the FIPS 203 section 7.2 encapsulation key check and
+    // fail when it does not pass.
+    bool  (*kem_encaps)(void* self, kem_id id, const std::byte* pub, std::size_t publen,
+                        std::byte* ct, std::size_t ctcap, std::size_t* ct_len,
+                        std::byte* ss, std::size_t sscap, std::size_t* ss_len) noexcept;
 };
 
 class provider;
@@ -163,6 +182,11 @@ struct aead_tag {
 struct kex_tag {
     static void destroy(const provider_vtable* vt, void* self, void* ctx) noexcept {
         vt->kex_free(self, ctx);
+    }
+};
+struct kem_tag {
+    static void destroy(const provider_vtable* vt, void* self, void* ctx) noexcept {
+        vt->kem_free(self, ctx);
     }
 };
 struct signing_key_tag {
@@ -251,6 +275,20 @@ public:
     }
 };
 
+// Decapsulation side of a KEM: owns the private key from provider::new_kem.
+class kem_keypair : public detail::handle<detail::kem_tag> {
+public:
+    using handle::handle;
+
+    [[nodiscard]] bool public_key(std::span<std::byte> out, std::size_t& len) noexcept {
+        return vt_->kem_public(self_, ctx_, out.data(), out.size(), &len);
+    }
+    [[nodiscard]] bool decapsulate(std::span<const std::byte> ct, std::span<std::byte> ss,
+                                   std::size_t& len) noexcept {
+        return vt_->kem_decaps(self_, ctx_, ct.data(), ct.size(), ss.data(), ss.size(), &len);
+    }
+};
+
 namespace detail_adapt {
 template <class T>
 struct decorate_thunks;
@@ -273,8 +311,17 @@ public:
     [[nodiscard]] bool supports(hash_id id) const noexcept { return sup(primitive_kind::hash, id); }
     [[nodiscard]] bool supports(cipher_id id) const noexcept { return sup(primitive_kind::cipher, id); }
     [[nodiscard]] bool supports(mac_id id) const noexcept { return sup(primitive_kind::mac, id); }
-    [[nodiscard]] bool supports(kex_id id) const noexcept { return sup(primitive_kind::kex, id); }
+    [[nodiscard]] bool supports(kex_id id) const noexcept {
+        if (id == kex_id::mlkem768x25519) {
+            return supports(kem_id::mlkem768) && supports(kex_id::curve25519);
+        }
+        return sup(primitive_kind::kex, id);
+    }
     [[nodiscard]] bool supports(sig_id id) const noexcept { return sup(primitive_kind::signature, id); }
+    // True only when the backend fills the whole kem group and reports the id.
+    [[nodiscard]] bool supports(kem_id id) const noexcept {
+        return has_kem() && sup(primitive_kind::kem, id);
+    }
 
     [[nodiscard]] std::error_code random_bytes(std::span<std::byte> out) const noexcept {
         if (!vt_ || vt_->random_bytes == nullptr) {
@@ -312,6 +359,17 @@ public:
     [[nodiscard]] kex_agreement new_kex(kex_id id) const noexcept {
         if (!vt_ || vt_->kex_new == nullptr) return {};
         return {vt_, self_, vt_->kex_new(self_, id)};
+    }
+    [[nodiscard]] kem_keypair new_kem(kem_id id) const noexcept {
+        if (!has_kem()) return {};
+        return {vt_, self_, vt_->kem_new(self_, id)};
+    }
+    [[nodiscard]] bool encapsulate(kem_id id, std::span<const std::byte> pub,
+                                   std::span<std::byte> ct, std::size_t& ct_len,
+                                   std::span<std::byte> ss, std::size_t& ss_len) const noexcept {
+        if (!has_kem()) return false;
+        return vt_->kem_encaps(self_, id, pub.data(), pub.size(), ct.data(), ct.size(), &ct_len,
+                               ss.data(), ss.size(), &ss_len);
     }
     [[nodiscard]] signing_key new_signing_key(const private_key_material& key) const noexcept {
         if (!vt_ || vt_->signing_key_new == nullptr) return {};
@@ -370,6 +428,12 @@ private:
     // Type-erased backend; decorate() forwards unoverridden slots through these.
     [[nodiscard]] const provider_vtable* vtable() const noexcept { return vt_; }
     [[nodiscard]] void* self_ptr() const noexcept { return self_; }
+
+    [[nodiscard]] bool has_kem() const noexcept {
+        return vt_ != nullptr && vt_->kem_new != nullptr && vt_->kem_free != nullptr
+               && vt_->kem_public != nullptr && vt_->kem_decaps != nullptr
+               && vt_->kem_encaps != nullptr;
+    }
 
     template <class Id>
     [[nodiscard]] bool sup(primitive_kind kind, Id id) const noexcept {

@@ -27,11 +27,11 @@ namespace yanterm::ssh::testing {
 // stream. Other slots (hash/hmac/cipher/aead/poly1305, and unoverridden
 // supports / constant_time_eq) are forwarded by provider::decorate.
 //
-// OpenSSL's kex_new / ECDSA sig_sign / generate_keypair still call RAND_bytes
-// internally. Those overlay entry points open a rand_scope that routes OpenSSL
-// randomness to this instance's PRNG so multiple fixed_random_provider objects
-// can coexist (client + server loopback) without sharing one process-global
-// stream.
+// OpenSSL's kex_new / kem_new / kem_encaps / ECDSA sig_sign / generate_keypair
+// still call RAND_bytes internally. Those overlay entry points open a
+// rand_scope that routes OpenSSL randomness to this instance's PRNG so
+// multiple fixed_random_provider objects can coexist (client + server
+// loopback) without sharing one process-global stream.
 class fixed_random_provider {
 public:
     fixed_random_provider(crypto::provider inner, std::uint64_t seed)
@@ -105,6 +105,34 @@ public:
         }
         *storage_used = storage_cap;
         return true;
+    }
+
+    void* kem_new(crypto::kem_id id) noexcept {
+        rand_scope scope{this};
+        auto h = inner_.new_kem(id);
+        if (!h) return nullptr;
+        return new (std::nothrow) crypto::kem_keypair(std::move(h));
+    }
+    void kem_free(void* ctx) noexcept { delete static_cast<crypto::kem_keypair*>(ctx); }
+    bool kem_public(void* ctx, std::byte* out, std::size_t cap, std::size_t* out_len) noexcept {
+        if (ctx == nullptr || out_len == nullptr) return false;
+        return static_cast<crypto::kem_keypair*>(ctx)->public_key(
+            std::span<std::byte>{out, cap}, *out_len);
+    }
+    bool kem_decaps(void* ctx, const std::byte* ct, std::size_t ctlen, std::byte* ss,
+                    std::size_t cap, std::size_t* ss_len) noexcept {
+        if (ctx == nullptr || ss_len == nullptr) return false;
+        return static_cast<crypto::kem_keypair*>(ctx)->decapsulate(
+            std::span<const std::byte>{ct, ctlen}, std::span<std::byte>{ss, cap}, *ss_len);
+    }
+    bool kem_encaps(crypto::kem_id id, const std::byte* pub, std::size_t publen, std::byte* ct,
+                    std::size_t ctcap, std::size_t* ct_len, std::byte* ss, std::size_t sscap,
+                    std::size_t* ss_len) noexcept {
+        rand_scope scope{this};
+        if (ct_len == nullptr || ss_len == nullptr) return false;
+        return inner_.encapsulate(id, std::span<const std::byte>{pub, publen},
+                                  std::span<std::byte>{ct, ctcap}, *ct_len,
+                                  std::span<std::byte>{ss, sscap}, *ss_len);
     }
 
 private:

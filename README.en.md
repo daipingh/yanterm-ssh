@@ -35,7 +35,6 @@ The following capabilities are common in mainstream implementations such as Open
 - **External signing**: an external signing interface is provided, but no ssh-agent or PKCS#11/smart-card client is built in.
 - **Agent forwarding**: `auth-agent-req@openssh.com` and its channel.
 - **Compression**: `zlib@openssh.com` / `zlib`; only `none` is negotiated.
-- **Post-quantum key exchange**: `mlkem768x25519-sha256`, `sntrup761x25519-sha512@openssh.com`.
 - **SFTP / SCP**: not built in; they can be carried over a `subsystem` channel, but the protocol must be implemented by the application.
 
 ## Supported algorithms
@@ -44,7 +43,7 @@ Algorithms are listed in default preference order. The "Enabled by default" colu
 
 | Category | Enabled by default | Supported only |
 | --- | --- | --- |
-| Key exchange | `curve25519-sha256`, `curve25519-sha256@libssh.org`, `ecdh-sha2-nistp256/384/521`, `sm2-sm3`, `ecgm-sm2-sm3`, `diffie-hellman-group16-sha512`, `diffie-hellman-group14-sha256` | `diffie-hellman-group14-sha1` |
+| Key exchange | `mlkem768x25519-sha256`, `curve25519-sha256`, `curve25519-sha256@libssh.org`, `ecdh-sha2-nistp256/384/521`, `sm2-sm3`, `ecgm-sm2-sm3`, `diffie-hellman-group16-sha512`, `diffie-hellman-group14-sha256` | `diffie-hellman-group14-sha1` |
 | Host key | `ssh-ed25519`, `ecdsa-sha2-nistp256/384/521`, `sm2`, `rsa-sha2-512`, `rsa-sha2-256` | `ssh-rsa` |
 | Cipher | `chacha20-poly1305@openssh.com`, `aes256-gcm@openssh.com`, `aes128-gcm@openssh.com`, `aes256/192/128-ctr`, `sm4-ctr` | `sm4-cbc` |
 | MAC | `hmac-sha2-256-etm@openssh.com`, `hmac-sha2-512-etm@openssh.com`, `hmac-sha2-256`, `hmac-sha2-512`, `hmac-sm3` | `hmac-sha1` |

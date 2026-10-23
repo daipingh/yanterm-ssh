@@ -459,10 +459,13 @@ TEST_CASE("negotiated names stay valid after handshake and rekey",
     auto server = make_server(p);
     configure_server(server, hm);
     REQUIRE(run_handshake(client, server));
+    const std::string_view default_kex = p.supports(crypto::kex_id::mlkem768x25519)
+                                             ? "mlkem768x25519-sha256"
+                                             : "curve25519-sha256";
 
     const auto* n = client.conn.negotiated();
     REQUIRE(n != nullptr);
-    CHECK(n->kex_name == "curve25519-sha256");
+    CHECK(n->kex_name == default_kex);
     CHECK(n->host_key_name == "ssh-ed25519");
 
     rekey_capture cap;
@@ -471,9 +474,9 @@ TEST_CASE("negotiated names stay valid after handshake and rekey",
     REQUIRE(cap.client_rekey_done == 1);
     n = client.conn.negotiated();
     REQUIRE(n != nullptr);
-    CHECK(n->kex_name == "curve25519-sha256");
+    CHECK(n->kex_name == default_kex);
     CHECK(n->host_key_name == "ssh-ed25519");
-    CHECK(server.conn.negotiated()->kex_name == "curve25519-sha256");
+    CHECK(server.conn.negotiated()->kex_name == default_kex);
 }
 
 TEST_CASE("deferred control is flushed before on_rekey_done", "[rekey]") {

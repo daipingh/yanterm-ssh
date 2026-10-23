@@ -786,6 +786,7 @@ err:
         case kex_id::ecdh_sm2:
         case kex_id::sm2_kap:
         case kex_id::sm2_kap_server: return sm2_avail;
+        case kex_id::mlkem768x25519: return false;
         }
         return false;
     case primitive_kind::signature:
@@ -801,6 +802,7 @@ err:
         case sig_id::sm2_ecdsa: return sm2_avail;
         }
         return false;
+    case primitive_kind::kem: return false;
     }
     return false;
 }

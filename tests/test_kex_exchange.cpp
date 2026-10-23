@@ -204,11 +204,13 @@ TEST_CASE("client/server kex round-trip agrees on H and K", "[kex][exchange]") {
         {crypto::kex_id::dh_group16, "diffie-hellman-group16-sha512", crypto::hash_id::sha512},
         {crypto::kex_id::ecdh_sm2, "ecgm-sm2-sm3", crypto::hash_id::sm3},
         {crypto::kex_id::sm2_kap, "sm2-sm3", crypto::hash_id::sm3},
+        {crypto::kex_id::mlkem768x25519, "mlkem768x25519-sha256", crypto::hash_id::sha256},
     };
 
     for (const auto& c : cases) {
         INFO(c.name);
         if (c.id == crypto::kex_id::ecdh_sm2 && !p.supports(c.id)) continue;
+        if (c.id == crypto::kex_id::mlkem768x25519 && !p.supports(c.id)) continue;
         const auto n = make_negotiated(c.id, c.name, c.hash);
         const auto rt = run_round_trip(p, n, hs, fx);
         REQUIRE(rt.client_hash == rt.server_hash);
@@ -276,28 +278,41 @@ TEST_CASE("wrong Q_S length yields invalid_kex_reply", "[kex][exchange]") {
     crypto::provider p = prov();
     auto hs = make_ed25519_signer(p);
     exchange_fixture fx;
-    const auto n =
-        make_negotiated(crypto::kex_id::curve25519, "curve25519-sha256", crypto::hash_id::sha256);
 
-    core::detail::key_exchange client{p, n, core::role::client};
-    wire::writer init_w;
-    REQUIRE_FALSE(client.start(init_w));
+    // RFC 10042 section 2.1: S_REPLY must be exactly 1088 + 32 bytes.
+    const struct {
+        crypto::kex_id id;
+        std::string_view name;
+    } cases[] = {
+        {crypto::kex_id::curve25519, "curve25519-sha256"},
+        {crypto::kex_id::mlkem768x25519, "mlkem768x25519-sha256"},
+    };
 
-    // Craft an ECDH reply with a truncated Q_S.
-    const std::array<std::byte, 16> bad_qs{};
-    const std::array<std::byte, 4> bogus_sig{std::byte{0}, std::byte{0}, std::byte{0},
-                                             std::byte{0}};
-    wire::writer reply_w;
-    wire::detail::kex_ecdh_reply reply;
-    reply.host_key = hs.blob;
-    reply.server_public = bad_qs;
-    reply.signature = bogus_sig;
-    reply.encode(reply_w);
+    for (const auto& c : cases) {
+        INFO(c.name);
+        if (c.id == crypto::kex_id::mlkem768x25519 && !p.supports(c.id)) continue;
+        const auto n = make_negotiated(c.id, c.name, crypto::hash_id::sha256);
 
-    core::detail::host_key_view host_key;
-    std::span<const std::byte> client_hash;
-    const auto ec = client.accept_reply(fx.ctx(), reply_w.data(), host_key, client_hash);
-    REQUIRE(ec == code::invalid_kex_reply);
+        core::detail::key_exchange client{p, n, core::role::client};
+        wire::writer init_w;
+        REQUIRE_FALSE(client.start(init_w));
+
+        // Craft an ECDH reply with a truncated Q_S.
+        const std::array<std::byte, 16> bad_qs{};
+        const std::array<std::byte, 4> bogus_sig{std::byte{0}, std::byte{0}, std::byte{0},
+                                                 std::byte{0}};
+        wire::writer reply_w;
+        wire::detail::kex_ecdh_reply reply;
+        reply.host_key = hs.blob;
+        reply.server_public = bad_qs;
+        reply.signature = bogus_sig;
+        reply.encode(reply_w);
+
+        core::detail::host_key_view host_key;
+        std::span<const std::byte> client_hash;
+        const auto ec = client.accept_reply(fx.ctx(), reply_w.data(), host_key, client_hash);
+        REQUIRE(ec == code::invalid_kex_reply);
+    }
 }
 
 TEST_CASE("non-curve25519 agree failure is invalid_kex_reply", "[kex][exchange]") {

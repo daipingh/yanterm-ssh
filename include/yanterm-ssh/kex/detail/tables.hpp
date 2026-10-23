@@ -53,6 +53,7 @@ struct mac_entry {
 };
 
 inline constexpr kex_entry kex_table[] = {
+    {"mlkem768x25519-sha256", crypto::kex_id::mlkem768x25519, crypto::hash_id::sha256},
     {"curve25519-sha256", crypto::kex_id::curve25519, crypto::hash_id::sha256},
     {"curve25519-sha256@libssh.org", crypto::kex_id::curve25519, crypto::hash_id::sha256},
     {"ecdh-sha2-nistp256", crypto::kex_id::ecdh_nistp256, crypto::hash_id::sha256},
@@ -104,7 +105,8 @@ inline constexpr mac_entry mac_table[] = {
     case crypto::kex_id::ecdh_nistp521:
     case crypto::kex_id::ecdh_sm2:
     case crypto::kex_id::sm2_kap:
-    case crypto::kex_id::sm2_kap_server: return true;
+    case crypto::kex_id::sm2_kap_server:
+    case crypto::kex_id::mlkem768x25519: return true;
     default: return false;
     }
 }
