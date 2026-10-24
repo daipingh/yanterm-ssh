@@ -51,7 +51,15 @@ YANTERM_SSH_INLINE std::error_code connection::feed(std::span<const std::byte> i
         std::error_code ec = reader_.read(in.subspan(accepted), n, pool_, payload);
         accepted += n;
         if (ec) {
-            result = fail(ec, detail::format_phase_detail(static_cast<std::uint8_t>(phase_)));
+            // Only the inbound direction is broken, so the writer can still
+            // carry a DISCONNECT. Every peer-attributable packet error maps to
+            // one reason and text: distinct ones would be a padding/MAC oracle.
+            const bool local = ec == errc::crypto_backend_failure;
+            result = fail_and_disconnect(
+                ec,
+                local ? wire::disconnect_reason::by_application : wire::disconnect_reason::protocol_error,
+                local ? "internal error" : "bad packet",
+                detail::format_phase_detail(static_cast<std::uint8_t>(phase_)));
             break;
         }
         if (payload.empty()) {

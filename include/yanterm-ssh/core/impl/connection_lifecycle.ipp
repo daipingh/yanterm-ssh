@@ -53,6 +53,18 @@ YANTERM_SSH_INLINE std::error_code connection::fail(std::error_code ec, std::str
     return failure_;
 }
 
+YANTERM_SSH_INLINE std::error_code connection::fail_and_disconnect(std::error_code ec,
+                                                                  wire::disconnect_reason reason,
+                                                                  std::string_view description,
+                                                                  std::string detail) {
+    auto err = fail(ec, std::move(detail));
+    if (phase_ != phase::dead) {
+        (void)enqueue_disconnect(reason, description);
+        phase_ = phase::dead;
+    }
+    return err;
+}
+
 YANTERM_SSH_INLINE std::error_code connection::enqueue_disconnect(wire::disconnect_reason reason,
                                    std::string_view description) {
     wire::detail::disconnect_msg msg;
@@ -88,15 +100,25 @@ YANTERM_SSH_INLINE std::error_code connection::handle_payload(memory::detail::pa
     if (payload.empty()) return code::invalid_format;
     const auto id = static_cast<wire::msg>(std::to_integer<std::uint8_t>(payload[0]));
     auto unexpected = [&] {
-        return fail(code::unexpected_message,
-                    detail::format_unexpected_message(static_cast<std::uint8_t>(id),
-                                                      static_cast<std::uint8_t>(phase_)));
+        return fail_and_disconnect(code::unexpected_message, wire::disconnect_reason::protocol_error,
+                                   "unexpected message",
+                                   detail::format_unexpected_message(static_cast<std::uint8_t>(id),
+                                                                     static_cast<std::uint8_t>(phase_)));
+    };
+    auto strict_kex_violation = [&] {
+        return fail_and_disconnect(code::strict_kex_violation, wire::disconnect_reason::protocol_error,
+                                   "strict KEX violation");
     };
 
     if (id == wire::msg::disconnect) {
         wire::reader r{payload};
         wire::detail::disconnect_msg msg;
-        if (!msg.decode(r)) return code::invalid_format;
+        if (!msg.decode(r)) {
+            // The peer is already tearing down; answering would only race its close.
+            fail(code::invalid_format);
+            phase_ = phase::dead;
+            return failure_;
+        }
         fail(code::peer_disconnected);
         phase_ = phase::dead;
         notify([&](handler& app, connection& self) {
@@ -108,15 +130,16 @@ YANTERM_SSH_INLINE std::error_code connection::handle_payload(memory::detail::pa
     // Strict KEX (CVE-2023-48795): once enabled, IGNORE/DEBUG/UNIMPLEMENTED
     // are forbidden for the rest of the initial KEX (until NEWKEYS is received).
     if (id == wire::msg::ignore || id == wire::msg::debug || id == wire::msg::unimplemented) {
-        if (strict_kex_active_ && in_initial_kex()) {
-            return code::strict_kex_violation;
-        }
+        if (strict_kex_active_ && in_initial_kex()) return strict_kex_violation();
     }
 
     if (id == wire::msg::ignore) {
         wire::reader r{payload};
         wire::detail::ignore_msg msg;
-        if (!msg.decode(r)) return code::invalid_format;
+        if (!msg.decode(r)) {
+            return fail_and_disconnect(code::invalid_format, wire::disconnect_reason::protocol_error,
+                                       "malformed IGNORE");
+        }
         notify([&](handler& app, connection& self) { app.on_ignore(self, msg.data); });
         note_inbound_packet();
         return {};
@@ -125,7 +148,10 @@ YANTERM_SSH_INLINE std::error_code connection::handle_payload(memory::detail::pa
     if (id == wire::msg::debug) {
         wire::reader r{payload};
         wire::detail::debug_msg msg;
-        if (!msg.decode(r)) return code::invalid_format;
+        if (!msg.decode(r)) {
+            return fail_and_disconnect(code::invalid_format, wire::disconnect_reason::protocol_error,
+                                       "malformed DEBUG");
+        }
         notify([&](handler& app, connection& self) {
             app.on_debug(self, msg.always_display, msg.message, msg.language);
         });
@@ -155,9 +181,7 @@ YANTERM_SSH_INLINE std::error_code connection::handle_payload(memory::detail::pa
     case phase::wait_kexinit:
         if (id != wire::msg::kexinit) {
             // First binary packet must be KEXINIT when we advertise strict.
-            if (!rekeying_ && cfg_.advertise_strict_kex) {
-                return code::strict_kex_violation;
-            }
+            if (!rekeying_ && cfg_.advertise_strict_kex) return strict_kex_violation();
             if (rekeying_) return dispatch_app(payload, &pkt);
             return unexpected();
         }
@@ -246,9 +270,10 @@ YANTERM_SSH_INLINE bool connection::is_connection_layer(wire::msg id) noexcept {
 YANTERM_SSH_INLINE std::error_code connection::dispatch_app(std::span<const std::byte> payload, memory::detail::page_slice* pkt_page) {
     const auto id = static_cast<wire::msg>(std::to_integer<std::uint8_t>(payload[0]));
     auto unexpected = [&] {
-        return fail(code::unexpected_message,
-                    detail::format_unexpected_message(static_cast<std::uint8_t>(id),
-                                                      static_cast<std::uint8_t>(phase_)));
+        return fail_and_disconnect(code::unexpected_message, wire::disconnect_reason::protocol_error,
+                                   "unexpected message",
+                                   detail::format_unexpected_message(static_cast<std::uint8_t>(id),
+                                                                     static_cast<std::uint8_t>(phase_)));
     };
     if (!service_ready_) {
         if (id != wire::msg::service_request && id != wire::msg::service_accept) {
