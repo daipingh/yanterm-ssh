@@ -73,21 +73,19 @@ YANTERM_SSH_INLINE std::error_code connection::resolve(host_key_ticket ticket, h
     host_key_pending_ = false;
 
     if (v == host_key_verdict::reject) {
-        fail(code::host_key_rejected);
-        (void)enqueue_disconnect(wire::disconnect_reason::host_key_not_verifiable,
-                                 "host key rejected");
-        phase_ = phase::dead;
         round_->cached_reply.clear();
-        return code::host_key_rejected;
+        return fail_and_disconnect(code::host_key_rejected,
+                                   wire::disconnect_reason::host_key_not_verifiable,
+                                   "host key rejected");
     }
 
     detail::host_key_view verified;
     std::span<const std::byte> hash;
     if (auto err = round_->exchange->accept_reply(make_exchange_context(), round_->cached_reply, verified, hash)) {
-        fail(err);
-        phase_ = phase::dead;
         round_->cached_reply.clear();
-        return err;
+        return fail_and_disconnect(err, wire::disconnect_reason::key_exchange_failed,
+                                   "key exchange failed",
+                                   detail::format_kex_handler(negotiated_.kex_name, "reply", rekeying_));
     }
     if (crypto::is_sm2_sig(round_->exchange->host_sig_id())) {
         sm2_userauth_sig_ = round_->exchange->host_sig_id();
@@ -96,9 +94,9 @@ YANTERM_SSH_INLINE std::error_code connection::resolve(host_key_ticket ticket, h
     round_->cached_reply.clear();
 
     if (auto err = finish_kex_and_send_newkeys(hash)) {
-        fail(err);
-        phase_ = phase::dead;
-        return err;
+        return fail_and_disconnect(err, wire::disconnect_reason::key_exchange_failed,
+                                   "key exchange failed",
+                                   detail::format_kex_handler(negotiated_.kex_name, "reply", rekeying_));
     }
     if (auto err = send_service_request()) {
         fail(err);
@@ -156,7 +154,8 @@ YANTERM_SSH_INLINE std::error_code connection::begin_rekey() {
 
 YANTERM_SSH_INLINE std::error_code connection::on_peer_identification() {
     if (role_ == role::server && !host_key_set_) {
-        return code::invalid_state;
+        return fail_and_disconnect(code::invalid_state, wire::disconnect_reason::key_exchange_failed,
+                                   "key exchange failed");
     }
 
     if (auto ec = send_kexinit()) return ec;
@@ -176,7 +175,11 @@ YANTERM_SSH_INLINE std::error_code connection::send_kexinit() {
     std::vector<std::string_view> server_host_key_allow;
     std::span<const std::string_view> host_key_allow{};
     if (role_ == role::server) {
-        if (!host_key_set_ || host_keys_.empty()) return code::invalid_state;
+        if (!host_key_set_ || host_keys_.empty()) {
+            return fail_and_disconnect(code::invalid_state,
+                                       wire::disconnect_reason::key_exchange_failed,
+                                       "key exchange failed");
+        }
         for (const auto& e : kex::detail::host_key_table) {
             if (!p_.supports(e.id)) continue;
             bool ok = false;
@@ -191,7 +194,9 @@ YANTERM_SSH_INLINE std::error_code connection::send_kexinit() {
             if (ok) server_host_key_allow.push_back(e.name);
         }
         if (server_host_key_allow.empty()) {
-            return code::unsupported_algorithm;
+            return fail_and_disconnect(code::unsupported_algorithm,
+                                       wire::disconnect_reason::key_exchange_failed,
+                                       "key exchange failed");
         }
         host_key_allow = server_host_key_allow;
     }
@@ -213,12 +218,16 @@ YANTERM_SSH_INLINE std::error_code connection::send_kexinit() {
         if (names.host_key.empty()) add("host_key");
         if (names.cipher.empty()) add("cipher");
         if (names.mac.empty()) add("mac");
-        return fail(code::empty_algorithm_list,
-                    std::move(empty));
+        return fail_and_disconnect(code::empty_algorithm_list,
+                                   wire::disconnect_reason::key_exchange_failed,
+                                   "key exchange failed", std::move(empty));
     }
 
     wire::detail::kexinit msg;
-    if (auto ec = p_.random_bytes(msg.cookie)) return ec;
+    if (auto ec = p_.random_bytes(msg.cookie)) {
+        return fail_and_disconnect(ec, wire::disconnect_reason::key_exchange_failed,
+                                   "key exchange failed");
+    }
     msg.out_kex_algorithms = names.kex;
     msg.out_server_host_key_algorithms = names.host_key;
     msg.out_encryption_c2s = names.cipher;
@@ -231,7 +240,12 @@ YANTERM_SSH_INLINE std::error_code connection::send_kexinit() {
     wire::writer payload;
     msg.encode(payload);
     r.our_kexinit.assign(payload.data().begin(), payload.data().end());
-    return write_packet(r.our_kexinit);
+    if (auto ec = write_packet(r.our_kexinit)) {
+        fail(ec);
+        phase_ = phase::dead;
+        return ec;
+    }
+    return {};
 }
 
 YANTERM_SSH_INLINE bool connection::in_initial_kex() const noexcept {
@@ -267,13 +281,16 @@ YANTERM_SSH_INLINE std::error_code connection::on_kexinit(std::span<const std::b
     wire::reader peer_r{r.peer_kexinit};
     wire::detail::kexinit peer_msg;
     if (!peer_msg.decode(peer_r) || !peer_r.empty()) {
-        return code::invalid_format;
+        return fail_and_disconnect(code::invalid_format, wire::disconnect_reason::protocol_error,
+                                   "malformed KEXINIT");
     }
 
     wire::reader our_r{r.our_kexinit};
     wire::detail::kexinit our_msg;
     if (!our_msg.decode(our_r) || !our_r.empty()) {
-        return code::invalid_format;
+        return fail_and_disconnect(code::invalid_format,
+                                   wire::disconnect_reason::key_exchange_failed,
+                                   "key exchange failed");
     }
 
     const wire::detail::kexinit& client_msg = (role_ == role::client) ? our_msg : peer_msg;
@@ -310,7 +327,8 @@ YANTERM_SSH_INLINE std::error_code connection::on_kexinit(std::span<const std::b
             detail::append_quoted_field(d, "s2c_local", local.compression_s2c.raw(), false);
             detail::append_quoted_field(d, "s2c_peer", peer.compression_s2c.raw(), true);
         }
-        return fail(ec, std::move(d));
+        return fail_and_disconnect(ec, wire::disconnect_reason::key_exchange_failed,
+                                   "algorithm negotiation failed", std::move(d));
     }
     negotiated_ready_ = true;
     r.exchange.emplace(p_, negotiated_, role_);
@@ -321,7 +339,9 @@ YANTERM_SSH_INLINE std::error_code connection::on_kexinit(std::span<const std::b
         // initial key exchange (Terrapin). Rekey keeps app traffic flowing.
         if (!rekeying_) {
             if (reader_.sequence_number() != 1) {
-                return code::strict_kex_violation;
+                return fail_and_disconnect(code::strict_kex_violation,
+                                           wire::disconnect_reason::protocol_error,
+                                           "strict KEX violation");
             }
             strict_kex_active_ = true;
         }
@@ -330,9 +350,16 @@ YANTERM_SSH_INLINE std::error_code connection::on_kexinit(std::span<const std::b
     if (role_ == role::client) {
         wire::writer init_w;
         if (auto ec = r.exchange->start(init_w)) {
-            return fail(ec, detail::format_kex_handler(negotiated_.kex_name, "start", rekeying_));
+            return fail_and_disconnect(ec, wire::disconnect_reason::key_exchange_failed,
+                                       "key exchange failed",
+                                       detail::format_kex_handler(negotiated_.kex_name, "start",
+                                                                  rekeying_));
         }
-        if (auto ec = write_packet(init_w.data())) return ec;
+        if (auto ec = write_packet(init_w.data())) {
+            fail(ec);
+            phase_ = phase::dead;
+            return ec;
+        }
     }
     phase_ = phase::wait_kex_msg;
     return {};
@@ -341,8 +368,10 @@ YANTERM_SSH_INLINE std::error_code connection::on_kexinit(std::span<const std::b
 YANTERM_SSH_INLINE std::error_code connection::on_client_kex_reply(std::span<const std::byte> payload) {
     // 修正G: parse host key for policy, cache full reply; accept_reply only
     // after resolve(accept).
-    auto fail_kex = [&](std::error_code ec) {
-        return fail(ec, detail::format_kex_handler(negotiated_.kex_name, "reply", rekeying_));
+    auto fail_kex = [&](std::error_code ec, std::string_view description = "key exchange failed") {
+        return fail_and_disconnect(ec, wire::disconnect_reason::key_exchange_failed,
+                                   description,
+                                   detail::format_kex_handler(negotiated_.kex_name, "reply", rekeying_));
     };
     round_->cached_reply.assign(payload.begin(), payload.end());
 
@@ -366,7 +395,7 @@ YANTERM_SSH_INLINE std::error_code connection::on_client_kex_reply(std::span<con
         // Rekey: byte-compare to the first K_S; never emit verify_host_key.
         if (ks.size() != first_host_key_blob_.size()
             || !std::equal(ks.begin(), ks.end(), first_host_key_blob_.begin())) {
-            return fail_kex(code::host_key_changed);
+            return fail_kex(code::host_key_changed, "host key changed");
         }
         detail::host_key_view verified;
         std::span<const std::byte> hash;
@@ -386,7 +415,7 @@ YANTERM_SSH_INLINE std::error_code connection::on_client_kex_reply(std::span<con
     first_host_key_blob_ = peer_host_key_blob_;
 
     if (host_key_round_ == std::numeric_limits<std::uint64_t>::max()) {
-        return fail(code::invalid_state);
+        return fail_kex(code::invalid_state);
     }
     ++host_key_round_;
     host_key_pending_ = true;
@@ -418,8 +447,10 @@ YANTERM_SSH_INLINE const connection::installed_host_key* connection::select_host
 }
 
 YANTERM_SSH_INLINE std::error_code connection::on_server_kex_init(std::span<const std::byte> payload) {
-    auto fail_kex = [&](std::error_code ec) {
-        return fail(ec, detail::format_kex_handler(negotiated_.kex_name, "init", rekeying_));
+    auto fail_kex = [&](std::error_code ec, std::string_view description = "key exchange failed") {
+        return fail_and_disconnect(ec, wire::disconnect_reason::key_exchange_failed,
+                                   description,
+                                   detail::format_kex_handler(negotiated_.kex_name, "init", rekeying_));
     };
     if (!host_key_set_ || host_keys_.empty() || !(round_ && round_->exchange)) {
         return fail_kex(code::invalid_state);

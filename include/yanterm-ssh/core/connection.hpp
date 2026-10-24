@@ -246,6 +246,10 @@ private:
     };
 
     std::error_code fail(std::error_code ec, std::string detail = {});
+    // `description` goes to the peer, often in plaintext: keep it a static,
+    // coarse string, never failure detail or peer-supplied bytes.
+    std::error_code fail_and_disconnect(std::error_code ec, wire::disconnect_reason reason,
+                                        std::string_view description, std::string detail = {});
 
     [[nodiscard]] detail::exchange_context make_exchange_context() const noexcept;
 
