@@ -14,8 +14,6 @@ enum class errc : int {
     negotiation_failed,
     unsupported_algorithm,
     crypto_backend_failure,
-    transport_failed,
-    invalid_state,
     too_many_channels,
     session_closed,
     peer_disconnected,
@@ -25,6 +23,9 @@ enum class errc : int {
     incorrect_passphrase,
     unsupported_key_format,
     insecure_permissions,
+    invalid_state,
+    invalid_argument,
+    transport_failed,
 };
 
 [[nodiscard]] const std::error_category& condition_category() noexcept;
@@ -60,8 +61,6 @@ inline std::string detail::ssh_condition_category::message(int value) const {
     case errc::negotiation_failed:     return "negotiation failed";
     case errc::unsupported_algorithm:  return "unsupported algorithm";
     case errc::crypto_backend_failure: return "crypto backend failure";
-    case errc::transport_failed:       return "transport failed";
-    case errc::invalid_state:          return "invalid state";
     case errc::too_many_channels:      return "too many channels";
     case errc::session_closed:         return "session closed";
     case errc::peer_disconnected:      return "peer disconnected";
@@ -71,6 +70,9 @@ inline std::string detail::ssh_condition_category::message(int value) const {
     case errc::incorrect_passphrase:   return "incorrect passphrase";
     case errc::unsupported_key_format: return "unsupported key format";
     case errc::insecure_permissions:   return "insecure permissions";
+    case errc::invalid_state:          return "invalid state";
+    case errc::invalid_argument:       return "invalid argument";
+    case errc::transport_failed:       return "transport failed";
     }
     return "unknown yanterm-ssh error condition";
 }

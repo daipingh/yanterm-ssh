@@ -19,11 +19,14 @@
 #include "handshake_fixture.hpp"
 #include "loopback.hpp"
 #include "recording_handler.hpp"
+#include "scripted_peer.hpp"
 
 #include <algorithm>
 #include <array>
 #include <cstddef>
 #include <cstdint>
+#include <iterator>
+#include <optional>
 #include <span>
 #include <string>
 #include <string_view>
@@ -886,8 +889,8 @@ TEST_CASE("packet read error records failure_detail", "[connection][handshake]")
     bogus[3] = std::byte{0xff};
     n = 0;
     ec = client.conn.feed(bogus, n);
-    REQUIRE(client.conn.failure() == code::packet_too_large);
-    REQUIRE(ec == code::packet_too_large);
+    REQUIRE(client.conn.failure() == code::invalid_packet_length);
+    REQUIRE(ec == code::invalid_packet_length);
     REQUIRE_FALSE(client.conn.failure_detail().empty());
 }
 
@@ -926,4 +929,453 @@ TEST_CASE("set_host_key copies private material; caller seed still signs after s
     std::size_t n = 0;
     REQUIRE(key.sign(std::span<const std::byte>{msg}, sig, n));
     REQUIRE(n > 0);
+}
+
+TEST_CASE("fatal key exchange errors send disconnect to the peer",
+          "[connection][handshake][kex]") {
+    enum class scenario {
+        negotiate_no_common_kex,
+        strict_kex_before_kexinit,
+        strict_kex_during_initial_kex,
+        unexpected_message_during_initial_kex,
+        unrecognized_message_during_strict_initial_kex,
+        server_invalid_kex_init,
+        client_invalid_kex_reply,
+        client_resolve_accept_invalid_reply,
+        rekey_host_key_changed,
+        bad_packet_length_during_initial_kex,
+        malformed_ignore_during_initial_kex,
+        malformed_debug_during_initial_kex,
+    };
+
+    struct case_t {
+        std::string_view name;
+        scenario kind;
+        bool client_fails;
+        code expected_failure;
+        wire::disconnect_reason expected_reason;
+    };
+
+    constexpr auto kex_failed = wire::disconnect_reason::key_exchange_failed;
+    constexpr auto protocol_error = wire::disconnect_reason::protocol_error;
+    const case_t cases[] = {
+        {"negotiate_no_common_kex", scenario::negotiate_no_common_kex, false,
+         code::no_common_kex_algorithm, kex_failed},
+        {"strict_kex_before_kexinit", scenario::strict_kex_before_kexinit, true,
+         code::strict_kex_violation, protocol_error},
+        {"strict_kex_during_initial_kex", scenario::strict_kex_during_initial_kex, true,
+         code::strict_kex_violation, protocol_error},
+        {"unexpected_message_during_initial_kex", scenario::unexpected_message_during_initial_kex,
+         true, code::unexpected_message, protocol_error},
+        {"unrecognized_message_during_strict_initial_kex",
+         scenario::unrecognized_message_during_strict_initial_kex, true, code::strict_kex_violation,
+         protocol_error},
+        {"server_invalid_kex_init", scenario::server_invalid_kex_init, false,
+         code::invalid_kex_reply, kex_failed},
+        {"client_invalid_kex_reply", scenario::client_invalid_kex_reply, true,
+         code::invalid_kex_reply, kex_failed},
+        {"client_resolve_accept_invalid_reply", scenario::client_resolve_accept_invalid_reply, true,
+         code::invalid_kex_reply, kex_failed},
+        {"bad_packet_length_during_initial_kex", scenario::bad_packet_length_during_initial_kex,
+         true, code::invalid_packet_length, protocol_error},
+        {"malformed_ignore_during_initial_kex", scenario::malformed_ignore_during_initial_kex,
+         true, code::invalid_format, protocol_error},
+        {"malformed_debug_during_initial_kex", scenario::malformed_debug_during_initial_kex,
+         true, code::invalid_format, protocol_error},
+    };
+
+    crypto::provider p = prov();
+    auto hm = make_ed25519_host(p);
+
+    for (const auto& c : cases) {
+        INFO(c.name);
+        core::config client_cfg;
+        core::config server_cfg;
+        if (c.kind == scenario::negotiate_no_common_kex) {
+            client_cfg.preferred_kex = "curve25519-sha256";
+            server_cfg.preferred_kex = "diffie-hellman-group14-sha256";
+        } else if (c.kind == scenario::malformed_ignore_during_initial_kex
+                   || c.kind == scenario::malformed_debug_during_initial_kex) {
+            // Strict KEX would reject any IGNORE/DEBUG before decoding it.
+            client_cfg.advertise_strict_kex = false;
+        }
+
+        auto client = make_client(p, client_cfg);
+        auto server = make_server(p, server_cfg);
+        configure_server(server, hm);
+
+        auto exchange_banners_only = [&]() {
+            const auto cb = collect_output(client.conn);
+            const auto sb = collect_output(server.conn);
+            client.conn.consume_output(cb.size());
+            server.conn.consume_output(sb.size());
+            std::error_code ec;
+            REQUIRE(feed_all(server.conn, cb, ec) == cb.size());
+            REQUIRE_FALSE(ec);
+            REQUIRE(feed_all(client.conn, sb, ec) == sb.size());
+            REQUIRE_FALSE(ec);
+        };
+
+        auto reach_initial_kex_exchange = [&]() {
+            exchange_banners_only();
+            const auto ck = collect_output(client.conn);
+            const auto sk = collect_output(server.conn);
+            client.conn.consume_output(ck.size());
+            server.conn.consume_output(sk.size());
+            std::error_code ec;
+            REQUIRE(feed_all(server.conn, ck, ec) == ck.size());
+            REQUIRE_FALSE(ec);
+            REQUIRE(feed_all(client.conn, sk, ec) == sk.size());
+            REQUIRE_FALSE(ec);
+            REQUIRE(client.conn.negotiated() != nullptr);
+            REQUIRE(server.conn.negotiated() != nullptr);
+            client.conn.consume_output(client.conn.pending_output_bytes());
+            REQUIRE(client.conn.pending_output_bytes() == 0);
+            REQUIRE(server.conn.pending_output_bytes() == 0);
+        };
+
+        std::error_code trigger_ec;
+        switch (c.kind) {
+            case scenario::negotiate_no_common_kex: {
+                exchange_banners_only();
+                server.conn.consume_output(server.conn.pending_output_bytes());
+                const auto ck = collect_output(client.conn);
+                client.conn.consume_output(ck.size());
+                std::size_t n = 0;
+                trigger_ec = server.conn.feed(ck, n);
+                break;
+            }
+            case scenario::strict_kex_before_kexinit: {
+                exchange_banners_only();
+                client.conn.consume_output(client.conn.pending_output_bytes());
+                server.conn.consume_output(server.conn.pending_output_bytes());
+                wire::detail::service_msg svc{wire::msg::service_request, "ssh-userauth"};
+                wire::writer w;
+                svc.encode(w);
+                const auto pkt = plaintext_packet(p, w.data());
+                std::size_t n = 0;
+                trigger_ec = client.conn.feed(pkt, n);
+                break;
+            }
+            case scenario::strict_kex_during_initial_kex: {
+                reach_initial_kex_exchange();
+                wire::detail::ignore_msg ig{};
+                wire::writer w;
+                ig.encode(w);
+                const auto pkt = plaintext_packet(p, w.data());
+                std::size_t n = 0;
+                trigger_ec = client.conn.feed(pkt, n);
+                break;
+            }
+            case scenario::unexpected_message_during_initial_kex: {
+                reach_initial_kex_exchange();
+                wire::detail::service_msg svc{wire::msg::service_accept, "ssh-userauth"};
+                wire::writer w;
+                svc.encode(w);
+                const auto pkt = plaintext_packet(p, w.data());
+                std::size_t n = 0;
+                trigger_ec = client.conn.feed(pkt, n);
+                break;
+            }
+            case scenario::unrecognized_message_during_strict_initial_kex: {
+                reach_initial_kex_exchange();
+                const std::byte payload[]{std::byte{200}};
+                const auto pkt = plaintext_packet(p, payload);
+                std::size_t n = 0;
+                trigger_ec = client.conn.feed(pkt, n);
+                break;
+            }
+            case scenario::server_invalid_kex_init: {
+                reach_initial_kex_exchange();
+                const std::byte payload[]{
+                    std::byte{static_cast<std::uint8_t>(wire::msg::kex_ecdh_init)}};
+                const auto pkt = plaintext_packet(p, payload);
+                std::size_t n = 0;
+                trigger_ec = server.conn.feed(pkt, n);
+                break;
+            }
+            case scenario::client_invalid_kex_reply: {
+                reach_initial_kex_exchange();
+                const std::byte payload[]{
+                    std::byte{static_cast<std::uint8_t>(wire::msg::kex_ecdh_reply)}};
+                const auto pkt = plaintext_packet(p, payload);
+                std::size_t n = 0;
+                trigger_ec = client.conn.feed(pkt, n);
+                break;
+            }
+            case scenario::client_resolve_accept_invalid_reply: {
+                reach_initial_kex_exchange();
+                wire::detail::kex_ecdh_reply reply{};
+                reply.host_key = hm.blob;
+                wire::writer w;
+                reply.encode(w);
+                const auto pkt = plaintext_packet(p, w.data());
+                std::size_t n = 0;
+                REQUIRE_FALSE(client.conn.feed(pkt, n));
+                core::host_key_ticket ticket{};
+                for (const auto& ev : client.handler.events) {
+                    if (const auto* hk =
+                            std::get_if<recording_handler::verify_host_key>(&ev)) {
+                        ticket = hk->ticket;
+                    }
+                }
+                REQUIRE(ticket != core::host_key_ticket{});
+                trigger_ec = client.conn.resolve(ticket, core::host_key_verdict::accept);
+                break;
+            }
+            case scenario::rekey_host_key_changed: {
+                handshake_capture cap;
+                REQUIRE(run_handshake(client, server, cap));
+                client.conn.consume_output(client.conn.pending_output_bytes());
+                server.conn.consume_output(server.conn.pending_output_bytes());
+                keys::private_key alt_sk;
+                REQUIRE_FALSE(
+                    keys::private_key::generate(p, crypto::sig_id::ed25519, 0, "alt", alt_sk));
+                REQUIRE_FALSE(server.conn.rekey());
+                REQUIRE_FALSE(server.conn.set_host_key(alt_sk.pub().blob(), alt_sk.material()));
+                feed_consume(server.conn, client.conn);
+                feed_consume(client.conn, server.conn);
+                const auto srv_reply = collect_output(server.conn);
+                server.conn.consume_output(srv_reply.size());
+                std::size_t n = 0;
+                trigger_ec = client.conn.feed(srv_reply, n);
+                break;
+            }
+            case scenario::bad_packet_length_during_initial_kex: {
+                reach_initial_kex_exchange();
+                std::array<std::byte, 8> bogus;
+                bogus.fill(std::byte{0xff});
+                std::size_t n = 0;
+                trigger_ec = client.conn.feed(bogus, n);
+                break;
+            }
+            case scenario::malformed_ignore_during_initial_kex:
+            case scenario::malformed_debug_during_initial_kex: {
+                reach_initial_kex_exchange();
+                const auto id = c.kind == scenario::malformed_ignore_during_initial_kex
+                                    ? wire::msg::ignore
+                                    : wire::msg::debug;
+                const std::byte payload[]{std::byte{static_cast<std::uint8_t>(id)}};
+                const auto pkt = plaintext_packet(p, payload);
+                std::size_t n = 0;
+                trigger_ec = client.conn.feed(pkt, n);
+                break;
+            }
+        }
+
+        wired_connection& failing = c.client_fails ? client : server;
+        wired_connection& peer = c.client_fails ? server : client;
+
+        REQUIRE(trigger_ec == c.expected_failure);
+        REQUIRE(failing.conn.failure() == c.expected_failure);
+        REQUIRE(failing.conn.pending_output_bytes() > 0);
+
+        peer.handler.events.clear();
+        const auto disconnect_bytes = collect_output(failing.conn);
+        std::error_code peer_ec;
+        const std::size_t accepted = feed_all(peer.conn, disconnect_bytes, peer_ec);
+        failing.conn.consume_output(accepted);
+        REQUIRE(accepted == disconnect_bytes.size());
+        REQUIRE_FALSE(peer_ec);
+        REQUIRE(peer.conn.failure() == code::peer_disconnected);
+
+        const recording_handler::disconnected* got_disc = nullptr;
+        for (const auto& ev : peer.handler.events) {
+            if (const auto* d = std::get_if<recording_handler::disconnected>(&ev)) {
+                got_disc = d;
+            }
+        }
+        REQUIRE(got_disc != nullptr);
+        REQUIRE(got_disc->reason == c.expected_reason);
+        REQUIRE_FALSE(got_disc->description.empty());
+    }
+}
+
+// RFC 4253 §11.4: an unrecognized message number is answered with
+// UNIMPLEMENTED carrying its sequence number and is otherwise ignored.
+TEST_CASE("unrecognized messages are answered with UNIMPLEMENTED", "[connection][transport]") {
+    struct case_t {
+        std::string_view name;
+        core::role role;
+        bool service_ready;
+        std::uint8_t id;
+    };
+    const case_t cases[] = {
+        {"client before userauth service", core::role::client, false, 62},
+        {"server before userauth service", core::role::server, false, 101},
+        {"server, unassigned connection number", core::role::server, true, 83},
+        {"client, client protocol range", core::role::client, true, 128},
+        {"server, local extension range", core::role::server, true, 200},
+    };
+
+    for (const auto& c : cases) {
+        INFO(c.name);
+        peer_session s{c.role};
+        if (c.service_ready) {
+            s.handshake();
+        } else {
+            s.exchange_keys();
+        }
+        s.peer.clear_received();
+
+        const std::uint32_t seq = s.peer.next_send_sequence();
+        const std::byte payload[]{std::byte{c.id}, std::byte{0x2a}};
+        s.peer.send(payload);
+        REQUIRE_FALSE(s.peer.exchange(s.sut));
+        REQUIRE_FALSE(s.sut.conn.failure());
+
+        const auto reply = s.peer.take(wire::msg::unimplemented);
+        REQUIRE(reply);
+        wire::reader r{*reply};
+        wire::detail::unimplemented_msg msg;
+        REQUIRE(msg.decode(r));
+        REQUIRE(r.empty());
+        REQUIRE(msg.sequence_number == seq);
+    }
+}
+
+// A known message in the wrong state, or one that does not decode, is a
+// protocol error rather than an unrecognized message.
+TEST_CASE("misplaced or malformed upper-layer messages disconnect with PROTOCOL_ERROR",
+          "[connection][transport]") {
+    enum class stage { keys, service, authenticated };
+    struct case_t {
+        std::string_view name;
+        core::role role;
+        stage at;
+        std::vector<std::byte> payload;
+        code expected;
+    };
+    auto build = [](wire::msg id, auto&& fill) {
+        wire::writer w;
+        w.write_byte(static_cast<std::uint8_t>(id));
+        fill(w);
+        return std::vector<std::byte>(w.data().begin(), w.data().end());
+    };
+    auto nothing = [](wire::writer&) {};
+    const case_t cases[] = {
+        {"client receives SERVICE_REQUEST", core::role::client, stage::keys,
+         build(wire::msg::service_request, [](wire::writer& w) { w.write_string("ssh-userauth"); }),
+         code::unexpected_message},
+        {"client receives USERAUTH_REQUEST", core::role::client, stage::service,
+         build(wire::msg::userauth_request,
+               [](wire::writer& w) {
+                   w.write_string("alice");
+                   w.write_string("ssh-connection");
+                   w.write_string("none");
+               }),
+         code::unexpected_message},
+        {"server receives USERAUTH_SUCCESS", core::role::server, stage::service,
+         build(wire::msg::userauth_success, nothing), code::unexpected_message},
+        {"client receives USERAUTH_FAILURE with no request pending", core::role::client,
+         stage::service,
+         build(wire::msg::userauth_failure,
+               [](wire::writer& w) {
+                   w.write_string("password");
+                   w.write_bool(false);
+               }),
+         code::unexpected_message},
+        {"server receives truncated USERAUTH_REQUEST", core::role::server, stage::service,
+         build(wire::msg::userauth_request, nothing), code::invalid_format},
+        {"CHANNEL_DATA for an unknown channel", core::role::client, stage::authenticated,
+         build(wire::msg::channel_data,
+               [](wire::writer& w) {
+                   w.write_uint32(7);
+                   w.write_string("x");
+               }),
+         code::unexpected_message},
+        {"REQUEST_SUCCESS with no global request pending", core::role::server,
+         stage::authenticated, build(wire::msg::request_success, nothing),
+         code::unexpected_message},
+        {"truncated CHANNEL_WINDOW_ADJUST", core::role::client, stage::authenticated,
+         build(wire::msg::channel_window_adjust, nothing), code::invalid_format},
+    };
+
+    for (const auto& c : cases) {
+        INFO(c.name);
+        peer_session s{c.role};
+        switch (c.at) {
+        case stage::keys: s.exchange_keys(); break;
+        case stage::service: s.handshake(); break;
+        case stage::authenticated: s.authenticate(); break;
+        }
+        s.peer.clear_received();
+
+        s.peer.send(c.payload);
+        REQUIRE(s.peer.exchange(s.sut) == c.expected);
+        REQUIRE(s.sut.conn.failure() == c.expected);
+
+        const auto disc = s.peer.take(wire::msg::disconnect);
+        REQUIRE(disc);
+        wire::reader r{*disc};
+        wire::detail::disconnect_msg msg;
+        REQUIRE(msg.decode(r));
+        REQUIRE(msg.reason == wire::disconnect_reason::protocol_error);
+        REQUIRE_FALSE(s.peer.take(wire::msg::unimplemented));
+    }
+}
+
+// Framing and authentication failures must look the same on the wire;
+// distinct replies would be a padding/MAC oracle.
+TEST_CASE("binary packet errors all disconnect with one PROTOCOL_ERROR message",
+          "[connection][transport]") {
+    enum class corrupt { packet_length, padding, gcm_tag };
+    struct case_t {
+        std::string_view name;
+        corrupt kind;
+        code expected;
+    };
+    const case_t cases[] = {
+        {"plaintext packet_length above the maximum", corrupt::packet_length, code::invalid_packet_length},
+        {"plaintext padding_length below the minimum", corrupt::padding, code::invalid_padding},
+        {"aes256-gcm tag mismatch", corrupt::gcm_tag, code::decrypt_failure},
+    };
+
+    std::optional<std::string> description;
+    for (const auto& c : cases) {
+        INFO(c.name);
+        peer_session s{core::role::client};
+
+        std::vector<std::byte> bytes;
+        if (c.kind == corrupt::gcm_tag) {
+            s.exchange_keys();
+            s.peer.clear_received();
+            const std::byte ignore[]{std::byte{static_cast<std::uint8_t>(wire::msg::ignore)},
+                                     std::byte{0}, std::byte{0}, std::byte{0}, std::byte{0}};
+            s.peer.send(ignore);
+            bytes = s.peer.take_pending();
+            REQUIRE_FALSE(bytes.empty());
+            bytes.back() ^= std::byte{0x01};
+        } else {
+            // The corrupt packet takes the place of the peer's KEXINIT.
+            const auto pending = s.peer.take_pending();
+            const auto eol = std::find(pending.begin(), pending.end(), std::byte{'\n'});
+            REQUIRE(eol != pending.end());
+            bytes.assign(pending.begin(), eol + 1);
+            if (c.kind == corrupt::packet_length) {
+                bytes.insert(bytes.end(), 4, std::byte{0xff});
+            } else {
+                // packet_length 12, padding_length 3, 8 payload bytes, 3 padding bytes.
+                const std::byte header[]{std::byte{0}, std::byte{0}, std::byte{0}, std::byte{12},
+                                         std::byte{3}};
+                bytes.insert(bytes.end(), std::begin(header), std::end(header));
+                bytes.insert(bytes.end(), 8, std::byte{0x11});
+                bytes.insert(bytes.end(), 3, std::byte{0x22});
+            }
+        }
+
+        std::size_t accepted = 0;
+        REQUIRE(s.sut.conn.feed(bytes, accepted) == c.expected);
+        REQUIRE(s.sut.conn.failure() == c.expected);
+
+        s.peer.collect(s.sut);
+        const auto disc = s.peer.take(wire::msg::disconnect);
+        REQUIRE(disc);
+        wire::reader r{*disc};
+        wire::detail::disconnect_msg msg;
+        REQUIRE(msg.decode(r));
+        REQUIRE(msg.reason == wire::disconnect_reason::protocol_error);
+        if (!description) description.emplace(msg.description);
+        REQUIRE(msg.description == *description);
+    }
 }

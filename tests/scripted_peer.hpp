@@ -44,6 +44,7 @@ public:
     }
 
     [[nodiscard]] std::size_t pending_bytes() const noexcept { return out_.size(); }
+    [[nodiscard]] std::uint32_t next_send_sequence() const noexcept { return writer_.sequence_number(); }
 
     std::error_code deliver(wired_connection& sut);
     void collect(wired_connection& sut);

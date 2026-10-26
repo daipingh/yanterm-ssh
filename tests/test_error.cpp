@@ -31,13 +31,11 @@ TEST_CASE("each detail::code maps to the specified errc", "[error]") {
     static constexpr row kMap[] = {
         {code::truncated_input, errc::malformed_input},
         {code::invalid_format, errc::malformed_input},
-        {code::string_too_long, errc::malformed_input},
         {code::invalid_mpint, errc::malformed_input},
         {code::invalid_name_list, errc::malformed_input},
         {code::version_line_too_long, errc::malformed_input},
         {code::unsupported_protocol_version, errc::malformed_input},
         {code::missing_version_banner, errc::malformed_input},
-        {code::packet_too_large, errc::malformed_input},
         {code::invalid_packet_length, errc::malformed_input},
         {code::invalid_padding, errc::malformed_input},
         {code::invalid_kex_reply, errc::malformed_input},
@@ -83,6 +81,7 @@ TEST_CASE("each detail::code maps to the specified errc", "[error]") {
         {code::incorrect_passphrase, errc::incorrect_passphrase},
         {code::unsupported_key_format, errc::unsupported_key_format},
         {code::insecure_permissions, errc::insecure_permissions},
+        {code::message_size, errc::invalid_argument},
     };
 
     for (row r : kMap) {

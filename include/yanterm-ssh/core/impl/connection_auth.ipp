@@ -132,13 +132,7 @@ YANTERM_SSH_INLINE std::error_code connection::on_service_message(wire::msg id,
     }
 
     if (msg.service_name != auth::service_userauth) {
-        wire::detail::disconnect_msg disc;
-        disc.reason = wire::disconnect_reason::service_not_available;
-        disc.description = "unsupported service";
-        wire::writer w;
-        disc.encode(w);
-        if (auto ec = write_control_packet(w.data())) return ec;
-        return code::unsupported_service;
+        return fail_and_disconnect(code::unsupported_service, wire::disconnect_reason::service_not_available);
     }
     std::vector<std::byte> scratch;
     detail::push_service_packet(wire::msg::service_accept, auth::service_userauth, scratch);

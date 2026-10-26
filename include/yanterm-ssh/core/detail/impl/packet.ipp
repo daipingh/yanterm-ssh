@@ -62,13 +62,13 @@ YANTERM_SSH_INLINE std::error_code packet_writer::prepare_wire(std::size_t paylo
                                                       std::uint32_t& packet_length,
                                                       std::size_t& wire_size) noexcept {
     if (payload_size > max_packet_length) {
-        return code::packet_too_large;
+        return code::message_size;
     }
     const std::size_t pl = 1u + payload_size + pad;
-    if (pl > max_packet_length) return code::packet_too_large;
+    if (pl > max_packet_length) return code::message_size;
     const std::size_t ws = 4u + pl + tail;
     if (ws < 4u + pl || ws > pool.page_capacity()) {
-        return code::packet_too_large;
+        return code::message_size;
     }
     packet_length = static_cast<std::uint32_t>(pl);
     wire_size = ws;
@@ -148,7 +148,7 @@ YANTERM_SSH_INLINE std::error_code packet_writer::begin_packet(std::size_t paylo
     if (auto ec = layout_for(payload_size, pool, pad, packet_length, wire_size); ec) return ec;
 
     memory::detail::page_slice slice = pool.allocate(wire_size);
-    if (slice.size() != wire_size) return code::packet_too_large;
+    if (slice.size() != wire_size) return code::message_size;
     auto w = slice.mutable_bytes();
 
     job.slice = std::move(slice);
@@ -526,7 +526,7 @@ YANTERM_SSH_INLINE std::error_code packet_reader::complete_clear_length(std::spa
     }
 
     memory::detail::page_slice plain = pool.allocate(packet_length);
-    if (plain.size() != packet_length) return code::packet_too_large;
+    if (plain.size() != packet_length) return code::invalid_state;
     auto w = plain.mutable_bytes();
     if (encrypted_body) {
         if (!st_.cipher.update(body, w)) {
@@ -582,7 +582,7 @@ YANTERM_SSH_INLINE std::error_code packet_reader::complete_eam(std::span<const s
     if (in.size() < rest_cipher + st_.mac_length) return packet_read_need_more();
 
     memory::detail::page_slice plain = pool.allocate(plain_size);
-    if (plain.size() != plain_size) return code::packet_too_large;
+    if (plain.size() != plain_size) return code::invalid_state;
     auto w = plain.mutable_bytes();
     copy_out(w.first(block), eam_plain_);
     if (rest_cipher > 0) {
@@ -632,7 +632,7 @@ YANTERM_SSH_INLINE std::error_code packet_reader::complete_gcm(std::span<const s
     if (in.size() < wire_size) return packet_read_need_more();
 
     memory::detail::page_slice plain = pool.allocate(packet_length);
-    if (plain.size() != packet_length) return code::packet_too_large;
+    if (plain.size() != packet_length) return code::invalid_state;
     auto pt = plain.mutable_bytes();
     std::array<std::byte, 16> tag{};
     const auto tag_wire = in.subspan(4 + packet_length, tag_len);
@@ -701,7 +701,7 @@ YANTERM_SSH_INLINE std::error_code packet_reader::complete_chacha(std::span<cons
     make_chacha_iv(iv, /*counter=*/1, seq);
     if (!st_.cipher.set_iv(iv)) return code::cipher_failure;
     memory::detail::page_slice plain = pool.allocate(packet_length);
-    if (plain.size() != packet_length) return code::packet_too_large;
+    if (plain.size() != packet_length) return code::invalid_state;
     if (!st_.cipher.update(in.subspan(4, packet_length), plain.mutable_bytes())) {
         return code::cipher_failure;
     }

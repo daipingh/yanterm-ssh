@@ -438,8 +438,8 @@ YANTERM_SSH_INLINE std::error_code connection::write_channel_fragments(channel_r
         if (auto ec = channel_begin_write(ch, true, win)) return ec;
         if (win.available == 0) return {};
 
+        // max_pl is one full page of SSH payload, always far larger than the channel header.
         const auto max_pl = writer_.max_payload_size(pool_);
-        if (max_pl < header) return code::packet_too_large;
         const auto limit = std::min({static_cast<std::size_t>(win.available),
                                      static_cast<std::size_t>(win.max_packet),
                                      max_pl - header});

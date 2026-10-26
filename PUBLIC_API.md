@@ -358,7 +358,6 @@ enum class disconnect_reason    // RFC 4253 断连原因
 ```
 namespace yanterm::ssh::wire
 
-max_string_length
 class name_list                 // RFC 4251 name-list 视图
 class reader                    // 从 span 解包
 class writer                    // 组包；take() 移出缓冲
