@@ -13,13 +13,11 @@ namespace detail {
 enum class code : int {
     truncated_input = 1,
     invalid_format,
-    string_too_long,
     invalid_mpint,
     invalid_name_list,
     version_line_too_long,
     unsupported_protocol_version,
     missing_version_banner,
-    packet_too_large,
     invalid_packet_length,
     invalid_padding,
     invalid_kex_reply,
@@ -65,6 +63,7 @@ enum class code : int {
     incorrect_passphrase,
     unsupported_key_format,
     insecure_permissions,
+    message_size,
 };
 
 class ssh_error_category final : public std::error_category {
@@ -75,14 +74,12 @@ public:
         switch (static_cast<code>(value)) {
         case code::truncated_input:               return "input ended in the middle of a field";
         case code::invalid_format:                return "malformed encoding";
-        case code::string_too_long:               return "string length exceeds the configured limit";
         case code::invalid_mpint:                 return "mpint is negative or not canonically encoded";
         case code::invalid_name_list:             return "name-list contains an empty or non-US-ASCII name";
         case code::version_line_too_long:         return "identification line exceeds 255 bytes";
         case code::unsupported_protocol_version:  return "peer does not speak SSH 2.0";
         case code::missing_version_banner:        return "peer sent no SSH identification string";
-        case code::packet_too_large:              return "binary packet exceeds the maximum accepted size";
-        case code::invalid_packet_length:         return "binary packet length is not a valid multiple";
+        case code::invalid_packet_length:         return "binary packet length is out of range or not a valid multiple";
         case code::invalid_padding:               return "binary packet padding length is out of range";
         case code::mac_mismatch:                  return "message authentication code mismatch";
         case code::decrypt_failure:               return "packet decryption or AEAD authentication failed";
@@ -121,6 +118,7 @@ public:
         case code::kex_failure:                   return "key exchange primitive failed";
         case code::sign_failure:                  return "signing primitive failed";
         case code::keygen_failure:                return "key generation failed";
+        case code::message_size:                  return "message is too large to fit in one binary packet";
         }
         return "unknown yanterm-ssh error";
     }
@@ -129,13 +127,11 @@ public:
         switch (static_cast<code>(ev)) {
         case code::truncated_input:
         case code::invalid_format:
-        case code::string_too_long:
         case code::invalid_mpint:
         case code::invalid_name_list:
         case code::version_line_too_long:
         case code::unsupported_protocol_version:
         case code::missing_version_banner:
-        case code::packet_too_large:
         case code::invalid_packet_length:
         case code::invalid_padding:
         case code::invalid_kex_reply:
@@ -191,6 +187,8 @@ public:
             return make_error_condition(errc::unsupported_key_format);
         case code::insecure_permissions:
             return make_error_condition(errc::insecure_permissions);
+        case code::message_size:
+            return make_error_condition(errc::invalid_argument);
         }
         return std::error_condition(ev, *this);
     }

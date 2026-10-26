@@ -590,8 +590,8 @@ TEST_CASE("auth_password write failure fails the session", "[auth][password]") {
 
     const std::string huge(40000, 'p');
     const auto ec = client.conn.auth_password("alice", huge);
-    REQUIRE(ec == code::packet_too_large);
-    REQUIRE(client.conn.failure() == code::packet_too_large);
+    REQUIRE(ec == code::message_size);
+    REQUIRE(client.conn.failure() == code::message_size);
     REQUIRE(client.conn.auth_none("alice") == code::invalid_state);
 }
 

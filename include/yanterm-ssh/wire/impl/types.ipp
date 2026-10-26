@@ -66,7 +66,6 @@ YANTERM_SSH_INLINE bool reader::read_uint64(std::uint64_t& out) noexcept {
 YANTERM_SSH_INLINE bool reader::read_string(std::span<const std::byte>& out) noexcept {
     std::uint32_t len = 0;
     if (!read_uint32(len)) return false;
-    if (len > max_string_length) return fail(code::string_too_long);
     return read_bytes(out, len);
 }
 

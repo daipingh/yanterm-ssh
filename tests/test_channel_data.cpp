@@ -397,32 +397,48 @@ TEST_CASE("stderr and stdout share the send window", "[channel][data]") {
     REQUIRE_FALSE(server.conn.failure());
 }
 
-TEST_CASE("inbound data larger than window is channel_window_exceeded", "[channel][data]") {
-    auto cfg = scripted_peer::sut_config();
-    cfg.initial_window = 4;
-    cfg.max_channels = 4;
-    peer_session s{core::role::client, cfg};
-    s.authenticate();
-    const auto ch = open_confirmed(s, 100, 32);
-    wire::detail::channel_data msg;
-    msg.recipient = ch.sut_id;
-    msg.data = std::as_bytes(std::span{"abcdef", 6});
-    s.peer.send_msg(msg);
-    REQUIRE(s.peer.deliver(s.sut) == code::channel_window_exceeded);
-}
+TEST_CASE("inbound window violations disconnect with PROTOCOL_ERROR", "[channel][data]") {
+    enum class violation { data_beyond_window, adjust_overflow };
+    struct case_t {
+        std::string_view name;
+        violation kind;
+    };
+    const case_t cases[] = {
+        {"CHANNEL_DATA larger than the local window", violation::data_beyond_window},
+        {"WINDOW_ADJUST overflowing the remote window", violation::adjust_overflow},
+    };
 
-TEST_CASE("inbound WINDOW_ADJUST overflow is channel_window_exceeded", "[channel][data]") {
-    auto cfg = scripted_peer::sut_config();
-    cfg.initial_window = 4;
-    cfg.max_channels = 4;
-    peer_session s{core::role::client, cfg};
-    s.authenticate();
-    const auto ch = open_confirmed(s, 100, 32);
-    wire::detail::channel_window_adjust msg;
-    msg.recipient = ch.sut_id;
-    msg.bytes = std::numeric_limits<std::uint32_t>::max();
-    s.peer.send_msg(msg);
-    REQUIRE(s.peer.deliver(s.sut) == code::channel_window_exceeded);
+    for (const auto& c : cases) {
+        INFO(c.name);
+        auto cfg = scripted_peer::sut_config();
+        cfg.initial_window = 4;
+        cfg.max_channels = 4;
+        peer_session s{core::role::client, cfg};
+        s.authenticate();
+        const auto ch = open_confirmed(s, 100, 32);
+        if (c.kind == violation::data_beyond_window) {
+            wire::detail::channel_data msg;
+            msg.recipient = ch.sut_id;
+            msg.data = std::as_bytes(std::span{"abcdef", 6});
+            s.peer.send_msg(msg);
+        } else {
+            wire::detail::channel_window_adjust msg;
+            msg.recipient = ch.sut_id;
+            msg.bytes = std::numeric_limits<std::uint32_t>::max();
+            s.peer.send_msg(msg);
+        }
+        s.peer.clear_received();
+
+        REQUIRE(s.peer.exchange(s.sut) == code::channel_window_exceeded);
+        REQUIRE(s.sut.conn.failure() == code::channel_window_exceeded);
+
+        const auto disc = s.peer.take(wire::msg::disconnect);
+        REQUIRE(disc);
+        wire::reader r{*disc};
+        wire::detail::disconnect_msg msg;
+        REQUIRE(msg.decode(r));
+        REQUIRE(msg.reason == wire::disconnect_reason::protocol_error);
+    }
 }
 
 TEST_CASE("unread data then EOF is readable before eof and then empty", "[channel][data]") {

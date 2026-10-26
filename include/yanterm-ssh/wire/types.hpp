@@ -13,11 +13,6 @@
 
 namespace yanterm::ssh::wire {
 
-// Sanity bound on a single SSH `string`. Real packets are far smaller (RFC 4253
-// caps a binary packet at 35000 bytes), but a peer can still claim 0xffffffff
-// in a length field; rejecting early keeps the arithmetic below in range.
-inline constexpr std::size_t max_string_length = 32u * 1024u * 1024u;
-
 // A borrowed, comma-separated list of US-ASCII names (RFC 4251 section 5).
 // Validation happens in reader::read_name_list; by the time a name_list exists
 // its contents are known to be well formed.

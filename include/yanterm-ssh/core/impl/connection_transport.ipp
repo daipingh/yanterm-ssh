@@ -48,20 +48,33 @@ YANTERM_SSH_INLINE std::error_code connection::feed(std::span<const std::byte> i
 
         std::size_t n = 0;
         memory::detail::page_slice payload;
-        std::error_code ec = reader_.read(in.subspan(accepted), n, pool_, payload);
-        accepted += n;
-        if (ec) {
-            result = fail(ec, detail::format_phase_detail(static_cast<std::uint8_t>(phase_)));
-            break;
+        if (auto ec = reader_.read(in.subspan(accepted), n, pool_, payload)) {
+            accepted += n;
+            // Only the inbound direction is broken, so the writer can still
+            // carry a DISCONNECT. Every peer-attributable packet error maps to
+            // one reason and text: distinct ones would be a padding/MAC oracle.
+            auto d = detail::format_phase_detail(static_cast<std::uint8_t>(phase_));
+            if (ec == errc::malformed_input || ec == errc::security_violation) {
+                return fail_and_disconnect(ec, wire::disconnect_reason::protocol_error, std::move(d));
+            }
+            phase_ = phase::dead;
+            return fail(ec, std::move(d));
         }
+        accepted += n;
+
         if (payload.empty()) {
             if (traffic_armed_) bytes_recv_ += n;
             break;
         }
 
-        if (auto err = dispatch_payload(payload)) {
-            result = fail(err);
-            break;
+        if (auto ec = dispatch_payload(payload)) {
+            const auto id = std::to_integer<std::uint8_t>(payload.bytes()[0]);
+            auto d = detail::format_unexpected_message(id, static_cast<std::uint8_t>(phase_));
+            if (ec == errc::malformed_input || ec == errc::protocol_violation || ec == code::strict_kex_violation) {
+                return fail_and_disconnect(ec, wire::disconnect_reason::protocol_error, std::move(d));
+            }
+            phase_ = phase::dead;
+            return fail(ec, std::move(d));
         }
         if (traffic_armed_) bytes_recv_ += n;
     }

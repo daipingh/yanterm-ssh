@@ -379,11 +379,11 @@ TEST_CASE("writer rejects a payload that would exceed max_packet_length",
     const auto payload = make_payload(core::detail::max_packet_length);
     memory::detail::page_pool pool;
     memory::detail::page_slice slice;
-    REQUIRE(w.write(payload, pool, slice) == code::packet_too_large);
+    REQUIRE(w.write(payload, pool, slice) == code::message_size);
     REQUIRE(slice.empty());
 }
 
-TEST_CASE("writer reports packet_too_large when the page cannot hold the wire packet",
+TEST_CASE("writer reports message_size when the page cannot hold the wire packet",
           "[packet][ctr][error]") {
     crypto::provider p = prov();
     core::detail::packet_writer w(p);
@@ -391,7 +391,7 @@ TEST_CASE("writer reports packet_too_large when the page cannot hold the wire pa
 
     memory::detail::page_pool tiny{memory::detail::page_header_size + 8};
     memory::detail::page_slice slice;
-    REQUIRE(w.write(bytes_of("hello"), tiny, slice) == code::packet_too_large);
+    REQUIRE(w.write(bytes_of("hello"), tiny, slice) == code::message_size);
     REQUIRE(slice.empty());
 }
 
@@ -513,7 +513,7 @@ TEST_CASE("reader rejects oversized packet_length", "[packet][ctr][error]") {
     memory::detail::page_pool pool;
     std::size_t consumed = 0;
     memory::detail::page_slice got;
-    REQUIRE(r.read(pkt, consumed, pool, got) == code::packet_too_large);
+    REQUIRE(r.read(pkt, consumed, pool, got) == code::invalid_packet_length);
 }
 
 TEST_CASE("padding bytes are random across writes", "[packet][ctr][plaintext]") {
@@ -661,7 +661,7 @@ TEST_CASE("max_payload_size succeeds and max+1 is rejected for plaintext and CTR
             REQUIRE(w.write_streamed(max + 1, pool, too_big, [&](auto&& append) {
                 fill_called = true;
                 append({});
-            }) == code::packet_too_large);
+            }) == code::message_size);
             REQUIRE_FALSE(fill_called);
             REQUIRE(too_big.empty());
             REQUIRE(w.sequence_number() == seq);

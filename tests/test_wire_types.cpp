@@ -109,7 +109,7 @@ TEST_CASE("reader rejects absurd string lengths without allocating", "[wire]") {
     reader r{buf};
     std::span<const std::byte> s;
     REQUIRE_FALSE(r.read_string(s));
-    REQUIRE(r.error() == code::string_too_long);
+    REQUIRE(r.error() == code::truncated_input);
 }
 
 // RFC 4251 section 5 mpint examples.

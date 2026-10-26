@@ -644,7 +644,7 @@ TEST_CASE("max_payload_size succeeds and max+1 is rejected for AEAD modes",
             REQUIRE(w.write_streamed(max + 1, pool, too_big, [&](auto&& append) {
                 fill_called = true;
                 append({});
-            }) == code::packet_too_large);
+            }) == code::message_size);
             REQUIRE_FALSE(fill_called);
             REQUIRE(too_big.empty());
             REQUIRE(w.sequence_number() == seq);

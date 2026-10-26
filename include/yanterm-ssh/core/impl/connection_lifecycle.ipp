@@ -53,6 +53,44 @@ YANTERM_SSH_INLINE std::error_code connection::fail(std::error_code ec, std::str
     return failure_;
 }
 
+YANTERM_SSH_INLINE std::error_code connection::fail_and_disconnect(std::error_code ec,
+                                                                  wire::disconnect_reason reason,
+                                                                  std::string detail) {
+    auto err = fail(ec, std::move(detail));
+    if (phase_ != phase::dead) {
+        std::string_view description;
+        switch (reason) {
+        case wire::disconnect_reason::protocol_error:
+            description = "Protocol error";
+            break;
+        case wire::disconnect_reason::key_exchange_failed:
+            description = "key exchange failed";
+            break;
+        case wire::disconnect_reason::service_not_available:
+            description = "bad service request";
+            break;
+        case wire::disconnect_reason::host_key_not_verifiable:
+            description = "Host key verification failed.";
+            break;
+        case wire::disconnect_reason::host_not_allowed_to_connect:
+        case wire::disconnect_reason::reserved:
+        case wire::disconnect_reason::mac_error:
+        case wire::disconnect_reason::compression_error:
+        case wire::disconnect_reason::protocol_version_not_supported:
+        case wire::disconnect_reason::connection_lost:
+        case wire::disconnect_reason::by_application:
+        case wire::disconnect_reason::too_many_connections:
+        case wire::disconnect_reason::auth_cancelled_by_user:
+        case wire::disconnect_reason::no_more_auth_methods_available:
+        case wire::disconnect_reason::illegal_user_name:
+            break;
+        }
+        (void)enqueue_disconnect(reason, description);
+        phase_ = phase::dead;
+    }
+    return err;
+}
+
 YANTERM_SSH_INLINE std::error_code connection::enqueue_disconnect(wire::disconnect_reason reason,
                                    std::string_view description) {
     wire::detail::disconnect_msg msg;
@@ -64,39 +102,31 @@ YANTERM_SSH_INLINE std::error_code connection::enqueue_disconnect(wire::disconne
     return write_packet(payload.data());
 }
 
-YANTERM_SSH_INLINE std::error_code connection::dispatch_payload(memory::detail::page_slice& payload) {
-    const auto bytes = payload.bytes();
-    if (bytes.empty()) return code::invalid_format;
-    const auto id = static_cast<wire::msg>(std::to_integer<std::uint8_t>(bytes[0]));
+YANTERM_SSH_INLINE std::error_code connection::dispatch_payload(memory::detail::page_slice& pkt) {
+    const auto payload = pkt.bytes();
+    if (payload.empty()) return code::invalid_format;
+    const auto id = static_cast<wire::msg>(std::to_integer<std::uint8_t>(payload[0]));
 
     // RFC 8308 §2.4: a client's EXT_INFO may only be the very next packet
     // after its first NEWKEYS, so the slot closes on whatever comes next.
     if (role_ == role::server && traffic_armed_ && !ext_info_closed_) {
         ext_info_closed_ = true;
         if (id == wire::msg::ext_info && cfg_.advertise_ext_info) {
-            if (auto err = apply_ext_info(bytes)) return err;
+            if (auto err = apply_ext_info(payload)) return err;
             note_inbound_packet();
             return {};
         }
     }
 
-    return handle_payload(payload);
-}
-
-YANTERM_SSH_INLINE std::error_code connection::handle_payload(memory::detail::page_slice& pkt) {
-    const auto payload = pkt.bytes();
-    if (payload.empty()) return code::invalid_format;
-    const auto id = static_cast<wire::msg>(std::to_integer<std::uint8_t>(payload[0]));
-    auto unexpected = [&] {
-        return fail(code::unexpected_message,
-                    detail::format_unexpected_message(static_cast<std::uint8_t>(id),
-                                                      static_cast<std::uint8_t>(phase_)));
-    };
-
     if (id == wire::msg::disconnect) {
         wire::reader r{payload};
         wire::detail::disconnect_msg msg;
-        if (!msg.decode(r)) return code::invalid_format;
+        if (!msg.decode(r)) {
+            // The peer is already tearing down; answering would only race its close.
+            fail(code::invalid_format);
+            phase_ = phase::dead;
+            return failure_;
+        }
         fail(code::peer_disconnected);
         phase_ = phase::dead;
         notify([&](handler& app, connection& self) {
@@ -108,15 +138,15 @@ YANTERM_SSH_INLINE std::error_code connection::handle_payload(memory::detail::pa
     // Strict KEX (CVE-2023-48795): once enabled, IGNORE/DEBUG/UNIMPLEMENTED
     // are forbidden for the rest of the initial KEX (until NEWKEYS is received).
     if (id == wire::msg::ignore || id == wire::msg::debug || id == wire::msg::unimplemented) {
-        if (strict_kex_active_ && in_initial_kex()) {
-            return code::strict_kex_violation;
-        }
+        if (strict_kex_active_ && in_initial_kex()) return code::strict_kex_violation;
     }
 
     if (id == wire::msg::ignore) {
         wire::reader r{payload};
         wire::detail::ignore_msg msg;
-        if (!msg.decode(r)) return code::invalid_format;
+        if (!msg.decode(r)) {
+            return code::invalid_format;
+        }
         notify([&](handler& app, connection& self) { app.on_ignore(self, msg.data); });
         note_inbound_packet();
         return {};
@@ -125,7 +155,9 @@ YANTERM_SSH_INLINE std::error_code connection::handle_payload(memory::detail::pa
     if (id == wire::msg::debug) {
         wire::reader r{payload};
         wire::detail::debug_msg msg;
-        if (!msg.decode(r)) return code::invalid_format;
+        if (!msg.decode(r)) {
+            return code::invalid_format;
+        }
         notify([&](handler& app, connection& self) {
             app.on_debug(self, msg.always_display, msg.message, msg.language);
         });
@@ -148,18 +180,25 @@ YANTERM_SSH_INLINE std::error_code connection::handle_payload(memory::detail::pa
             note_inbound_packet();
             return apply_ext_info(payload);
         }
-        return unexpected();
+        return code::unexpected_message;
+    }
+
+    // First binary packet must be KEXINIT when we advertise strict.
+    if (phase_ == phase::wait_kexinit && !rekeying_ && cfg_.advertise_strict_kex
+        && id != wire::msg::kexinit) {
+        return code::strict_kex_violation;
+    }
+
+    if (!is_recognized(id)) {
+        if (strict_kex_active_ && in_initial_kex()) return code::strict_kex_violation;
+        return send_unimplemented();
     }
 
     switch (phase_) {
     case phase::wait_kexinit:
         if (id != wire::msg::kexinit) {
-            // First binary packet must be KEXINIT when we advertise strict.
-            if (!rekeying_ && cfg_.advertise_strict_kex) {
-                return code::strict_kex_violation;
-            }
             if (rekeying_) return dispatch_app(payload, &pkt);
-            return unexpected();
+            return code::unexpected_message;
         }
         note_inbound_packet();
         return on_kexinit(payload);
@@ -167,21 +206,21 @@ YANTERM_SSH_INLINE std::error_code connection::handle_payload(memory::detail::pa
         if (role_ == role::client) {
             if (id != wire::msg::kex_ecdh_reply) {
                 if (rekeying_) return dispatch_app(payload, &pkt);
-                return unexpected();
+                return code::unexpected_message;
             }
             note_inbound_packet();
             return on_client_kex_reply(payload);
         }
         if (id != wire::msg::kex_ecdh_init) {
             if (rekeying_) return dispatch_app(payload, &pkt);
-            return unexpected();
+            return code::unexpected_message;
         }
         note_inbound_packet();
         return on_server_kex_init(payload);
     case phase::wait_newkeys:
         if (id != wire::msg::newkeys) {
             if (rekeying_) return dispatch_app(payload, &pkt);
-            return unexpected();
+            return code::unexpected_message;
         }
         note_inbound_packet();
         return on_newkeys();
@@ -196,9 +235,26 @@ YANTERM_SSH_INLINE std::error_code connection::handle_payload(memory::detail::pa
     case phase::await_host_key:
     case phase::version:
     case phase::dead:
-        return unexpected();
+    default:
+        return code::unexpected_message;
     }
-    return unexpected();
+}
+
+// RFC 4253 §11.4: only for message numbers this implementation does not know.
+YANTERM_SSH_INLINE std::error_code connection::send_unimplemented() {
+    wire::detail::unimplemented_msg msg;
+    msg.sequence_number = reader_.sequence_number() - 1u;
+    wire::writer payload;
+    msg.encode(payload);
+    if (auto ec = write_packet(payload.data())) return ec;
+    note_inbound_packet();
+    return {};
+}
+
+YANTERM_SSH_INLINE bool connection::is_recognized(wire::msg id) noexcept {
+    const auto n = static_cast<std::uint8_t>(id);
+    return (n >= 1 && n <= 7) || n == 20 || n == 21 || n == 30 || n == 31
+        || is_userauth_or_service(id) || is_connection_layer(id);
 }
 
 YANTERM_SSH_INLINE std::error_code connection::emit_handshake_done() {
@@ -245,14 +301,9 @@ YANTERM_SSH_INLINE bool connection::is_connection_layer(wire::msg id) noexcept {
 
 YANTERM_SSH_INLINE std::error_code connection::dispatch_app(std::span<const std::byte> payload, memory::detail::page_slice* pkt_page) {
     const auto id = static_cast<wire::msg>(std::to_integer<std::uint8_t>(payload[0]));
-    auto unexpected = [&] {
-        return fail(code::unexpected_message,
-                    detail::format_unexpected_message(static_cast<std::uint8_t>(id),
-                                                      static_cast<std::uint8_t>(phase_)));
-    };
     if (!service_ready_) {
         if (id != wire::msg::service_request && id != wire::msg::service_accept) {
-            return unexpected();
+            return code::unexpected_message;
         }
         note_inbound_packet();
         return on_service_message(id, payload);
@@ -260,20 +311,20 @@ YANTERM_SSH_INLINE std::error_code connection::dispatch_app(std::span<const std:
     if (is_userauth_or_service(id)) {
         if (authenticated() || id == wire::msg::service_request
             || id == wire::msg::service_accept) {
-            return unexpected();
+            return code::unexpected_message;
         }
         note_inbound_packet();
         assert(auth_);
         return auth_on_payload(payload, pkt_page);
     }
     if (is_connection_layer(id)) {
-        if (!authenticated()) return unexpected();
+        if (!authenticated()) return code::unexpected_message;
         note_inbound_packet();
         memory::detail::page_slice dummy;
         memory::detail::page_slice& page = pkt_page ? *pkt_page : dummy;
         return on_channel_payload(page);
     }
-    return unexpected();
+    return code::unexpected_message;
 }
 
 }  // namespace yanterm::ssh::core

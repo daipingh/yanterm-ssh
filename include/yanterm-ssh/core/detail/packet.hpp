@@ -105,8 +105,7 @@ inline void store_be32(std::span<std::byte> out, std::uint32_t v) noexcept {
 }
 
 [[nodiscard]] inline std::error_code check_packet_length(std::uint32_t packet_length) noexcept {
-    if (packet_length > max_packet_length) return code::packet_too_large;
-    if (packet_length < 5) return code::invalid_packet_length;
+    if (packet_length > max_packet_length || packet_length < 5) return code::invalid_packet_length;
     return {};
 }
 

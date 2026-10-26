@@ -247,6 +247,9 @@ private:
 
     std::error_code fail(std::error_code ec, std::string detail = {});
 
+    std::error_code fail_and_disconnect(std::error_code ec, wire::disconnect_reason reason,
+                                        std::string detail = {});
+
     [[nodiscard]] detail::exchange_context make_exchange_context() const noexcept;
 
     void commit_encrypted_packet(memory::detail::page_slice slice);
@@ -371,9 +374,11 @@ private:
 
     [[nodiscard]] bool in_initial_kex() const noexcept;
 
-    std::error_code dispatch_payload(memory::detail::page_slice& payload);
+    std::error_code dispatch_payload(memory::detail::page_slice& pkg);
 
-    std::error_code handle_payload(memory::detail::page_slice& pkt);
+    std::error_code send_unimplemented();
+
+    [[nodiscard]] static bool is_recognized(wire::msg id) noexcept;
 
     void note_inbound_packet(bool allow_auto_rekey = true);
 
