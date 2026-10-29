@@ -257,8 +257,9 @@ inline channel::operator bool() const noexcept { return static_cast<bool>(impl_)
 inline void channel::close_now() noexcept {
     if (!impl_ || st_ == nullptr || app_closed_) return;
     app_closed_ = true;
-    if (!impl_->run_active_) return;
+    if (impl_->closed()) return;
     (void)impl_->core_.channel_close(ref_);
+    impl_->note_core_failure();
     impl_->write_lot_.unparkAll();
 }
 
@@ -289,12 +290,8 @@ inline corral::Task<auv::read_result> channel::read_ext(std::uint32_t ext,
             self.write_lot_.unparkAll();
             co_return {std::error_code{}, n};
         }
-        const bool stopped = !self.run_active_ || bool(self.latch_) || bool(self.core_.failure());
-        const bool ended = st_->recv_eof || st_->recv_close;
-        if (stopped || ended) {
-            if (ended) co_return {auv::make_error_code(auv::errc::eof), 0};
-            co_return {code::session_closed, 0};
-        }
+        if (st_->recv_eof || st_->recv_close) co_return {auv::make_error_code(auv::errc::eof), 0};
+        if (self.closed()) co_return {self.latch_, 0};
         co_await lot.park();
     }
 }
@@ -312,7 +309,7 @@ inline corral::Task<std::error_code> channel::write_ext(std::uint32_t ext, const
                                                         std::size_t nbufs) {
     if (!impl_ || st_ == nullptr) co_return code::invalid_state;
     auto& self = *impl_;
-    if (!self.run_active_ || self.latch_) co_return code::session_closed;
+    if (self.closed()) co_return self.latch_;
 
     std::vector<std::span<const std::byte>> frags;
     frags.reserve(nbufs);
@@ -344,21 +341,24 @@ inline corral::Task<std::error_code> channel::write_ext(std::uint32_t ext, const
 
     auto& wr = st_->wr_lot;
     for (;;) {
-        if (!self.run_active_ || self.latch_) co_return code::session_closed;
+        if (self.closed()) co_return self.latch_;
         while (self.core_.pending_output_bytes() >= self.max_output_bytes_) {
-            if (!self.run_active_ || self.latch_) co_return code::session_closed;
+            if (self.closed()) co_return self.latch_;
             co_await self.out_space_lot_.park();
         }
         if (sent >= total) co_return {};
         auto rem = remaining(sent);
         std::size_t accepted = 0;
-        std::error_code wec;
-        if (ext == 0) {
-            wec = self.core_.channel_write(ref_, rem, accepted);
-        } else {
-            wec = self.core_.channel_write_extended(ref_, ext, rem, accepted);
+        std::error_code wec = [&] {
+            if (ext == 0) {
+                return self.core_.channel_write(ref_, rem, accepted);
+            }
+            return self.core_.channel_write_extended(ref_, ext, rem, accepted);
+        }();
+        if (wec) {
+            self.note_core_failure();
+            co_return wec;
         }
-        if (wec) co_return wec;
         self.write_lot_.unparkAll();
         sent += accepted;
         if (sent >= total) continue;
@@ -369,23 +369,30 @@ inline corral::Task<std::error_code> channel::write_ext(std::uint32_t ext, const
 inline corral::Task<std::error_code> channel::shutdown() {
     if (!impl_ || st_ == nullptr) co_return code::invalid_state;
     auto& self = *impl_;
-    if (!self.run_active_ || self.latch_) co_return code::session_closed;
-    auto ec = self.core_.channel_eof(ref_);
+    if (self.closed()) co_return self.latch_;
+    if (auto ec = self.core_.channel_eof(ref_)) {
+        self.note_core_failure();
+        co_return ec;
+    }
     self.write_lot_.unparkAll();
-    co_return ec;
+    co_return {};
 }
 
 inline corral::Task<void> channel::close() {
     if (!impl_ || st_ == nullptr) co_return;
     auto& self = *impl_;
     app_closed_ = true;
-    if (!self.run_active_) co_return;
+    if (self.closed()) co_return;
     // Always mark app_close while pumps run. Peer CLOSE may already have
     // set recv_close / sent_close, but a non-empty rx buffer still needs
     // app_close for releasable(); core.channel_close is idempotent.
     (void)self.core_.channel_close(ref_);
+    if (self.core_.failure()) {
+        self.note_core_failure();
+        co_return;
+    }
     self.write_lot_.unparkAll();
-    while (!st_->recv_close && self.run_active_ && !self.latch_) {
+    while (!st_->recv_close && !self.closed()) {
         co_await st_->rd_lot.park();
     }
 }
@@ -451,10 +458,11 @@ inline inbound_channel_open::~inbound_channel_open() { reject_now(); }
 inline void inbound_channel_open::reject_now() noexcept {
     if (settled_ || !impl_) return;
     settled_ = true;
-    if (!impl_->run_active_ || impl_->core_.failure()) return;
+    if (impl_->closed()) return;
     (void)impl_->core_.resolve(ticket_, channels::channel_open_verdict::rejected(
                                   channels::channel_open_reason::administratively_prohibited,
                                   "unhandled inbound open"));
+    impl_->note_core_failure();
     impl_->write_lot_.unparkAll();
     impl_->unstall_lot_.unparkAll();
 }
@@ -469,6 +477,7 @@ inline channel inbound_channel_open::accept() {
     sp->live_channels_.push_back(*st);
     if (auto ec = sp->core_.resolve(ticket_, channels::channel_open_verdict::accepted(), st)) {
         st->refs = 1;
+        sp->note_core_failure();
     }
     sp->write_lot_.unparkAll();
     sp->unstall_lot_.unparkAll();
@@ -479,6 +488,7 @@ inline void inbound_channel_open::reject(channel_open_reason reason, std::string
     if (settled_ || !impl_) return;
     settled_ = true;
     (void)impl_->core_.resolve(ticket_, channels::channel_open_verdict::rejected(reason, description));
+    impl_->note_core_failure();
     impl_->write_lot_.unparkAll();
     impl_->unstall_lot_.unparkAll();
 }
@@ -523,8 +533,9 @@ inline inbound_global_request::~inbound_global_request() { reject_now(); }
 inline void inbound_global_request::reject_now() noexcept {
     if (settled_ || !impl_) return;
     settled_ = true;
-    if (!impl_->run_active_ || impl_->core_.failure()) return;
+    if (impl_->closed()) return;
     (void)impl_->core_.resolve(ticket_, false);
+    impl_->note_core_failure();
     impl_->write_lot_.unparkAll();
     impl_->unstall_lot_.unparkAll();
 }
@@ -533,6 +544,7 @@ inline void inbound_global_request::accept(std::span<const std::byte> response_p
     if (settled_ || !impl_) return;
     settled_ = true;
     (void)impl_->core_.resolve(ticket_, true, response_payload);
+    impl_->note_core_failure();
     impl_->write_lot_.unparkAll();
     impl_->unstall_lot_.unparkAll();
 }
@@ -631,8 +643,11 @@ inline corral::Task<std::error_code> channel::enqueue_channel_request(bool want_
                                                                       Enqueue enqueue) {
     if (!impl_ || st_ == nullptr) co_return code::invalid_state;
     auto& self = *impl_;
-    if (!self.run_active_ || self.latch_) co_return code::session_closed;
-    if (auto ec = enqueue()) co_return ec;
+    if (self.closed()) co_return self.latch_;
+    if (auto ec = enqueue()) {
+        self.note_core_failure();
+        co_return ec;
+    }
     self.write_lot_.unparkAll();
     if (!want_reply) co_return {};
     co_return co_await wait_channel_response();
@@ -645,9 +660,9 @@ inline corral::Task<std::error_code> channel::wait_channel_response() {
     st_->reply_waiters.push_back(waiter);
 
     for (;;) {
-        if (self.latch_ || !self.run_active_) {
+        if (self.closed()) {
             waiter.done = true;
-            co_return code::session_closed;
+            co_return self.latch_;
         }
         if (waiter.done) {
             if (waiter.from_reply) {
@@ -753,6 +768,7 @@ inline corral::Task<void> channel::serve_requests_loop(Handler handler) {
         ~serving_guard() {
             auto reject = [&](core::channel_request_ticket ticket) {
                 (void)self->core_.resolve(ticket, false);
+                self->note_core_failure();
             };
             if (has_in_flight) reject(in_flight);
             while (!st->pending_reqs.empty()) {
@@ -766,7 +782,7 @@ inline corral::Task<void> channel::serve_requests_loop(Handler handler) {
         }
     } guard{&self, st_};
 
-    while (!self.latch_ && self.run_active_) {
+    while (!self.closed()) {
         if (!st_->pending_reqs.empty()) {
             auto pending = std::move(st_->pending_reqs.front());
             st_->pending_reqs.erase(st_->pending_reqs.begin());
@@ -774,10 +790,12 @@ inline corral::Task<void> channel::serve_requests_loop(Handler handler) {
             inbound_channel_request req{std::move(pending)};
             guard.in_flight = rid;
             guard.has_in_flight = true;
-            bool ok = co_await handler(std::move(req));
-            if (self.latch_ || !self.run_active_ || self.core_.failure()) co_return;
+            auto outcome = co_await corral::anyOf(handler(std::move(req)), self.closed_ev_);
+            if (self.closed() || !std::get<0>(outcome)) co_return;
+            const bool ok = *std::get<0>(outcome);
             guard.has_in_flight = false;
             (void)self.core_.resolve(rid, ok);
+            self.note_core_failure();
             self.write_lot_.unparkAll();
             self.unstall_lot_.unparkAll();
             continue;

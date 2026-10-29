@@ -61,7 +61,7 @@ TEST_CASE("rejecting the host key fails the client", "[facade][handshake]") {
             REQUIRE(fp.client.failure_detail().data() == first_detail.data());
             auto again = co_await fp.client.handshake(
                 [](host_key_view) -> corral::Task<bool> { co_return true; });
-            REQUIRE(again == errc::session_closed);
+            REQUIRE(again == errc::host_key_rejected);
             REQUIRE(fp.client.failure() == first);
             REQUIRE(fp.client.failure_detail().data() == first_detail.data());
             REQUIRE(fp.client.failure_detail() == first_detail);
