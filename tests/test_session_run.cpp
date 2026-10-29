@@ -23,8 +23,7 @@ using namespace yanterm::ssh::testing;
 namespace {
 
 // Counts overlapping write() calls on one pipe end. memory_pipe::write is
-// otherwise synchronous unless the peer stalls reads, which hid the
-// write_pump vs flush_pending race on real streams.
+// otherwise synchronous unless the peer stalls reads.
 struct concurrent_write_end {
     memory_pipe::end inner;
     int in_flight = 0;
@@ -142,11 +141,16 @@ TEST_CASE("run pumps the identification banner", "[facade][run]") {
         CORRAL_WITH_NURSERY(n) {
             co_await n.start(&client_session::run, &cs);
             co_await n.start(&server_session::run, &ss);
-            // Banner is "SSH-2.0-…\r\n". Drain one TestLoop turn so
-            // memory_pipe wakeups (loop.post) run; corral::yield does not.
-            corral::Event turn;
-            loop.post([&] { turn.trigger(); });
-            co_await turn;
+            // Banner bytes are delivered through TestLoop posts.
+            for (int i = 0; i < 8; ++i) {
+                if (cs.peer_identification().starts_with("SSH-2.0-") &&
+                    ss.peer_identification().starts_with("SSH-2.0-")) {
+                    break;
+                }
+                corral::Event turn;
+                loop.post([&] { turn.trigger(); });
+                co_await turn;
+            }
             REQUIRE(cs.peer_identification().starts_with("SSH-2.0-"));
             REQUIRE(ss.peer_identification().starts_with("SSH-2.0-"));
             co_await cs.disconnect(disconnect_reason::by_application, "done");
@@ -155,7 +159,7 @@ TEST_CASE("run pumps the identification banner", "[facade][run]") {
     }());
 }
 
-TEST_CASE("run FINALLY flushes DISCONNECT before close", "[facade][run]") {
+TEST_CASE("cancelling run does not send DISCONNECT", "[facade][run]") {
     TestLoop loop;
     auto [a, b] = memory_pipe::make(loop);
     crypto::openssl_backend backend;
@@ -172,8 +176,8 @@ TEST_CASE("run FINALLY flushes DISCONNECT before close", "[facade][run]") {
     corral::run(loop, [&]() -> corral::Task<void> {
         CORRAL_WITH_NURSERY(n) {
             co_await n.start(&server_session::run, &ss);
-            // Nest the client so cancel hits its run() FINALLY without a user
-            // disconnect(), while the server stays alive to observe it.
+            // Cancel the client without disconnect(). The peer must not observe
+            // SSH_MSG_DISCONNECT; that wait belongs to session::disconnect.
             CORRAL_WITH_NURSERY(client_n) {
                 co_await client_n.start(&client_session::run, &cs);
                 for (int i = 0; i < 64; ++i) {
@@ -187,8 +191,7 @@ TEST_CASE("run FINALLY flushes DISCONNECT before close", "[facade][run]") {
                 }
                 co_return corral::cancel;
             };
-            for (int i = 0; i < 64; ++i) {
-                if (ss.disconnected() != nullptr) break;
+            for (int i = 0; i < 8; ++i) {
                 corral::Event turn;
                 loop.post([&] { turn.trigger(); });
                 co_await turn;
@@ -197,11 +200,11 @@ TEST_CASE("run FINALLY flushes DISCONNECT before close", "[facade][run]") {
         };
     }());
 
-    REQUIRE(ss.disconnected() != nullptr);
-    REQUIRE(ss.failure() == errc::peer_disconnected);
+    REQUIRE(ss.disconnected() == nullptr);
+    REQUIRE(cs.failure() == errc::session_closed);
 }
 
-TEST_CASE("run FINALLY does not write concurrently with write_pump", "[facade][run]") {
+TEST_CASE("disconnect shares the write pump", "[facade][run]") {
     TestLoop loop;
     auto [a, b] = memory_pipe::make(loop);
     auto stall_server_reads = b.stall_reads();
@@ -233,11 +236,11 @@ TEST_CASE("run FINALLY does not write concurrently with write_pump", "[facade][r
                     loop.post([&] { turn.trigger(); });
                     co_await turn;
                 }
-                // Park the next client stream_.write so a racing flush_pending
-                // would overlap in-flight writes instead of completing synchronously.
+                // Park the next client stream_.write. disconnect() must wait on
+                // the same pump, not start a second writer.
                 stall_server_reads = true;
                 n.start([&]() -> corral::Task<void> {
-                    for (int i = 0; i < 8; ++i) {
+                    for (int i = 0; i < 4; ++i) {
                         corral::Event turn;
                         loop.post([&] { turn.trigger(); });
                         co_await turn;
@@ -245,6 +248,7 @@ TEST_CASE("run FINALLY does not write concurrently with write_pump", "[facade][r
                     stall_server_reads = false;
                     co_return;
                 });
+                co_await cs.disconnect(disconnect_reason::by_application, "done");
                 co_return corral::cancel;
             };
             for (int i = 0; i < 64; ++i) {
@@ -259,6 +263,7 @@ TEST_CASE("run FINALLY does not write concurrently with write_pump", "[facade][r
 
     REQUIRE_FALSE(concurrent_writes);
     REQUIRE(ss.disconnected() != nullptr);
+    REQUIRE(ss.disconnected()->reason == disconnect_reason::by_application);
     REQUIRE(ss.failure() == errc::peer_disconnected);
 }
 
@@ -362,43 +367,6 @@ TEST_CASE("write I/O failure latches transport_failed with detail", "[facade][ru
                 co_return true;
             });
             require_transport_io(cs, io_ec);
-            co_return corral::cancel;
-        };
-    }());
-}
-
-TEST_CASE("flush I/O failure latches transport_failed with detail", "[facade][run]") {
-    TestLoop loop;
-    auto [a, b] = memory_pipe::make(loop);
-    crypto::openssl_backend backend;
-    auto p = crypto::provider::wrap(backend);
-    const auto io_ec = std::error_code(EIO, std::system_category());
-    bool fail_writes = false;
-    gated_write_end gated{std::move(a), &fail_writes, io_ec};
-    client_session cs{static_cast<auv::stream>(std::move(gated)), p, client_options{}};
-    auv::stream peer = auv::stream::own(std::move(b));
-
-    corral::run(loop, [&]() -> corral::Task<void> {
-        CORRAL_WITH_NURSERY(n) {
-            corral::Event cancel_event;
-            co_await n.start([&](corral::TaskStarted<> started) -> corral::Task<void> {
-                co_await corral::anyOf(cs.run(std::move(started)), cancel_event.get());
-            });
-            for (int i = 0; i < 8; ++i) {
-                corral::Event turn;
-                loop.post([&] { turn.trigger(); });
-                co_await turn;
-            }
-            fail_writes = true;
-            cancel_event.trigger();
-            for (int i = 0; i < 8; ++i) {
-                if (cs.failure() == errc::transport_failed) break;
-                corral::Event turn;
-                loop.post([&] { turn.trigger(); });
-                co_await turn;
-            }
-            require_transport_io(cs, io_ec);
-            (void)peer;
             co_return corral::cancel;
         };
     }());

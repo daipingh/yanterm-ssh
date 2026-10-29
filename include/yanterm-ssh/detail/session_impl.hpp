@@ -18,6 +18,7 @@
 #include <corral/ParkingLot.h>
 #include <corral/Task.h>
 #include <corral/utility.h>
+#include <corral/wait.h>
 
 #include <array>
 #include <cassert>
@@ -45,11 +46,19 @@ struct session_impl : core::handler {
                  std::function<void(std::string_view, std::string_view)> on_banner = {});
 
     void latch(std::error_code ec, std::string detail = {});
+    // Copies core_.failure() into the facade. Call immediately after any core
+    // operation that may have failed, before unparking waiters.
+    void note_core_failure() {
+        if (latch_ || !core_.failure()) return;
+        latch(core_.failure(), std::string(core_.failure_detail()));
+    }
+    
+    // Calls may suspend only while run() is active and no error has been latched.
+    [[nodiscard]] bool closed() const noexcept { return !run_active_ || bool(latch_); }
     [[nodiscard]] bool inbound_queue_full() const noexcept;
     auth_result take_auth_response();
     corral::Task<void> read_pump();
-    corral::Task<void> write_pump(corral::TaskStarted<> started);
-    corral::Task<void> flush_pending();
+    corral::Task<void> write_pump();
     corral::Task<std::tuple<std::error_code, auth_result>> wait_auth_response();
     void release_auth_stage() noexcept;
     void on_peer_identification(core::connection&, std::string_view) override {}
@@ -98,6 +107,7 @@ struct session_impl : core::handler {
     core::connection core_;
 
     bool run_active_ = false;
+    bool writer_done_ = false;
     std::uint32_t max_pending_requests_ = default_max_pending_requests;
     std::error_code latch_{};
     std::string latch_detail_;
@@ -109,7 +119,7 @@ struct session_impl : core::handler {
     corral::ParkingLot flushed_lot_;
     corral::ParkingLot rekey_lot_;
     std::uint64_t rekey_gen_ = 0;
-    corral::Event failed_ev_;
+    corral::Event closed_ev_;
     std::function<void(bool always_display, std::string_view text, std::string_view language)>
         on_debug_;
     corral::ParkingLot hs_lot_;
@@ -526,9 +536,9 @@ inline void session_impl::on_released(core::connection&, core::channel_ref, void
 inline void session_impl::latch(std::error_code ec, std::string detail) {
     if (!latch_) {
         latch_ = ec;
-        latch_detail_ = core::detail::clip_failure_detail(std::move(detail));
+        latch_detail_ = std::move(detail);
     }
-    failed_ev_.trigger();
+    closed_ev_.trigger();
     wake_reply_waiters();
     write_lot_.unparkAll();
     unstall_lot_.unparkAll();
@@ -692,28 +702,30 @@ inline corral::Task<void> session_impl::read_pump() {
         }
     };
 
+    auto inbound_blocked = [this] {
+        return core_.inbound_requests_stalled() || inbound_queue_full();
+    };
+
     recv_block in{mr_};
-    for (;;) {
-        if (latch_ || core_.failure()) break;
+    while (!closed()) {
         if (in.off < in.end) {
             std::size_t accepted = 0;
             auto ec = core_.feed(std::span(in.data + in.off, in.end - in.off), accepted);
             in.off += accepted;
             write_lot_.unparkAll();
             if (ec) {
-                latch(ec, std::string(core_.failure_detail()));
-                break;
+                note_core_failure();
+                latch(ec);
+                co_return;
             }
             if (in.off == in.end) in.release();
-            if (core_.inbound_requests_stalled()) {
-                co_await unstall_lot_.park();
-                continue;
-            }
-            if (inbound_queue_full()) {
-                co_await unstall_lot_.park();
-                continue;
-            }
-            if (accepted != 0) continue;
+            if (accepted != 0 && !inbound_blocked()) continue;
+        }
+        // Bytes already read stay a single feed, so a blocked inbound side
+        // waits here even with an empty buffer.
+        if (inbound_blocked()) {
+            co_await unstall_lot_.park();
+            continue;
         }
         if (in.off == in.end) {
             in.release();
@@ -722,88 +734,51 @@ inline corral::Task<void> session_impl::read_pump() {
             in.end -= in.off;
             in.off = 0;
         }
-        // Empty buffer still waits here. Bytes already read stay a single feed.
-        if (core_.inbound_requests_stalled() || inbound_queue_full()) {
-            co_await unstall_lot_.park();
-            continue;
-        }
         auto [ec, n] = co_await stream_.read([&in] {
             std::byte* buf = in.acquire();
             return auv::buffer(reinterpret_cast<char*>(buf + in.end), inbuf_size - in.end);
         });
         if (ec) {
             latch(ec, core::detail::format_transport_io("read", ec));
-            break;
+            co_return;
         }
         if (n == 0) {
             const auto eof = auv::make_error_code(auv::errc::eof);
             latch(eof, core::detail::format_transport_io("read", eof));
-            break;
+            co_return;
         }
         in.end += n;
     }
-    if (in.off == in.end) in.release();
-    latch(latch_ ? latch_ : core_.failure(),
-          latch_ ? std::string{} : std::string(core_.failure_detail()));
 }
 
-inline corral::Task<void> session_impl::write_pump(corral::TaskStarted<> started) {
+inline corral::Task<void> session_impl::write_pump() {
     std::array<std::span<const std::byte>, 8> segs{};
     std::array<auv::buffer, 8> bufs{};
-    bool announced = false;
-    auto announce = [&] {
-        if (!announced) {
-            announced = true;
-            started();
-        }
-    };
     for (;;) {
-        if (latch_ && core_.pending_output_bytes() == 0) break;
+        // RFC 4253 §11.1: nothing may be sent after receiving DISCONNECT.
+        if (have_disc_) break;
         if (core_.pending_output_bytes() == 0) {
-            announce();
+            if (latch_) break;
             co_await write_lot_.park();
             continue;
         }
         const std::size_t n = core_.pending_output(segs);
+        std::size_t bytes = 0;
         for (std::size_t i = 0; i < n; ++i) {
             bufs[i] = auv::buffer(reinterpret_cast<const char*>(segs[i].data()), segs[i].size());
+            bytes += segs[i].size();
         }
-        std::size_t bytes = 0;
-        for (std::size_t i = 0; i < n; ++i) bytes += segs[i].size();
         auto ec = co_await stream_.write(bufs.data(), n);
         if (ec) {
-            announce();
             latch(ec, core::detail::format_transport_io("write", ec));
             break;
         }
         core_.consume_output(bytes);
         out_space_lot_.unparkAll();
         flushed_lot_.unparkAll();
-        announce();
     }
-    announce();
-}
-
-inline corral::Task<void> session_impl::flush_pending() {
-    std::array<std::span<const std::byte>, 8> segs{};
-    std::array<auv::buffer, 8> bufs{};
-    while (core_.pending_output_bytes() > 0 && !latch_) {
-        const std::size_t n = core_.pending_output(segs);
-        if (n == 0) break;
-        for (std::size_t i = 0; i < n; ++i) {
-            bufs[i] = auv::buffer(reinterpret_cast<const char*>(segs[i].data()), segs[i].size());
-        }
-        std::size_t bytes = 0;
-        for (std::size_t i = 0; i < n; ++i) bytes += segs[i].size();
-        auto ec = co_await stream_.write(bufs.data(), n);
-        if (ec) {
-            latch(ec, core::detail::format_transport_io("flush", ec));
-            break;
-        }
-        core_.consume_output(bytes);
-        out_space_lot_.unparkAll();
-        flushed_lot_.unparkAll();
-    }
+    writer_done_ = true;
+    flushed_lot_.unparkAll();
 }
 
 inline void session_impl::release_auth_stage() noexcept { auth_.reset(); }
@@ -818,7 +793,7 @@ inline auth_result session_impl::take_auth_response() {
 
 inline corral::Task<std::tuple<std::error_code, auth_result>> session_impl::wait_auth_response() {
     for (;;) {
-        if (latch_) co_return {code::session_closed, {}};
+        if (closed()) co_return {latch_, {}};
         if (auth_ && auth_->pending_auth_resp) {
             auto r = take_auth_response();
             auth_->client_auth_outstanding = false;
@@ -826,7 +801,6 @@ inline corral::Task<std::tuple<std::error_code, auth_result>> session_impl::wait
             co_return {std::error_code{}, r};
         }
         co_await auth_lot_.park();
-        if (latch_) co_return {code::session_closed, {}};
     }
 }
 
