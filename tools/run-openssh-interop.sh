@@ -435,6 +435,7 @@ if [[ ! -x "$AUTH_TOOL" ]]; then
 else
   USER="${USER:-$(id -un)}"
   ssh-keygen -q -t ed25519 -N '' -f "$TMP/user"
+  ssh-keygen -q -t rsa -b 2048 -N '' -f "$TMP/user_rsa"
   PORT2="$(pick_port)"
 
   echo "==> yanterm client -> sshd publickey (port $PORT)" >&2
@@ -478,6 +479,20 @@ else
       run_ssh "$SSH_BIN" "${SSH_COMMON_OPTS[@]}" -o PreferredAuthentications=publickey \
         -i "$TMP/user" -p "$PORT2" "$USER@127.0.0.1" true >/dev/null 2>"$TMP/ssh-pubkey.err"
       judge_auth_server "ssh -> yanterm publickey" "$TMP/auth-server.err"
+    else
+      stop_auth_server
+      FAILURES=$((FAILURES + 1))
+    fi
+
+    echo "==> ssh -> yanterm server publickey (rsa user key + ed25519 host key, port $PORT2)" >&2
+    stop_auth_server
+    "$AUTH_TOOL" --mode server --listen "$PORT2" --host-key "$TMP/ssh_host_ed25519_key" \
+      --user "$USER" --authorized "$TMP/user_rsa.pub" >"$TMP/auth-server.out" 2>"$TMP/auth-server.err" &
+    AUTH_SERVER_PID=$!
+    if wait_auth_listening "$TMP/auth-server.err"; then
+      run_ssh "$SSH_BIN" "${SSH_COMMON_OPTS[@]}" -o PreferredAuthentications=publickey \
+        -i "$TMP/user_rsa" -p "$PORT2" "$USER@127.0.0.1" true >/dev/null 2>"$TMP/ssh-pubkey-rsa.err"
+      judge_auth_server "ssh -> yanterm publickey (rsa user key + ed25519 host key)" "$TMP/auth-server.err"
     else
       stop_auth_server
       FAILURES=$((FAILURES + 1))

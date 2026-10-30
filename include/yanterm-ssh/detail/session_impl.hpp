@@ -43,6 +43,7 @@ struct session_impl : core::handler {
                  session_options o, std::pmr::memory_resource* mr,
                  std::string auth_banner = {},
                  std::string auth_banner_language = {},
+                 std::string accepted_publickey_algorithms = {},
                  std::function<void(std::string_view, std::string_view)> on_banner = {});
 
     void latch(std::error_code ec, std::string detail = {});
@@ -254,6 +255,7 @@ struct session_impl : core::handler {
 inline session_impl::session_impl(
     core::role r, auv::stream stream, crypto::provider provider, session_options o,
     std::pmr::memory_resource* mr, std::string auth_banner, std::string auth_banner_language,
+    std::string accepted_publickey_algorithms,
     std::function<void(std::string_view, std::string_view)> on_banner)
     : software_(std::move(o.software))
     , preferred_kex_(std::move(o.preferred_kex))
@@ -281,6 +283,7 @@ inline session_impl::session_impl(
                 cfg.max_channels = o.max_channels;
                 cfg.auth_banner = auth_banner;
                 cfg.auth_banner_language = auth_banner_language;
+                cfg.accepted_publickey_algorithms = accepted_publickey_algorithms;
                 return cfg;
             }(),
             *this, mr_)
