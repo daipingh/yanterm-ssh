@@ -125,6 +125,7 @@ ctest --preset dev
 | `asan` | 在 `dev` 基础上开启 AddressSanitizer + UBSan | `build/asan` |
 | `release` | Release，含测试与基准工具 | `build/release` |
 | `clang` | Debug，Clang 18，用于 C++20 模块冒烟测试 | `build/clang` |
+| `fuzz` | RelWithDebInfo，Clang 18，构建 libFuzzer 目标 | `build/fuzz` |
 
 常用 CMake 选项：
 
@@ -133,6 +134,7 @@ ctest --preset dev
 - `YANTERM_SSH_INTEROP_TESTS`：启用与 OpenSSH 的互操作测试，默认关闭。
 - `YANTERM_SSH_ENABLE_ASAN`：开启 ASan + UBSan。
 - `YANTERM_SSH_STATIC_LIBSTDCXX`：测试与工具静态链接 libgcc/libstdc++，默认开启。
+- `YANTERM_SSH_BUILD_FUZZERS`：构建 libFuzzer 目标，需要 Clang、OpenSSL 并开启 `YANTERM_SSH_BUILD_TESTS`，默认关闭。
 
 ## 在项目中使用
 
@@ -253,6 +255,7 @@ while (conn.pending_output_bytes() > 0) {
 - `yanterm_ssh_header_self_contained`：逐个检查头文件能否单独编译。
 - `yanterm_ssh_source_layout`：检查源码布局是否符合 [`SOURCE_LAYOUT.md`](SOURCE_LAYOUT.md)。
 - `yanterm_ssh_replay_tests`：回放 `corpus/` 中录制的 OpenSSH 握手轨迹。
+- `yanterm_ssh_fuzz_replay`：把 `tests/fuzz/corpus/` 中的种子逐个交给 fuzz harness，不需要 libFuzzer。
 - `yanterm_ssh_module_*`：C++20 模块冒烟测试，需使用 `clang` 预设并安装 `clang-tools-18`（提供 `clang-scan-deps`），否则自动跳过。GCC 预设下跳过属于预期行为。
 
 在 `.hpp` 与 `.ipp` 之间移动定义后，务必同时跑 `yanterm_ssh_header_only` 和 `yanterm_ssh_tests`，两种编译模式缺一不可。
@@ -274,6 +277,32 @@ ctest --preset dev -L interop
 - 通道：pty-shell、exec、direct-tcpip。
 
 若安装了 `Terrapin_Scanner`，还会额外检查 strict kex。
+
+### Fuzz 测试
+
+`fuzz` 预设用 libFuzzer + ASan + UBSan 构建三个目标：
+
+- `yanterm-ssh-fuzz-keys`：公钥、私钥、`known_hosts`、`authorized_keys` 解析。
+- `yanterm-ssh-fuzz-wire`：传输层、认证层、连接层报文与通道请求的解码。
+- `yanterm-ssh-fuzz-connection-prekex`：以 client 或 server 身份驱动 `core::connection`，覆盖版本交换、密钥交换，以及按不同分块方式到达的字节流。
+
+```bash
+cmake --preset fuzz
+cmake --build --preset fuzz
+mkdir -p build/fuzz/out-wire
+./build/fuzz/yanterm-ssh-fuzz-wire build/fuzz/out-wire tests/fuzz/corpus/wire
+```
+
+第一个目录接收新发现的输入，后面的目录只读取。发现的崩溃输入修复后可以放进 `tests/fuzz/corpus/` 对应目录，由 `yanterm_ssh_fuzz_replay` 持续回放。
+
+`connection_prekex/` 下的种子和 `keys/10_*` 由 `yanterm-ssh-fuzz-corpus-gen` 生成：它让 harness 的目标端与真实对端对跑并录下对端字节流，目标端回放时能算出相同的会话密钥。harness 固定了标识串和算法列表（见 `tests/fuzz/connection_prekex_setup.hpp`），版本号、默认算法顺序和加密库的差异都不会让种子失效；只有修改这些固定参数、目标端在 NEWKEYS 之前使用随机数的方式，或密钥交换的报文流程时才需要重新生成：
+
+```bash
+cmake --build --preset dev --target yanterm-ssh-fuzz-corpus-gen
+./build/dev/yanterm-ssh-fuzz-corpus-gen tests/fuzz/corpus
+```
+
+其余种子是按 RFC 4251/4253/4254 与 OpenSSH 密钥格式编码的静态样本，不随实现变化，无需重新生成。
 
 ## 基准测试
 
