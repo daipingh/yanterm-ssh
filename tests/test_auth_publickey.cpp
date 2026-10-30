@@ -294,7 +294,9 @@ TEST_CASE("rsa key without rsa-sha2 in server-sig-algs is unsupported_algorithm"
     auto p = prov();
     auto hm = make_ed25519_host(p);
     auto client = make_client(p);
-    auto server = make_server(p);
+    core::config server_cfg;
+    server_cfg.accepted_publickey_algorithms = "ssh-ed25519";
+    auto server = make_server(p, server_cfg);
     configure_server(server, hm);
     handshake_capture cap;
     REQUIRE(run_handshake(client, server, cap));
@@ -368,4 +370,233 @@ TEST_CASE("signed publickey treats PK_OK as unexpected_message", "[auth][publick
     pkok.blob = pk.blob();
     s.peer.send_msg(pkok);
     REQUIRE(s.peer.deliver(s.sut) == code::unexpected_message);
+}
+
+TEST_CASE("ed25519-only server accepts rsa-sha2 user key by default", "[auth][publickey][rsa]") {
+    auto p = prov();
+    auto hm = make_ed25519_host(p);
+    auto client = make_client(p);
+    auto server = make_server(p);
+    configure_server(server, hm);
+    handshake_capture cap;
+    REQUIRE(run_handshake(client, server, cap));
+    REQUIRE(client.conn.server_sig_algs() == kex::default_host_key_algorithms(p));
+
+    user_key rsa;
+    generate_user_key(p, crypto::sig_id::rsa_pkcs1_sha256, 2048, rsa);
+
+    REQUIRE_FALSE(client.conn.auth_publickey_query("alice", rsa.blob()));
+    bool saw_query = false;
+    bool saw_pk_ok = false;
+    REQUIRE(run_auth_loopback(client, server, [&](bool is_client, const recording_handler::recorded_event& ev) {
+        if (!is_client && std::holds_alternative<recording_handler::auth_request>(ev)) {
+            const auto& req = std::get<recording_handler::auth_request>(ev);
+            REQUIRE_FALSE(req.has_signature);
+            REQUIRE(req.algorithm == "rsa-sha2-256");
+            saw_query = true;
+            server.conn.resolve(req.ticket, auth_verdict::success());
+        }
+        if (is_client && std::holds_alternative<recording_handler::auth_response>(ev)) {
+            REQUIRE(std::get<recording_handler::auth_response>(ev).pk_ok);
+            saw_pk_ok = true;
+        }
+    }));
+    REQUIRE(saw_query);
+    REQUIRE(saw_pk_ok);
+
+    client.handler.events.clear();
+    server.handler.events.clear();
+    REQUIRE_FALSE(client.conn.auth_publickey("alice", rsa.blob(), rsa.priv));
+    bool saw_signed = false;
+    bool saw_ok = false;
+    REQUIRE(run_auth_loopback(client, server, [&](bool is_client, const recording_handler::recorded_event& ev) {
+        if (!is_client && std::holds_alternative<recording_handler::auth_request>(ev)) {
+            const auto& req = std::get<recording_handler::auth_request>(ev);
+            REQUIRE(req.has_signature);
+            REQUIRE(req.algorithm == "rsa-sha2-256");
+            saw_signed = true;
+            server.conn.resolve(req.ticket, auth_verdict::success());
+        }
+        if (is_client && std::holds_alternative<recording_handler::auth_response>(ev)) {
+            REQUIRE(std::get<recording_handler::auth_response>(ev).success);
+            saw_ok = true;
+        }
+    }));
+    REQUIRE(saw_signed);
+    REQUIRE(saw_ok);
+    REQUIRE_FALSE(client.conn.failure());
+    REQUIRE_FALSE(server.conn.failure());
+}
+
+TEST_CASE("default server rejects ssh-rsa publickey before on_auth_request",
+          "[auth][publickey]") {
+    // Plan task 2 (a): empty accepted_publickey_algorithms → default excludes ssh-rsa.
+    auto cfg = scripted_peer::sut_config();
+    REQUIRE(cfg.accepted_publickey_algorithms.empty());
+    peer_session s{core::role::server, cfg};
+    s.handshake();
+
+    user_key rsa;
+    generate_user_key(s.p, crypto::sig_id::rsa_pkcs1_sha256, 2048, rsa);
+
+    for (bool has_sig : {false, true}) {
+        CAPTURE(has_sig);
+        wire::detail::userauth_request_publickey msg;
+        msg.user = "alice";
+        msg.service = "ssh-connection";
+        msg.has_signature = has_sig;
+        msg.algorithm = "ssh-rsa";
+        msg.blob = rsa.blob();
+        const std::array<std::byte, 4> dummy_sig{};
+        if (has_sig) msg.signature = dummy_sig;
+
+        s.peer.send_msg(msg);
+        REQUIRE_FALSE(s.peer.exchange(s.sut));
+        REQUIRE(s.sut.handler.events.empty());  // on_auth_request == 0
+        REQUIRE(s.peer.take(wire::msg::userauth_failure));
+        REQUIRE_FALSE(s.peer.take(wire::msg::userauth_pk_ok));
+        REQUIRE_FALSE(s.peer.take(wire::msg::userauth_success));
+    }
+}
+
+TEST_CASE("server rejects publickey request outside accepted_publickey_algorithms before on_auth_request",
+          "[auth][publickey]") {
+    auto cfg = scripted_peer::sut_config();
+    cfg.accepted_publickey_algorithms = "ssh-ed25519";
+    peer_session s{core::role::server, cfg};
+    s.handshake();
+
+    user_key rsa;
+    generate_user_key(s.p, crypto::sig_id::rsa_pkcs1_sha512, 2048, rsa);
+
+    for (bool has_sig : {false, true}) {
+        CAPTURE(has_sig);
+        wire::detail::userauth_request_publickey msg;
+        msg.user = "alice";
+        msg.service = "ssh-connection";
+        msg.has_signature = has_sig;
+        msg.algorithm = "rsa-sha2-512";
+        msg.blob = rsa.blob();
+        const std::array<std::byte, 4> dummy_sig{};
+        if (has_sig) msg.signature = dummy_sig;
+
+        s.peer.send_msg(msg);
+        REQUIRE_FALSE(s.peer.exchange(s.sut));
+        REQUIRE(s.sut.handler.events.empty());
+        REQUIRE(s.peer.take(wire::msg::userauth_failure));
+        REQUIRE_FALSE(s.peer.take(wire::msg::userauth_pk_ok));
+        REQUIRE_FALSE(s.peer.take(wire::msg::userauth_success));
+    }
+
+    user_key ed;
+    generate_user_key(s.p, crypto::sig_id::ed25519, 0, ed);
+    wire::detail::userauth_request_publickey query;
+    query.user = "alice";
+    query.service = "ssh-connection";
+    query.has_signature = false;
+    query.algorithm = "ssh-ed25519";
+    query.blob = ed.blob();
+    s.peer.send_msg(query);
+    REQUIRE_FALSE(s.peer.exchange(s.sut));
+    REQUIRE(s.sut.handler.events.size() == 1);
+    const auto* req = std::get_if<recording_handler::auth_request>(&s.sut.handler.events[0]);
+    REQUIRE(req != nullptr);
+    REQUIRE(req->algorithm == "ssh-ed25519");
+    REQUIRE_FALSE(s.sut.conn.resolve(req->ticket, auth_verdict::success()));
+    REQUIRE_FALSE(s.peer.exchange(s.sut));
+    REQUIRE(s.peer.take(wire::msg::userauth_pk_ok));
+}
+
+TEST_CASE("explicit accepted_publickey_algorithms can opt into ssh-rsa and rsa-sha2-512",
+          "[auth][publickey][rsa]") {
+    auto p = prov();
+    auto hm = make_ed25519_host(p);
+    user_key rsa;
+    generate_user_key(p, crypto::sig_id::rsa_pkcs1_sha256, 2048, rsa);
+
+    {
+        core::config server_cfg;
+        server_cfg.accepted_publickey_algorithms = "ssh-rsa,rsa-sha2-512";
+        auto client = make_client(p);
+        auto server = make_server(p, server_cfg);
+        configure_server(server, hm);
+        handshake_capture cap;
+        REQUIRE(run_handshake(client, server, cap));
+        REQUIRE(client.conn.server_sig_algs() == "ssh-rsa,rsa-sha2-512");
+
+        REQUIRE_FALSE(client.conn.auth_publickey("alice", rsa.blob(), rsa.priv));
+        bool saw_req = false;
+        bool saw_ok = false;
+        REQUIRE(run_auth_loopback(client, server, [&](bool is_client, const recording_handler::recorded_event& ev) {
+            if (!is_client && std::holds_alternative<recording_handler::auth_request>(ev)) {
+                const auto& req = std::get<recording_handler::auth_request>(ev);
+                REQUIRE(req.has_signature);
+                REQUIRE(req.algorithm == "rsa-sha2-512");
+                saw_req = true;
+                server.conn.resolve(req.ticket, auth_verdict::success());
+            }
+            if (is_client && std::holds_alternative<recording_handler::auth_response>(ev)) {
+                REQUIRE(std::get<recording_handler::auth_response>(ev).success);
+                saw_ok = true;
+            }
+        }));
+        REQUIRE(saw_req);
+        REQUIRE(saw_ok);
+        REQUIRE_FALSE(client.conn.failure());
+        REQUIRE_FALSE(server.conn.failure());
+
+        auto peer_cfg = scripted_peer::sut_config();
+        peer_cfg.accepted_publickey_algorithms = "ssh-rsa,rsa-sha2-512";
+        peer_session s{core::role::server, peer_cfg};
+        s.handshake();
+        wire::detail::userauth_request_publickey query;
+        query.user = "alice";
+        query.service = "ssh-connection";
+        query.has_signature = false;
+        query.algorithm = "ssh-rsa";
+        query.blob = rsa.blob();
+        s.peer.send_msg(query);
+        REQUIRE_FALSE(s.peer.exchange(s.sut));
+        REQUIRE(s.sut.handler.events.size() == 1);
+        const auto* req = std::get_if<recording_handler::auth_request>(&s.sut.handler.events[0]);
+        REQUIRE(req != nullptr);
+        REQUIRE(req->algorithm == "ssh-rsa");
+        REQUIRE_FALSE(s.sut.conn.resolve(req->ticket, auth_verdict::success()));
+        REQUIRE_FALSE(s.peer.exchange(s.sut));
+        REQUIRE(s.peer.take(wire::msg::userauth_pk_ok));
+    }
+
+    {
+        core::config client_cfg;
+        client_cfg.preferred_host_key = "ssh-ed25519,ssh-rsa";
+        core::config server_cfg;
+        server_cfg.accepted_publickey_algorithms = "ssh-rsa";
+        auto client = make_client(p, client_cfg);
+        auto server = make_server(p, server_cfg);
+        configure_server(server, hm);
+        handshake_capture cap;
+        REQUIRE(run_handshake(client, server, cap));
+        REQUIRE(client.conn.server_sig_algs() == "ssh-rsa");
+
+        REQUIRE_FALSE(client.conn.auth_publickey("alice", rsa.blob(), rsa.priv));
+        bool saw_req = false;
+        bool saw_ok = false;
+        REQUIRE(run_auth_loopback(client, server, [&](bool is_client, const recording_handler::recorded_event& ev) {
+            if (!is_client && std::holds_alternative<recording_handler::auth_request>(ev)) {
+                const auto& req = std::get<recording_handler::auth_request>(ev);
+                REQUIRE(req.has_signature);
+                REQUIRE(req.algorithm == "ssh-rsa");
+                saw_req = true;
+                server.conn.resolve(req.ticket, auth_verdict::success());
+            }
+            if (is_client && std::holds_alternative<recording_handler::auth_response>(ev)) {
+                REQUIRE(std::get<recording_handler::auth_response>(ev).success);
+                saw_ok = true;
+            }
+        }));
+        REQUIRE(saw_req);
+        REQUIRE(saw_ok);
+        REQUIRE_FALSE(client.conn.failure());
+        REQUIRE_FALSE(server.conn.failure());
+    }
 }

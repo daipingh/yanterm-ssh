@@ -447,15 +447,8 @@ YANTERM_SSH_INLINE std::error_code connection::on_server_kex_init(std::span<cons
 }
 
 YANTERM_SSH_INLINE std::error_code connection::send_ext_info() {
-    if (!round_ || !round_->local_algs) return code::invalid_state;
-    const auto host_keys = round_->local_algs->names().host_key;
-    ext_info_sig_algs_wire_.clear();
-    for (std::size_t i = 0; i < host_keys.size(); ++i) {
-        if (i != 0) ext_info_sig_algs_wire_.push_back(',');
-        ext_info_sig_algs_wire_.append(host_keys[i]);
-    }
     const auto value_bytes =
-        std::as_bytes(std::span{ext_info_sig_algs_wire_.data(), ext_info_sig_algs_wire_.size()});
+        std::as_bytes(std::span{accepted_publickey_algorithms_.data(), accepted_publickey_algorithms_.size()});
     const wire::detail::ext_info::entry entries[] = {{"server-sig-algs", value_bytes}};
     wire::detail::ext_info msg;
     msg.entries = entries;

@@ -533,7 +533,7 @@ private:
 
     std::vector<std::byte> session_id_;
     std::string server_sig_algs_;
-    std::string ext_info_sig_algs_wire_;
+    std::string accepted_publickey_algorithms_;
     std::uint64_t bytes_sent_ = 0;
     std::uint64_t bytes_recv_ = 0;
     std::uint64_t packets_sent_ = 0;
