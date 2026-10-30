@@ -53,13 +53,33 @@
         "OPENSSL_ROOT_DIR": "${sourceDir}/.deps/openssl",
         "OPENSSL_USE_STATIC_LIBS": "ON"
       }
+    },
+    {
+      "name": "fuzz",
+      "displayName": "fuzz",
+      "inherits": "clang",
+      "binaryDir": "${sourceDir}/build/fuzz",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "RelWithDebInfo",
+        "YANTERM_SSH_BUILD_FUZZERS": "ON"
+      }
     }
   ],
   "buildPresets": [
     { "name": "dev", "configurePreset": "dev", "jobs": 8 },
     { "name": "asan", "configurePreset": "asan", "jobs": 8 },
     { "name": "release", "configurePreset": "release", "jobs": 8 },
-    { "name": "clang", "configurePreset": "clang", "jobs": 8 }
+    { "name": "clang", "configurePreset": "clang", "jobs": 8 },
+    {
+      "name": "fuzz",
+      "configurePreset": "fuzz",
+      "jobs": 8,
+      "targets": [
+        "yanterm-ssh-fuzz-keys",
+        "yanterm-ssh-fuzz-wire",
+        "yanterm-ssh-fuzz-connection-prekex"
+      ]
+    }
   ],
   "testPresets": [
     { "name": "dev", "configurePreset": "dev", "output": { "outputOnFailure": true } },

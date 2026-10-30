@@ -199,6 +199,53 @@ if(OpenSSL_FOUND)
         NAME yanterm_ssh_replay_tests
         COMMAND yanterm-ssh-tests "[replay]"
     )
+
+    add_executable(yanterm-ssh-fuzz-replay
+        fuzz/fuzz_replay_main.cpp
+        fuzz/fuzz_keys.cpp
+        fuzz/fuzz_wire.cpp
+        fuzz/fuzz_connection_prekex.cpp
+    )
+    target_include_directories(yanterm-ssh-fuzz-replay PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR})
+    target_compile_definitions(yanterm-ssh-fuzz-replay PRIVATE
+        YANTERM_SSH_FUZZ_CORPUS_DIR="${CMAKE_CURRENT_SOURCE_DIR}/fuzz/corpus")
+    target_link_libraries(yanterm-ssh-fuzz-replay PRIVATE
+        yanterm::ssh-static
+        OpenSSL::Crypto)
+    yanterm_ssh_link_static_libstdcxx(yanterm-ssh-fuzz-replay)
+    add_test(NAME yanterm_ssh_fuzz_replay COMMAND yanterm-ssh-fuzz-replay)
+
+    add_executable(yanterm-ssh-fuzz-corpus-gen fuzz/fuzz_corpus_gen.cpp)
+    target_include_directories(yanterm-ssh-fuzz-corpus-gen PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR})
+    target_link_libraries(yanterm-ssh-fuzz-corpus-gen PRIVATE
+        yanterm::ssh-static
+        OpenSSL::Crypto)
+    yanterm_ssh_link_static_libstdcxx(yanterm-ssh-fuzz-corpus-gen)
+
+    if(YANTERM_SSH_BUILD_FUZZERS)
+        foreach(_fuzz_pair IN ITEMS
+            "yanterm-ssh-fuzz-keys:fuzz/fuzz_keys.cpp"
+            "yanterm-ssh-fuzz-wire:fuzz/fuzz_wire.cpp"
+            "yanterm-ssh-fuzz-connection-prekex:fuzz/fuzz_connection_prekex.cpp"
+        )
+            string(REPLACE ":" ";" _fuzz_parts "${_fuzz_pair}")
+            list(GET _fuzz_parts 0 _bin)
+            list(GET _fuzz_parts 1 _src)
+            add_executable(${_bin} ${_src})
+            target_include_directories(${_bin} PRIVATE
+                ${CMAKE_CURRENT_SOURCE_DIR})
+            target_compile_definitions(${_bin} PRIVATE
+                YANTERM_SSH_FUZZER_STANDALONE)
+            target_link_options(${_bin} PRIVATE -fsanitize=fuzzer)
+            target_link_libraries(${_bin} PRIVATE
+                yanterm::ssh-static
+                OpenSSL::Crypto)
+        endforeach()
+    endif()
+elseif(YANTERM_SSH_BUILD_FUZZERS)
+    message(FATAL_ERROR "YANTERM_SSH_BUILD_FUZZERS requires OpenSSL")
 endif() # OpenSSL_FOUND
 
 add_executable(yanterm-ssh-facade-header-only-test

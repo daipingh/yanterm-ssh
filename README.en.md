@@ -125,6 +125,7 @@ Available presets:
 | `asan` | `dev` plus AddressSanitizer + UBSan | `build/asan` |
 | `release` | Release, with tests and benchmark tool | `build/release` |
 | `clang` | Debug, Clang 18, for C++20 module smoke tests | `build/clang` |
+| `fuzz` | RelWithDebInfo, Clang 18, builds the libFuzzer targets | `build/fuzz` |
 
 Common CMake options:
 
@@ -133,6 +134,7 @@ Common CMake options:
 - `YANTERM_SSH_INTEROP_TESTS`: enable OpenSSH interop tests; off by default.
 - `YANTERM_SSH_ENABLE_ASAN`: enable ASan + UBSan.
 - `YANTERM_SSH_STATIC_LIBSTDCXX`: statically link libgcc/libstdc++ into tests and tools; on by default.
+- `YANTERM_SSH_BUILD_FUZZERS`: build the libFuzzer targets; requires Clang, OpenSSL, and `YANTERM_SSH_BUILD_TESTS`; off by default.
 
 ## Using it in your project
 
@@ -253,6 +255,7 @@ Events that require an application decision, such as host key verification or se
 - `yanterm_ssh_header_self_contained`: checks that every header compiles on its own.
 - `yanterm_ssh_source_layout`: checks that the source layout conforms to [`SOURCE_LAYOUT.md`](SOURCE_LAYOUT.md).
 - `yanterm_ssh_replay_tests`: replays recorded OpenSSH handshake traces from `corpus/`.
+- `yanterm_ssh_fuzz_replay`: feeds every seed under `tests/fuzz/corpus/` to the fuzz harnesses; does not need libFuzzer.
 - `yanterm_ssh_module_*`: C++20 module smoke tests; requires the `clang` preset and `clang-tools-18` (which provides `clang-scan-deps`), otherwise skipped automatically. Skipping under the GCC preset is expected.
 
 After moving a definition between `.hpp` and `.ipp`, always run both `yanterm_ssh_header_only` and `yanterm_ssh_tests`; both compilation modes must be covered.
@@ -274,6 +277,32 @@ The script `tools/run-openssh-interop.sh` starts a temporary sshd and covers the
 - Channels: pty-shell, exec, direct-tcpip.
 
 If `Terrapin_Scanner` is installed, strict kex is checked as well.
+
+### Fuzz testing
+
+The `fuzz` preset builds three targets with libFuzzer + ASan + UBSan:
+
+- `yanterm-ssh-fuzz-keys`: parsing of public keys, private keys, `known_hosts`, and `authorized_keys`.
+- `yanterm-ssh-fuzz-wire`: decoding of transport, authentication, and connection messages and channel requests.
+- `yanterm-ssh-fuzz-connection-prekex`: drives `core::connection` as client or server through version exchange and key exchange, with the byte stream arriving in different chunkings.
+
+```bash
+cmake --preset fuzz
+cmake --build --preset fuzz
+mkdir -p build/fuzz/out-wire
+./build/fuzz/yanterm-ssh-fuzz-wire build/fuzz/out-wire tests/fuzz/corpus/wire
+```
+
+The first directory receives newly found inputs; the others are only read. Once a crashing input is fixed, it can go into the matching directory under `tests/fuzz/corpus/`, where `yanterm_ssh_fuzz_replay` keeps replaying it.
+
+The seeds under `connection_prekex/` and `keys/10_*` are produced by `yanterm-ssh-fuzz-corpus-gen`: it runs the harness's target against a real peer and records the peer's bytes, so replaying them lets the target derive the same session keys. The harness pins the identification string and algorithm lists (see `tests/fuzz/connection_prekex_setup.hpp`), so version bumps, default-order changes, and differences between crypto libraries leave the seeds valid. Regenerate them only after changing those pinned parameters, how the target uses randomness before NEWKEYS, or the key exchange message flow:
+
+```bash
+cmake --build --preset dev --target yanterm-ssh-fuzz-corpus-gen
+./build/dev/yanterm-ssh-fuzz-corpus-gen tests/fuzz/corpus
+```
+
+The remaining seeds are static samples encoded per RFC 4251/4253/4254 and the OpenSSH key formats; they do not track the implementation and need no regeneration.
 
 ## Benchmarks
 

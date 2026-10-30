@@ -44,7 +44,7 @@ jobs:
       - name: Check test list
         run: |
           ctest --preset dev -N | tee ctest-list.txt
-          for t in yanterm_ssh_tests yanterm_ssh_openssh_interop; do
+          for t in yanterm_ssh_tests yanterm_ssh_openssh_interop yanterm_ssh_fuzz_replay; do
             grep -Eq "Test +#[0-9]+: ${t}\$" ctest-list.txt || { echo "::error::test not registered: ${t}"; exit 1; }
           done
       - name: Test
@@ -88,11 +88,21 @@ jobs:
       - name: Check test list
         run: |
           ctest --preset clang -N | tee ctest-list.txt
-          for t in yanterm_ssh_tests yanterm_ssh_openssh_interop yanterm_ssh_module_corral yanterm_ssh_module_openssl yanterm_ssh_module_mixed; do
+          for t in yanterm_ssh_tests yanterm_ssh_openssh_interop yanterm_ssh_fuzz_replay yanterm_ssh_module_corral yanterm_ssh_module_openssl yanterm_ssh_module_mixed; do
             grep -Eq "Test +#[0-9]+: ${t}\$" ctest-list.txt || { echo "::error::test not registered: ${t}"; exit 1; }
           done
       - name: Test
         run: ctest --preset clang
+      - name: Build and smoke-run fuzzers
+        run: |
+          cmake --preset fuzz
+          cmake --build --preset fuzz
+          for t in keys wire connection_prekex; do
+            mkdir -p "build/fuzz/out-${t}"
+            "./build/fuzz/yanterm-ssh-fuzz-${t//_/-}" \
+              -runs=100 -rss_limit_mb=2048 -timeout=10 \
+              "build/fuzz/out-${t}" "tests/fuzz/corpus/${t}"
+          done
 
   gcc15:
     runs-on: ubuntu-26.04
@@ -119,7 +129,7 @@ jobs:
       - name: Check test list (dev)
         run: |
           ctest --preset dev -N | tee ctest-list.txt
-          for t in yanterm_ssh_tests yanterm_ssh_openssh_interop; do
+          for t in yanterm_ssh_tests yanterm_ssh_openssh_interop yanterm_ssh_fuzz_replay; do
             grep -Eq "Test +#[0-9]+: ${t}\$" ctest-list.txt || { echo "::error::test not registered: ${t}"; exit 1; }
           done
       - name: Test (dev)
@@ -131,7 +141,7 @@ jobs:
       - name: Check test list (release)
         run: |
           ctest --test-dir build/release -N | tee ctest-list-release.txt
-          for t in yanterm_ssh_tests yanterm_ssh_openssh_interop; do
+          for t in yanterm_ssh_tests yanterm_ssh_openssh_interop yanterm_ssh_fuzz_replay; do
             grep -Eq "Test +#[0-9]+: ${t}\$" ctest-list-release.txt || { echo "::error::test not registered: ${t}"; exit 1; }
           done
       - name: Test (release)
@@ -162,7 +172,7 @@ jobs:
       - name: Check test list
         run: |
           ctest --preset asan -N | tee ctest-list.txt
-          for t in yanterm_ssh_tests yanterm_ssh_openssh_interop; do
+          for t in yanterm_ssh_tests yanterm_ssh_openssh_interop yanterm_ssh_fuzz_replay; do
             grep -Eq "Test +#[0-9]+: ${t}\$" ctest-list.txt || { echo "::error::test not registered: ${t}"; exit 1; }
           done
       - name: Test

@@ -1,0 +1,3 @@
+# authorized_keys sample
+ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIJ798Bbo8dNjFsF4p6xDdLAQjxOyetiVERawDkgEVCye yanterm-ssh test
+command="/usr/bin/true",no-pty,from="10.0.0.1" ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIJ798Bbo8dNjFsF4p6xDdLAQjxOyetiVERawDkgEVCye yanterm-ssh test

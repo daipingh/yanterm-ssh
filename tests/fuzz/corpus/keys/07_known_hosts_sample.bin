@@ -1,0 +1,6 @@
+# comment line
+example.com,192.0.2.1 ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIJ798Bbo8dNjFsF4p6xDdLAQjxOyetiVERawDkgEVCye yanterm-ssh test
+[ssh.example.com]:2222 ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIJ798Bbo8dNjFsF4p6xDdLAQjxOyetiVERawDkgEVCye yanterm-ssh test
+@cert-authority *.example.com ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIJ798Bbo8dNjFsF4p6xDdLAQjxOyetiVERawDkgEVCye yanterm-ssh test
+@revoked bad.example.com ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIJ798Bbo8dNjFsF4p6xDdLAQjxOyetiVERawDkgEVCye yanterm-ssh test
+|1|c2FsdHNhbHRzYWx0c2FsdA==|aGFzaGhhc2hoYXNoaGFzaGhhc2g= ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIJ798Bbo8dNjFsF4p6xDdLAQjxOyetiVERawDkgEVCye yanterm-ssh test
