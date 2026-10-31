@@ -24,6 +24,7 @@ The entire public API lives under `include/yanterm-ssh/`; see [`PUBLIC_API.md`](
 - **Chinese commercial cryptography (SM) algorithms**: SM2 / SM3 / SM4 algorithms are available when the backend supports them (e.g. Tongsuo).
 - **Memory and security**: plaintext and ciphertext live in reference-counted page memory; sensitive data is carried by types such as `secure_bytes` and wiped on release.
 - **Three delivery forms**: header-only, static library, C++20 modules (experimental).
+- **SFTP**: a v3 client, plus the OpenSSH extensions (sent only when the peer advertised that exact version string). No built-in SFTP server.
 
 ### Not yet supported
 
@@ -35,7 +36,7 @@ The following capabilities are common in mainstream implementations such as Open
 - **External signing**: an external signing interface is provided, but no ssh-agent or PKCS#11/smart-card client is built in.
 - **Agent forwarding**: `auth-agent-req@openssh.com` and its channel.
 - **Compression**: `zlib@openssh.com` / `zlib`; only `none` is negotiated.
-- **SFTP / SCP**: not built in; they can be carried over a `subsystem` channel, but the protocol must be implemented by the application.
+- **SCP**: not built in; it can be carried over a `subsystem` channel, but the protocol must be implemented by the application.
 
 ## Supported algorithms
 
@@ -57,7 +58,7 @@ The library is organized in layers (see section 0 of [`PUBLIC_API.md`](PUBLIC_AP
 - **Core protocol layer** (`core/`, `wire/`, `kex/`, `auth/`, `channels/`, `transport/`): pure sans-I/O state machines; the entry points are `core::connection` and the callback interface `core::handler`.
 - **Crypto layer** (`crypto/`): the `crypto::provider` abstraction and the OpenSSL implementation `crypto::openssl_backend`.
 - **Keys layer** (`keys/`): keys and the various file formats. `keys/io.hpp` is the only header that performs blocking file I/O and must be included explicitly.
-- **Coroutine facade** (`session.hpp`, `channel.hpp`, `options.hpp`, `facade_types.hpp`): wraps the core layer in corral coroutines, with the underlying stream provided by `auv::stream`.
+- **Coroutine facade** (`session.hpp`, `channel.hpp`, `options.hpp`, `facade_types.hpp`, `sftp.hpp`): wraps the core layer in corral coroutines, with the underlying stream provided by `auv::stream`. The SFTP client sits on this facade.
 
 Corresponding CMake targets:
 

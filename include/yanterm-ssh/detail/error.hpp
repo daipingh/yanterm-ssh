@@ -64,6 +64,8 @@ enum class code : int {
     unsupported_key_format,
     insecure_permissions,
     message_size,
+    negotiation_failed,
+    invalid_argument,
 };
 
 class ssh_error_category final : public std::error_category {
@@ -119,6 +121,8 @@ public:
         case code::sign_failure:                  return "signing primitive failed";
         case code::keygen_failure:                return "key generation failed";
         case code::message_size:                  return "message is too large to fit in one binary packet";
+        case code::negotiation_failed:            return "negotiation failed";
+        case code::invalid_argument:              return "invalid argument";
         }
         return "unknown yanterm-ssh error";
     }
@@ -188,7 +192,10 @@ public:
         case code::insecure_permissions:
             return make_error_condition(errc::insecure_permissions);
         case code::message_size:
+        case code::invalid_argument:
             return make_error_condition(errc::invalid_argument);
+        case code::negotiation_failed:
+            return make_error_condition(errc::negotiation_failed);
         }
         return std::error_condition(ev, *this);
     }
