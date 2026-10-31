@@ -840,5 +840,9 @@ sftp_client                       // basic_sftp_client<channel>
 open_sftp(session&, sftp_options) // 打开 session 通道、请求 subsystem "sftp"、start()
 ```
 
-`basic_sftp_client` 在 `start()` 里发送 `SSH_FXP_INIT` 3，不附带扩展。之后的操作共用一条写串行和中继读。取消进行中的请求会丢掉迟到的应答，不把客户端标成失败。`read_all` / `write_all` 按 `max_inflight` 流水线分片。对端没通告的扩展返回 `status_code::op_unsupported`，不会写到线上。`home_directory` 把用户名原样送出；空字符串在 OpenSSH 10 表示当前登录用户，更早的 OpenSSH 会按字面查找。
+`basic_sftp_client` 在 `start()` 里发送 `SSH_FXP_INIT` 3，不附带扩展；对端版本低于 3 时返回 `negotiation_failed`，客户端随之失效。之后的操作共用一条写串行和中继读：未完成的请求（包括还在写自己报文的那个）轮流负责读取，任何时候都有一个在读。取消进行中的请求会丢掉迟到的应答，不把客户端标成失败；基于 `channel` 时，等待应答期间同样可以取消。
+
+发出的帧长不超过 `sftp_options::max_packet_length`，对端在 `limits@openssh.com` 里报了 `max-packet-length` 时再取两者较小值。超出时只让这一次调用返回 `invalid_argument`，客户端仍可用。`write` 一次最多 `min(max-write-length, 帧长上限 − 21 − 句柄长度)` 字节，`write_all` 按这个长度分片。`read` 在 `dst` 为空时直接返回 0，不发请求。`read_all` / `write_all` 按 `max_inflight` 流水线分片。`read_all` 的 `value` 是 `dst` 开头连续读到的字节数；出错时也照样给出，此时 `ec` 是这段前缀之后第一个失败分片的错误。
+
+对端没通告的扩展返回 `status_code::op_unsupported`，不会写到线上；`start()` 之前调用扩展与基础操作一样返回 `invalid_state`。`home_directory` 把用户名原样送出；空字符串在 OpenSSH 10 表示当前登录用户，更早的 OpenSSH 会按字面查找。
 

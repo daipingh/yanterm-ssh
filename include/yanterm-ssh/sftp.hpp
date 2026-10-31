@@ -7,17 +7,18 @@
 #include <yanterm-ssh/session.hpp>
 #include <yanterm-ssh/sftp/packets.hpp>
 
+#include <corral/Event.h>
 #include <corral/Nursery.h>
 #include <corral/ParkingLot.h>
+#include <corral/Semaphore.h>
 #include <corral/utility.h>
+#include <corral/wait.h>
 
 #include <algorithm>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
-#include <deque>
 #include <memory>
-#include <optional>
 #include <span>
 #include <string>
 #include <string_view>
@@ -134,25 +135,31 @@ public:
 
 private:
     static constexpr bool drains_stderr = std::is_same_v<Stream, channel>;
+    // DATA reply: type, id, data length.
     static constexpr std::uint32_t data_reply_overhead = 9;
+    // WRITE request: type, id, handle length, offset, data length.
+    static constexpr std::uint32_t write_request_overhead = 21;
 
     struct waiter : detail::intrusive_list_item<waiter> {
-        basic_sftp_client* self = nullptr;
         std::uint32_t id = 0;
         bool done = false;
         std::error_code ec;
         sftp::msg type{};
         std::vector<std::byte> payload;
         corral::ParkingLot lot;
+    };
 
-        ~waiter() {
-            const bool was_linked = this->linked();
-            this->unlink();
-            if (!was_linked || self == nullptr) return;
-            if (self->reader_ == this) {
-                self->reader_ = nullptr;
-                self->wake_next();
-            }
+    // Chunks past `stop` are not issued; the lowest stop offset wins.
+    struct pipeline_outcome {
+        std::size_t stop = 0;
+        std::error_code ec;
+        std::string message;
+
+        void halt(std::size_t at, std::error_code e, std::string m) {
+            if (at >= stop) return;
+            stop = at;
+            ec = e;
+            message = std::move(m);
         }
     };
 
@@ -170,6 +177,12 @@ private:
     [[nodiscard]] std::error_code gate() const {
         if (failed_) return failed_;
         if (!started_) return make_error_code(code::invalid_state);
+        return {};
+    }
+
+    [[nodiscard]] std::error_code gate(sftp::extension ext) const {
+        if (auto ec = gate()) return ec;
+        if (!supports(ext)) return sftp::make_error_code(sftp::status_code::op_unsupported);
         return {};
     }
 
@@ -202,23 +215,36 @@ private:
         return static_cast<std::uint32_t>(n);
     }
 
-    [[nodiscard]] std::uint32_t write_limit() const {
-        std::uint64_t n = limits_.max_write_length == 0 ? sftp::fallback_io_length
-                                                        : limits_.max_write_length;
-        if (n == 0) n = sftp::fallback_io_length;
-        if (n > 0xffffffffu) n = 0xffffffffu;
-        return static_cast<std::uint32_t>(n);
+    // Outbound frame bound: ours, narrowed by the peer's limits@openssh.com
+    // max-packet-length when it reported one.
+    [[nodiscard]] std::uint32_t frame_limit() const {
+        std::uint64_t cap = opts_.max_packet_length;
+        if (limits_.max_packet_length != 0) cap = std::min(cap, limits_.max_packet_length);
+        return static_cast<std::uint32_t>(cap);
+    }
+
+    [[nodiscard]] std::uint32_t write_limit(const sftp_handle& handle) const {
+        const std::uint64_t overhead = write_request_overhead + handle.bytes().size();
+        const std::uint64_t cap = frame_limit();
+        if (cap <= overhead) return 0;
+        const std::uint64_t max_write = limits_.max_write_length == 0 ? sftp::fallback_io_length
+                                                                      : limits_.max_write_length;
+        return static_cast<std::uint32_t>(std::min(max_write, cap - overhead));
     }
 
     [[nodiscard]] std::uint32_t inflight_limit() const {
         return opts_.max_inflight == 0 ? 1u : opts_.max_inflight;
     }
 
-    void wake_next() {
+    // Every pending linked waiter other than reader_ is parked in drive(), so
+    // the first one found can always take over.
+    void release_reader(const waiter& w) {
+        if (reader_ != &w) return;
+        reader_ = nullptr;
         if (failed_) return;
-        for (auto& w : waiters_) {
-            if (!w.done) {
-                w.lot.unparkOne();
+        for (auto& next : waiters_) {
+            if (&next != &w && !next.done) {
+                next.lot.unparkOne();
                 return;
             }
         }
@@ -234,6 +260,7 @@ private:
                 w.lot.unparkOne();
             }
         }
+        failed_ev_.trigger();
         write_lot_.unparkAll();
     }
 
@@ -261,10 +288,27 @@ private:
     }
     corral::Task<std::error_code> write_bytes(std::span<const std::byte> payload,
                                               std::span<const std::byte> extra);
+    corral::Task<void> send(std::span<const std::byte> payload, std::span<const std::byte> extra);
     corral::Task<void> drive(waiter& w);
     void dispatch_frame();
     corral::Task<raw_reply> exchange(std::uint32_t id, std::span<const std::byte> payload,
                                      std::span<const std::byte> extra = {});
+
+    template <class Fn>
+    corral::Task<void> pipeline(std::size_t total, std::size_t chunk, pipeline_outcome& out, Fn fn) {
+        corral::Semaphore slots(inflight_limit());
+        CORRAL_WITH_NURSERY(n) {
+            for (std::size_t off = 0; off < total && off < out.stop; off += chunk) {
+                auto slot = co_await slots.lock();
+                if (off >= out.stop) break;
+                const auto len = std::min(chunk, total - off);
+                n.start([&fn, off, len, slot = std::move(slot)]() -> corral::Task<void> {
+                    co_await fn(off, len);
+                });
+            }
+            co_return corral::join;
+        };
+    }
 
     sftp::result<> finish_status(const raw_reply& raw, bool eof_is_error = true) const;
     sftp::result<sftp_handle> finish_handle(const raw_reply& raw) const;
@@ -275,7 +319,6 @@ private:
 
     corral::Task<sftp::result<>> status_path(sftp::msg type, std::string_view path);
     corral::Task<sftp::result<sftp::attrs>> attrs_path(sftp::msg type, std::string_view path);
-    corral::Task<sftp::result<>> unsupported() const;
 
     Stream stream_;
     sftp_options opts_{};
@@ -284,6 +327,7 @@ private:
     bool started_ = false;
     bool stderr_open_ = drains_stderr;
     std::error_code failed_{};
+    corral::Event failed_ev_;
     std::uint32_t next_id_ = 1;
     bool write_busy_ = false;
     corral::ParkingLot write_lot_;
@@ -308,34 +352,37 @@ basic_sftp_client<Stream>::read_some(std::span<std::byte> dst) {
             std::byte junk[256];
             auv::buffer stdout_buf{reinterpret_cast<char*>(dst.data()), dst.size()};
             auv::buffer stderr_buf{reinterpret_cast<char*>(junk), sizeof junk};
-            auto both = co_await corral::noncancellable(corral::anyOf(
+            // Cancellable: a read that already copied bytes still completes,
+            // so the caller can commit hdr_/body_ before the next cancel point.
+            auto [stdout_read, stderr_read, failed] = co_await corral::anyOf(
                 stream_.read([](void* p) { return *static_cast<auv::buffer*>(p); }, &stdout_buf),
                 stream_.read_stderr([](void* p) { return *static_cast<auv::buffer*>(p); },
-                                    &stderr_buf)));
-            if (auto& stdout_read = std::get<0>(both)) {
+                                    &stderr_buf),
+                failed_ev_);
+            if (stdout_read) {
                 auto [ec, n] = *stdout_read;
                 out.n = n;
                 out.ec = accept_read(ec, n);
                 co_return out;
             }
-            if (auto& stderr_read = std::get<1>(both)) {
+            if (stderr_read) {
                 auto [ec, n] = *stderr_read;
                 (void)n;
                 if (ec == auv::make_error_code(auv::errc::eof)) stderr_open_ = false;
-                else if (ec) {
-                    out.ec = accept_read(ec, 0);
-                    co_return out;
-                }
+                else if (ec) out.ec = accept_read(ec, 0);
             }
+            if (failed) out.ec = failed_;
             co_return out;
         }
     }
     auv::buffer buf{reinterpret_cast<char*>(dst.data()), dst.size()};
-    // Cancellable while the stream has not produced bytes. A completed read
-    // still resumes here so the caller can commit hdr_/body_ before the next
-    // cancel point. Channel reads keep the noncancellable anyOf above.
-    auto [ec, n] = co_await stream_.read(
-        [](void* p) { return *static_cast<auv::buffer*>(p); }, &buf);
+    auto [got, failed] = co_await corral::anyOf(
+        stream_.read([](void* p) { return *static_cast<auv::buffer*>(p); }, &buf), failed_ev_);
+    if (!got) {
+        out.ec = failed_;
+        co_return out;
+    }
+    auto [ec, n] = *got;
     out.n = n;
     out.ec = accept_read(ec, n);
     co_return out;
@@ -380,11 +427,6 @@ corral::Task<std::error_code> basic_sftp_client<Stream>::lock_write() {
 template <class Stream>
 corral::Task<std::error_code> basic_sftp_client<Stream>::write_bytes(
     std::span<const std::byte> payload, std::span<const std::byte> extra) {
-    const std::size_t cap = std::min<std::size_t>(opts_.max_packet_length, 0xffffffffu);
-    if (payload.size() > cap || extra.size() > cap - payload.size()) {
-        fail(make_error_code(code::invalid_argument));
-        co_return failed_;
-    }
     const auto len = static_cast<std::uint32_t>(payload.size() + extra.size());
     std::byte hdr[4] = {
         static_cast<std::byte>(len >> 24),
@@ -398,9 +440,20 @@ corral::Task<std::error_code> basic_sftp_client<Stream>::write_bytes(
         {reinterpret_cast<const char*>(extra.data()), extra.size()},
     };
     const std::size_t nbufs = extra.empty() ? 2 : 3;
-    auto ec = co_await corral::noncancellable(stream_.write(bufs, nbufs));
-    if (ec) fail(ec);
-    co_return ec ? failed_ : std::error_code{};
+    // A frame is never abandoned half-written while the client is healthy;
+    // once it has failed the stream is dead and a blocked write may be dropped.
+    auto [wrote, failed] = co_await corral::noncancellable(
+        corral::anyOf(stream_.write(bufs, nbufs), failed_ev_));
+    (void)failed;
+    if (wrote && *wrote) fail(*wrote);
+    co_return failed_;
+}
+
+template <class Stream>
+corral::Task<void> basic_sftp_client<Stream>::send(std::span<const std::byte> payload,
+                                                   std::span<const std::byte> extra) {
+    (void)co_await write_bytes(payload, extra);
+    unlock_write();
 }
 
 template <class Stream>
@@ -433,7 +486,7 @@ void basic_sftp_client<Stream>::dispatch_frame() {
     for (auto& w : waiters_) {
         if (w.id != id || w.done) continue;
         w.type = type;
-        w.payload.assign(payload.begin(), payload.end());
+        w.payload.swap(body_);
         w.done = true;
         w.lot.unparkOne();
         return;
@@ -442,11 +495,16 @@ void basic_sftp_client<Stream>::dispatch_frame() {
 
 template <class Stream>
 corral::Task<void> basic_sftp_client<Stream>::drive(waiter& w) {
+    struct reader_guard {
+        basic_sftp_client& self;
+        const waiter& w;
+        ~reader_guard() { self.release_reader(w); }
+    } guard{*this, w};
     while (!w.done) {
         if (failed_) {
             w.ec = failed_;
             w.done = true;
-            co_return;
+            break;
         }
         if (reader_ == nullptr) reader_ = &w;
         if (reader_ != &w) {
@@ -475,24 +533,22 @@ basic_sftp_client<Stream>::exchange(std::uint32_t id, std::span<const std::byte>
         raw.ec = ec;
         co_return raw;
     }
+    const auto cap = frame_limit();
+    if (payload.size() > cap || extra.size() > cap - payload.size()) {
+        raw.ec = make_error_code(code::invalid_argument);
+        co_return raw;
+    }
     if (auto ec = co_await lock_write()) {
         raw.ec = ec;
         co_return raw;
     }
-    // Link the waiter before the write is awaited. A channel write can suspend
-    // after the bytes are on the wire, and the relay reader may dispatch the
-    // response before this coroutine resumes.
+    // The waiter reads while its own frame is still being written: with no
+    // other request in flight nobody else drains replies, and a peer stalled
+    // on our receive window would never open its own.
     waiter w;
-    w.self = this;
     w.id = id;
     waiters_.push_back(w);
-    auto wec = co_await write_bytes(payload, extra);
-    unlock_write();
-    if (wec || failed_) {
-        raw.ec = failed_ ? failed_ : wec;
-        co_return raw;
-    }
-    co_await drive(w);
+    co_await corral::allOf(drive(w), send(payload, extra));
     raw.ec = w.ec;
     raw.type = w.type;
     raw.payload = std::move(w.payload);
@@ -611,14 +667,11 @@ template <class Stream>
 corral::Task<std::error_code> basic_sftp_client<Stream>::start() {
     if (started_ || failed_) co_return make_error_code(code::invalid_state);
     struct guard {
-        basic_sftp_client* self;
-        bool armed = true;
+        basic_sftp_client& self;
         ~guard() {
-            if (armed && self != nullptr && !self->started_ && !self->failed_) {
-                self->fail(make_error_code(code::invalid_state));
-            }
+            if (!self.started_ && !self.failed_) self.fail(make_error_code(code::invalid_state));
         }
-    } cancel_guard{this};
+    } cancel_guard{*this};
     wire::writer hello;
     sftp::encode_init(hello);
     if (auto ec = co_await lock_write()) co_return ec;
@@ -638,23 +691,17 @@ corral::Task<std::error_code> basic_sftp_client<Stream>::start() {
     }
     reset_frame();
     if (version.version < sftp::protocol_version) {
-        cancel_guard.armed = false;
-        co_return make_error_code(code::negotiation_failed);
+        fail(make_error_code(code::negotiation_failed));
+        co_return failed_;
     }
     extensions_ = sftp::advertised_extensions(version.extensions);
     started_ = true;
-    cancel_guard.armed = false;
     if (opts_.query_limits && supports(sftp::extension::limits)) {
         auto lim = co_await query_limits();
         if (failed_) co_return failed_;
         if (!lim.ec) limits_ = lim.value;
     }
     co_return std::error_code{};
-}
-
-template <class Stream>
-corral::Task<sftp::result<>> basic_sftp_client<Stream>::unsupported() const {
-    co_return sftp::result<>{sftp::make_error_code(sftp::status_code::op_unsupported), {}};
 }
 
 template <class Stream>
@@ -671,6 +718,7 @@ template <class Stream>
 corral::Task<sftp::result<std::size_t>>
 basic_sftp_client<Stream>::read(const sftp_handle& handle, std::uint64_t offset, std::span<std::byte> dst) {
     if (auto ec = gate()) co_return failed_result<std::size_t>(ec);
+    if (dst.empty()) co_return sftp::result<std::size_t>{{}, {}, 0};
     const auto want = static_cast<std::uint32_t>(std::min<std::size_t>(dst.size(), read_limit()));
     const auto id = alloc_id();
     wire::writer w;
@@ -702,7 +750,7 @@ corral::Task<sftp::result<>>
 basic_sftp_client<Stream>::write(const sftp_handle& handle, std::uint64_t offset,
                                  std::span<const std::byte> src) {
     if (auto ec = gate()) co_return sftp::result<>{ec, {}};
-    if (src.size() > write_limit()) {
+    if (src.size() > write_limit(handle)) {
         co_return sftp::result<>{make_error_code(code::invalid_argument), {}};
     }
     const auto id = alloc_id();
@@ -896,82 +944,20 @@ corral::Task<sftp::result<std::size_t>>
 basic_sftp_client<Stream>::read_all(const sftp_handle& handle, std::uint64_t offset,
                                     std::span<std::byte> dst) {
     if (auto ec = gate()) co_return failed_result<std::size_t>(ec);
-    if (dst.empty()) co_return sftp::result<std::size_t>{{}, {}, 0};
-    struct state {
-        std::size_t next = 0;
-        std::size_t inflight = 0;
-        bool stop_new = false;
-        std::optional<std::size_t> eof_at;
-        std::deque<std::pair<std::size_t, std::size_t>> retry;
-        std::vector<char> got;
-        std::error_code ec;
-        std::string message;
-        std::size_t err_off = static_cast<std::size_t>(-1);
-        std::uint64_t epoch = 0;
-        corral::ParkingLot lot;
-    } sh;
-    sh.got.resize(dst.size());
-    const auto chunk = static_cast<std::size_t>(read_limit());
-    const auto limit = inflight_limit();
-    CORRAL_WITH_NURSERY(n) {
-        auto note = [&] {
-            ++sh.epoch;
-            sh.lot.unparkAll();
-        };
-        auto schedule = [&] {
-            while (sh.inflight < limit && !sh.ec) {
-                std::size_t off = 0;
-                std::size_t len = 0;
-                if (!sh.retry.empty()) {
-                    off = sh.retry.front().first;
-                    len = sh.retry.front().second;
-                    sh.retry.pop_front();
-                    if (sh.eof_at && off >= *sh.eof_at) continue;
-                } else if (!sh.stop_new && sh.next < dst.size()) {
-                    off = sh.next;
-                    len = std::min(chunk, dst.size() - off);
-                    sh.next += len;
-                } else {
-                    break;
-                }
-                ++sh.inflight;
-                n.start([this, &sh, &note, h = handle, off, len, offset, dst]() -> corral::Task<void> {
-                    auto r = co_await read(h, offset + off, dst.subspan(off, len));
-                    if (r.ec) {
-                        if (off < sh.err_off) {
-                            sh.err_off = off;
-                            sh.ec = r.ec;
-                            sh.message = std::move(r.message);
-                        }
-                        sh.stop_new = true;
-                    } else if (r.value == 0) {
-                        if (!sh.eof_at || off < *sh.eof_at) sh.eof_at = off;
-                        sh.stop_new = true;
-                    } else {
-                        std::fill(sh.got.begin() + static_cast<std::ptrdiff_t>(off),
-                                  sh.got.begin() + static_cast<std::ptrdiff_t>(off + r.value), 1);
-                        if (r.value < len) sh.retry.emplace_back(off + r.value, len - r.value);
-                    }
-                    --sh.inflight;
-                    note();
-                });
+    pipeline_outcome out{dst.size(), {}, {}};
+    co_await pipeline(dst.size(), read_limit(), out,
+                      [&](std::size_t off, std::size_t len) -> corral::Task<void> {
+        std::size_t done = 0;
+        while (done < len && off + done < out.stop) {
+            auto r = co_await read(handle, offset + off + done, dst.subspan(off + done, len - done));
+            if (r.ec || r.value == 0) {
+                out.halt(off + done, r.ec, std::move(r.message));
+                co_return;
             }
-        };
-        for (;;) {
-            const auto seen = sh.epoch;
-            schedule();
-            const bool more = !sh.retry.empty() || (!sh.stop_new && sh.next < dst.size());
-            if (sh.inflight == 0 && (!more || sh.ec)) break;
-            if (sh.epoch != seen) continue;
-            co_await sh.lot.park();
+            done += r.value;
         }
-        co_return corral::join;
-    };
-    if (sh.ec) co_return sftp::result<std::size_t>{sh.ec, std::move(sh.message), {}};
-    std::size_t nread = 0;
-    const std::size_t end = sh.eof_at.value_or(dst.size());
-    while (nread < end && sh.got[nread]) ++nread;
-    co_return sftp::result<std::size_t>{{}, {}, nread};
+    });
+    co_return sftp::result<std::size_t>{out.ec, std::move(out.message), out.stop};
 }
 
 template <class Stream>
@@ -980,56 +966,21 @@ basic_sftp_client<Stream>::write_all(const sftp_handle& handle, std::uint64_t of
                                      std::span<const std::byte> src) {
     if (auto ec = gate()) co_return sftp::result<>{ec, {}};
     if (src.empty()) co_return {};
-    struct state {
-        std::size_t next = 0;
-        std::size_t inflight = 0;
-        bool stop_new = false;
-        std::error_code ec;
-        std::string message;
-        std::size_t err_off = static_cast<std::size_t>(-1);
-        std::uint64_t epoch = 0;
-        corral::ParkingLot lot;
-    } sh;
-    const auto chunk = static_cast<std::size_t>(write_limit());
-    const auto limit = inflight_limit();
-    CORRAL_WITH_NURSERY(n) {
-        auto note = [&] {
-            ++sh.epoch;
-            sh.lot.unparkAll();
-        };
-        for (;;) {
-            const auto seen = sh.epoch;
-            while (sh.inflight < limit && !sh.stop_new && sh.next < src.size()) {
-                const auto off = sh.next;
-                const auto len = std::min(chunk, src.size() - off);
-                sh.next += len;
-                ++sh.inflight;
-                n.start([this, &sh, &note, h = handle, off, len, offset, src]() -> corral::Task<void> {
-                    auto r = co_await write(h, offset + off, src.subspan(off, len));
-                    if (r.ec && off < sh.err_off) {
-                        sh.err_off = off;
-                        sh.ec = r.ec;
-                        sh.message = std::move(r.message);
-                        sh.stop_new = true;
-                    }
-                    --sh.inflight;
-                    note();
-                });
-            }
-            if (sh.inflight == 0) break;
-            if (sh.epoch != seen) continue;
-            co_await sh.lot.park();
-        }
-        co_return corral::join;
-    };
-    co_return sftp::result<>{sh.ec, std::move(sh.message)};
+    const auto chunk = write_limit(handle);
+    if (chunk == 0) co_return sftp::result<>{make_error_code(code::invalid_argument), {}};
+    pipeline_outcome out{src.size(), {}, {}};
+    co_await pipeline(src.size(), chunk, out,
+                      [&](std::size_t off, std::size_t len) -> corral::Task<void> {
+        auto r = co_await write(handle, offset + off, src.subspan(off, len));
+        if (r.ec) out.halt(off, r.ec, std::move(r.message));
+    });
+    co_return sftp::result<>{out.ec, std::move(out.message)};
 }
 
 template <class Stream>
 corral::Task<sftp::result<>> basic_sftp_client<Stream>::posix_rename(std::string_view oldpath,
                                                                     std::string_view newpath) {
-    if (!supports(sftp::extension::posix_rename)) co_return co_await unsupported();
-    if (auto ec = gate()) co_return sftp::result<>{ec, {}};
+    if (auto ec = gate(sftp::extension::posix_rename)) co_return sftp::result<>{ec, {}};
     const auto id = alloc_id();
     wire::writer w;
     sftp::encode_posix_rename(w, id, oldpath, newpath);
@@ -1039,10 +990,7 @@ corral::Task<sftp::result<>> basic_sftp_client<Stream>::posix_rename(std::string
 template <class Stream>
 corral::Task<sftp::result<sftp::statvfs_info>>
 basic_sftp_client<Stream>::statvfs(std::string_view path) {
-    if (!supports(sftp::extension::statvfs)) {
-        co_return failed_result<sftp::statvfs_info>(sftp::make_error_code(sftp::status_code::op_unsupported));
-    }
-    if (auto ec = gate()) co_return failed_result<sftp::statvfs_info>(ec);
+    if (auto ec = gate(sftp::extension::statvfs)) co_return failed_result<sftp::statvfs_info>(ec);
     const auto id = alloc_id();
     wire::writer w;
     sftp::encode_statvfs(w, id, path);
@@ -1052,10 +1000,7 @@ basic_sftp_client<Stream>::statvfs(std::string_view path) {
 template <class Stream>
 corral::Task<sftp::result<sftp::statvfs_info>>
 basic_sftp_client<Stream>::fstatvfs(const sftp_handle& handle) {
-    if (!supports(sftp::extension::fstatvfs)) {
-        co_return failed_result<sftp::statvfs_info>(sftp::make_error_code(sftp::status_code::op_unsupported));
-    }
-    if (auto ec = gate()) co_return failed_result<sftp::statvfs_info>(ec);
+    if (auto ec = gate(sftp::extension::fstatvfs)) co_return failed_result<sftp::statvfs_info>(ec);
     const auto id = alloc_id();
     wire::writer w;
     sftp::encode_fstatvfs(w, id, handle.bytes());
@@ -1065,8 +1010,7 @@ basic_sftp_client<Stream>::fstatvfs(const sftp_handle& handle) {
 template <class Stream>
 corral::Task<sftp::result<>> basic_sftp_client<Stream>::hardlink(std::string_view oldpath,
                                                                 std::string_view newpath) {
-    if (!supports(sftp::extension::hardlink)) co_return co_await unsupported();
-    if (auto ec = gate()) co_return sftp::result<>{ec, {}};
+    if (auto ec = gate(sftp::extension::hardlink)) co_return sftp::result<>{ec, {}};
     const auto id = alloc_id();
     wire::writer w;
     sftp::encode_hardlink(w, id, oldpath, newpath);
@@ -1075,8 +1019,7 @@ corral::Task<sftp::result<>> basic_sftp_client<Stream>::hardlink(std::string_vie
 
 template <class Stream>
 corral::Task<sftp::result<>> basic_sftp_client<Stream>::fsync(const sftp_handle& handle) {
-    if (!supports(sftp::extension::fsync)) co_return co_await unsupported();
-    if (auto ec = gate()) co_return sftp::result<>{ec, {}};
+    if (auto ec = gate(sftp::extension::fsync)) co_return sftp::result<>{ec, {}};
     const auto id = alloc_id();
     wire::writer w;
     sftp::encode_fsync(w, id, handle.bytes());
@@ -1086,8 +1029,7 @@ corral::Task<sftp::result<>> basic_sftp_client<Stream>::fsync(const sftp_handle&
 template <class Stream>
 corral::Task<sftp::result<>> basic_sftp_client<Stream>::lsetstat(std::string_view path,
                                                                 const sftp::attrs& attributes) {
-    if (!supports(sftp::extension::lsetstat)) co_return co_await unsupported();
-    if (auto ec = gate()) co_return sftp::result<>{ec, {}};
+    if (auto ec = gate(sftp::extension::lsetstat)) co_return sftp::result<>{ec, {}};
     const auto id = alloc_id();
     wire::writer w;
     sftp::encode_lsetstat(w, id, path, attributes);
@@ -1096,10 +1038,7 @@ corral::Task<sftp::result<>> basic_sftp_client<Stream>::lsetstat(std::string_vie
 
 template <class Stream>
 corral::Task<sftp::result<sftp::limits_info>> basic_sftp_client<Stream>::query_limits() {
-    if (!supports(sftp::extension::limits)) {
-        co_return failed_result<sftp::limits_info>(sftp::make_error_code(sftp::status_code::op_unsupported));
-    }
-    if (auto ec = gate()) co_return failed_result<sftp::limits_info>(ec);
+    if (auto ec = gate(sftp::extension::limits)) co_return failed_result<sftp::limits_info>(ec);
     const auto id = alloc_id();
     wire::writer w;
     sftp::encode_limits(w, id);
@@ -1128,11 +1067,9 @@ corral::Task<sftp::result<sftp::limits_info>> basic_sftp_client<Stream>::query_l
 template <class Stream>
 corral::Task<sftp::result<std::vector<sftp::name_entry>>>
 basic_sftp_client<Stream>::expand_path(std::string_view path) {
-    if (!supports(sftp::extension::expand_path)) {
-        co_return failed_result<std::vector<sftp::name_entry>>(
-            sftp::make_error_code(sftp::status_code::op_unsupported));
+    if (auto ec = gate(sftp::extension::expand_path)) {
+        co_return failed_result<std::vector<sftp::name_entry>>(ec);
     }
-    if (auto ec = gate()) co_return failed_result<std::vector<sftp::name_entry>>(ec);
     const auto id = alloc_id();
     wire::writer w;
     sftp::encode_expand_path(w, id, path);
@@ -1144,8 +1081,7 @@ corral::Task<sftp::result<>>
 basic_sftp_client<Stream>::copy_data(const sftp_handle& src, std::uint64_t src_offset,
                                      std::uint64_t length, const sftp_handle& dst,
                                      std::uint64_t dst_offset) {
-    if (!supports(sftp::extension::copy_data)) co_return co_await unsupported();
-    if (auto ec = gate()) co_return sftp::result<>{ec, {}};
+    if (auto ec = gate(sftp::extension::copy_data)) co_return sftp::result<>{ec, {}};
     const auto id = alloc_id();
     wire::writer w;
     sftp::encode_copy_data(w, id, src.bytes(), src_offset, length, dst.bytes(), dst_offset);
@@ -1155,10 +1091,7 @@ basic_sftp_client<Stream>::copy_data(const sftp_handle& src, std::uint64_t src_o
 template <class Stream>
 corral::Task<sftp::result<std::string>>
 basic_sftp_client<Stream>::home_directory(std::string_view user) {
-    if (!supports(sftp::extension::home_directory)) {
-        co_return failed_result<std::string>(sftp::make_error_code(sftp::status_code::op_unsupported));
-    }
-    if (auto ec = gate()) co_return failed_result<std::string>(ec);
+    if (auto ec = gate(sftp::extension::home_directory)) co_return failed_result<std::string>(ec);
     const auto id = alloc_id();
     wire::writer w;
     sftp::encode_home_directory(w, id, user);
@@ -1174,11 +1107,14 @@ template <class Stream>
 corral::Task<sftp::result<sftp::id_name_lists>>
 basic_sftp_client<Stream>::users_groups_by_id(std::span<const std::uint32_t> uids,
                                               std::span<const std::uint32_t> gids) {
-    if (!supports(sftp::extension::users_groups_by_id)) {
-        co_return failed_result<sftp::id_name_lists>(
-            sftp::make_error_code(sftp::status_code::op_unsupported));
+    if (auto ec = gate(sftp::extension::users_groups_by_id)) {
+        co_return failed_result<sftp::id_name_lists>(ec);
     }
-    if (auto ec = gate()) co_return failed_result<sftp::id_name_lists>(ec);
+    // Keeps the uint32 blob lengths exact; exchange() enforces the frame bound.
+    const std::size_t max_ids = frame_limit() / 4u;
+    if (uids.size() > max_ids || gids.size() > max_ids - uids.size()) {
+        co_return failed_result<sftp::id_name_lists>(make_error_code(code::invalid_argument));
+    }
     const auto id = alloc_id();
     wire::writer w;
     sftp::encode_users_groups_by_id(w, id, uids, gids);

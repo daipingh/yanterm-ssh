@@ -52,6 +52,8 @@ struct script_state {
     std::size_t delivered = 0;
     bool read_waiting = false;
     std::size_t write_budget = static_cast<std::size_t>(-1);
+    // Models a peer that stops reading requests until its replies are consumed.
+    bool writes_wait_for_reads = false;
     bool write_parked = false;
     reader_gate reader;
     corral::ParkingLot data;
@@ -105,7 +107,7 @@ public:
         };
         while (remaining() > 0) {
             if (st_->closed) co_return std::make_error_code(std::errc::not_connected);
-            if (st_->write_budget == 0) {
+            if (st_->write_budget == 0 || (st_->writes_wait_for_reads && !st_->inbox.empty())) {
                 st_->write_parked = true;
                 st_->wake();
                 co_await st_->data.park();
@@ -261,15 +263,19 @@ corral::Task<std::uint32_t> expect_request(script_state& st, sftp::msg type) {
 
 }  // namespace
 
-TEST_CASE("sftp handshake accepts version 3 and rejects an older peer", "[sftp][client]") {
+TEST_CASE("sftp handshake accepts version 3 and latches an older peer", "[sftp][client]") {
     harness ok;
     corral::run(ok.loop, handshake(ok, 3));
     harness old;
     corral::run(old.loop, [&]() -> corral::Task<void> {
         co_await handshake(old, 2);
         auto st = co_await old.client.stat("/tmp");
-        REQUIRE(st.ec == errc::invalid_state);
+        REQUIRE(st.ec == errc::negotiation_failed);
         REQUIRE(st.message.empty());
+        const auto sent = old.st->outbox.size();
+        auto restarted = co_await old.client.start();
+        REQUIRE(restarted == errc::invalid_state);
+        REQUIRE(old.st->outbox.size() == sent);
     }());
 }
 
@@ -325,6 +331,8 @@ TEST_CASE("sftp rejects operations before the handshake", "[sftp][client]") {
         auto st = co_await h.client.stat("/tmp");
         REQUIRE(st.ec == errc::invalid_state);
         REQUIRE(st.message.empty());
+        auto renamed = co_await h.client.posix_rename("/a", "/b");
+        REQUIRE(renamed.ec == errc::invalid_state);
         REQUIRE(h.st->outbox.empty());
     }());
 }
@@ -648,19 +656,26 @@ TEST_CASE("sftp drops a cancelled request before it reaches the wire", "[sftp][c
     }());
 }
 
-TEST_CASE("sftp rejects an outbound frame longer than max_packet_length", "[sftp][client]") {
+TEST_CASE("sftp rejects an outbound frame longer than max_packet_length without failing", "[sftp][client]") {
     sftp_options opts;
-    opts.max_packet_length = 16;
+    opts.max_packet_length = 64;
     opts.query_limits = false;
     harness h(opts);
     corral::run(h.loop, [&]() -> corral::Task<void> {
         co_await handshake(h);
-        const std::string long_path(64, 'x');
+        const std::string long_path(128, 'x');
         auto removed = co_await h.client.remove(long_path);
         REQUIRE(removed.ec == errc::invalid_argument);
-        auto again = co_await h.client.remove("/y");
-        REQUIRE(again.ec == errc::invalid_argument);
         REQUIRE(h.st->outbox.empty());
+        CORRAL_WITH_NURSERY(n) {
+            n.start([&]() -> corral::Task<void> {
+                auto id = co_await expect_request(*h.st, sftp::msg::remove);
+                send_status(*h.st, id, sftp::status_code::ok, {});
+            });
+            auto again = co_await h.client.remove("/y");
+            REQUIRE_FALSE(again.ec);
+            co_return corral::join;
+        };
     }());
 }
 
@@ -774,6 +789,67 @@ TEST_CASE("sftp read_all retries a short read and stops at EOF", "[sftp][client]
     }());
 }
 
+TEST_CASE("sftp read_all reports the filled prefix when a later chunk fails", "[sftp][client]") {
+    sftp_options opts;
+    opts.max_inflight = 1;
+    harness h(opts);
+    h.peer_limits.max_read_length = 4;
+    corral::run(h.loop, [&]() -> corral::Task<void> {
+        co_await handshake(h, 3, k_limits);
+        auto handle = co_await open_ok(h);
+        CORRAL_WITH_NURSERY(n) {
+            n.start([&]() -> corral::Task<void> {
+                auto id = co_await expect_request(*h.st, sftp::msg::read);
+                send_payload(*h.st, encoded([&](wire::writer& w) {
+                    const std::byte raw[] = {std::byte{'a'}, std::byte{'b'}, std::byte{'c'}, std::byte{'d'}};
+                    sftp::encode_data(w, id, raw);
+                }));
+                id = co_await expect_request(*h.st, sftp::msg::read);
+                send_status(*h.st, id, sftp::status_code::failure, "io");
+            });
+            std::vector<std::byte> dst(10);
+            auto got = co_await h.client.read_all(handle, 0, dst);
+            REQUIRE(got.ec == sftp::status_code::failure);
+            REQUIRE(got.message == "io");
+            REQUIRE(got.value == 4);
+            REQUIRE(std::memcmp(dst.data(), "abcd", 4) == 0);
+            co_return corral::join;
+        };
+    }());
+}
+
+TEST_CASE("sftp read of an empty buffer returns zero without a request", "[sftp][client]") {
+    harness h;
+    corral::run(h.loop, [&]() -> corral::Task<void> {
+        co_await handshake(h);
+        auto handle = co_await open_ok(h);
+        const auto before = h.st->outbox.size();
+        auto got = co_await h.client.read(handle, 0, {});
+        REQUIRE_FALSE(got.ec);
+        REQUIRE(got.value == 0);
+        REQUIRE(h.st->outbox.size() == before);
+    }());
+}
+
+TEST_CASE("sftp keeps reading replies while its own request is blocked on write", "[sftp][client]") {
+    harness h;
+    corral::run(h.loop, [&]() -> corral::Task<void> {
+        co_await handshake(h);
+        h.st->writes_wait_for_reads = true;
+        send_status(*h.st, 999, sftp::status_code::ok, "stray");
+        CORRAL_WITH_NURSERY(n) {
+            n.start([&]() -> corral::Task<void> {
+                auto id = co_await expect_request(*h.st, sftp::msg::remove);
+                send_status(*h.st, id, sftp::status_code::ok, {});
+            });
+            auto removed = co_await h.client.remove("/x");
+            REQUIRE_FALSE(removed.ec);
+            REQUIRE(removed.message.empty());
+            co_return corral::join;
+        };
+    }());
+}
+
 TEST_CASE("sftp write_all stops issuing after the first failing chunk", "[sftp][client]") {
     sftp_options opts;
     opts.max_inflight = 1;
@@ -850,6 +926,65 @@ TEST_CASE("sftp write refuses a buffer larger than the negotiated limit", "[sftp
         REQUIRE(rejected.ec == errc::invalid_argument);
         REQUIRE(h.st->outbox.size() == mark);
     }());
+}
+
+TEST_CASE("sftp write_all keeps every WRITE frame within the packet limit", "[sftp][client]") {
+    struct scenario {
+        const char* name;
+        std::uint32_t local_max;
+        std::uint64_t peer_max_packet;
+        std::uint64_t peer_max_write;
+        std::size_t total;
+    };
+    const scenario cases[] = {
+        {"local limit below the fallback write length", 1024, 0, 0, 3000},
+        {"peer advertises an unbounded write length", 1024, 0, 0xffffffffu, 3000},
+        {"peer packet limit below ours", sftp::default_max_packet_length, 600, 0xffffffffu, 2000},
+    };
+    for (const auto& c : cases) {
+        SECTION(c.name) {
+            sftp_options opts;
+            opts.max_packet_length = c.local_max;
+            harness h(opts);
+            h.peer_limits.max_packet_length = c.peer_max_packet;
+            h.peer_limits.max_write_length = c.peer_max_write;
+            const auto frame_cap = c.peer_max_packet == 0
+                ? std::uint64_t{c.local_max}
+                : std::min<std::uint64_t>(c.local_max, c.peer_max_packet);
+            corral::run(h.loop, [&]() -> corral::Task<void> {
+                co_await handshake(h, 3, k_limits);
+                auto handle = co_await open_ok(h);
+                std::vector<std::byte> src(c.total);
+                for (std::size_t i = 0; i < src.size(); ++i) src[i] = static_cast<std::byte>(i);
+                std::vector<std::byte> seen(c.total);
+                std::size_t covered = 0;
+                CORRAL_WITH_NURSERY(n) {
+                    n.start([&]() -> corral::Task<void> {
+                        while (covered < c.total) {
+                            while (h.st->outbox.size() < 4) co_await h.st->progress.park();
+                            const auto len = sftp::decode_frame_header(
+                                std::span<const std::byte>(h.st->outbox.data(), 4));
+                            REQUIRE(len <= frame_cap);
+                            auto payload = co_await next_payload(*h.st);
+                            std::uint32_t id = 0;
+                            std::span<const std::byte> hb;
+                            std::uint64_t offset = 0;
+                            std::span<const std::byte> data;
+                            REQUIRE(sftp::decode_write(payload, id, hb, offset, data));
+                            REQUIRE(offset + data.size() <= c.total);
+                            std::memcpy(seen.data() + offset, data.data(), data.size());
+                            covered += data.size();
+                            send_status(*h.st, id, sftp::status_code::ok, {});
+                        }
+                    });
+                    auto wrote = co_await h.client.write_all(handle, 0, src);
+                    REQUIRE_FALSE(wrote.ec);
+                    co_return corral::join;
+                };
+                REQUIRE(seen == src);
+            }());
+        }
+    }
 }
 
 TEST_CASE("sftp does not send an extension the peer did not advertise", "[sftp][client]") {
@@ -1269,3 +1404,81 @@ TEST_CASE("sftp drains channel stderr before the stdout window stalls", "[sftp][
     }());
 }
 
+
+TEST_CASE("sftp cancels a channel request whose reply never arrives", "[sftp][channel]") {
+    auto fp = make_facade_pair({}, {});
+    auto accept_host = [](host_key_view) -> corral::Task<bool> { co_return true; };
+    auto dummy_global = [](inbound_global_request) -> corral::Task<void> { co_return; };
+
+    corral::run(fp.loop, [&]() -> corral::Task<void> {
+        CORRAL_WITH_NURSERY(n) {
+            co_await n.start(&client_session::run, &fp.client);
+            co_await n.start(&server_session::run, &fp.server);
+            auto [cec, sec] = co_await corral::allOf(fp.client.handshake(accept_host), fp.server.handshake());
+            REQUIRE_FALSE(cec);
+            REQUIRE_FALSE(sec);
+            auto [aec, auth] = co_await corral::allOf(
+                fp.client.auth_password("alice", "s3cret"),
+                fp.server.authenticate([](auth_request req) -> corral::Task<auth_verdict> {
+                    if (req.method() == "password" && req.user() == "alice" && req.password() == "s3cret") {
+                        co_return auth_verdict::success();
+                    }
+                    co_return auth_verdict::failure("password");
+                }));
+            REQUIRE_FALSE(std::get<0>(aec));
+            REQUIRE(std::get<1>(aec).success);
+            REQUIRE_FALSE(auth);
+
+            std::vector<std::byte> version = frame(encoded([&](wire::writer& w) {
+                sftp::encode_version(w, 3);
+            }));
+            const auto init_len = frame(encoded([&](wire::writer& w) { sftp::encode_init(w); })).size();
+            const auto stat_len = frame(encoded([&](wire::writer& w) {
+                sftp::encode_path_request(w, sftp::msg::stat, 0, "/hang");
+            })).size();
+            corral::Event serving;
+            corral::Event request_seen;
+            bool server_reading = true;
+            n.start([&]() -> corral::Task<void> {
+                serving.trigger();
+                co_await fp.server.serve(
+                    [&](inbound_channel_open open) -> corral::Task<void> {
+                        channel ch = open.accept();
+                        auv::buffer out{reinterpret_cast<char*>(version.data()), version.size()};
+                        auto wrote = co_await ch.write(&out, 1);
+                        REQUIRE_FALSE(wrote);
+                        char buf[256];
+                        auv::buffer in{buf, sizeof buf};
+                        std::size_t seen = 0;
+                        for (;;) {
+                            auto [ec, got] = co_await ch.read(
+                                [](void* p) { return *static_cast<auv::buffer*>(p); }, &in);
+                            if (ec) {
+                                server_reading = false;
+                                co_return;
+                            }
+                            seen += got;
+                            if (seen >= init_len + stat_len) request_seen.trigger();
+                        }
+                    },
+                    dummy_global);
+            });
+            co_await serving;
+            auto opened = co_await fp.client.open_session_channel();
+            REQUIRE_FALSE(opened.ec);
+            sftp_options opts;
+            opts.query_limits = false;
+            basic_sftp_client<channel> sftp(std::move(opened.ch), opts);
+            auto started = co_await sftp.start();
+            REQUIRE_FALSE(started);
+            CORRAL_WITH_NURSERY(op) {
+                op.start([&]() -> corral::Task<void> { (void)co_await sftp.stat("/hang"); });
+                co_await request_seen;
+                co_return corral::cancel;
+            };
+            REQUIRE(server_reading);
+            co_await fp.client.disconnect(disconnect_reason::by_application, "done");
+            co_return corral::cancel;
+        };
+    }());
+}
