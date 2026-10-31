@@ -72,6 +72,15 @@ if(OpenSSL_FOUND)
         OpenSSL::Crypto)
     yanterm_ssh_link_static_libstdcxx(yanterm-ssh-interop-channels)
 
+    add_executable(yanterm-ssh-interop-sftp
+        "${PROJECT_SOURCE_DIR}/tools/interop_sftp.cpp")
+    target_include_directories(yanterm-ssh-interop-sftp PRIVATE
+        ${PROJECT_SOURCE_DIR}/tests)
+    target_link_libraries(yanterm-ssh-interop-sftp PRIVATE
+        yanterm::ssh-static
+        OpenSSL::Crypto)
+    yanterm_ssh_link_static_libstdcxx(yanterm-ssh-interop-sftp)
+
     add_test(
         NAME yanterm_ssh_openssh_interop
         COMMAND ${PROJECT_SOURCE_DIR}/tools/run-openssh-interop.sh
@@ -81,6 +90,6 @@ if(OpenSSL_FOUND)
         DISABLED $<NOT:$<BOOL:${YANTERM_SSH_INTEROP_TESTS}>>
         SKIP_RETURN_CODE 77
         ENVIRONMENT
-            "YANTERM_SSH_BUILD_DIR=${PROJECT_BINARY_DIR};YANTERM_SSH_CORPUS_DIR=${PROJECT_SOURCE_DIR}/corpus;YANTERM_SSH_INTEROP_TOOL=$<TARGET_FILE:yanterm-ssh-interop-handshake>;YANTERM_SSH_INTEROP_AUTH_TOOL=$<TARGET_FILE:yanterm-ssh-interop-auth>;YANTERM_SSH_INTEROP_CHAN_TOOL=$<TARGET_FILE:yanterm-ssh-interop-channels>"
+            "YANTERM_SSH_BUILD_DIR=${PROJECT_BINARY_DIR};YANTERM_SSH_CORPUS_DIR=${PROJECT_SOURCE_DIR}/corpus;YANTERM_SSH_INTEROP_TOOL=$<TARGET_FILE:yanterm-ssh-interop-handshake>;YANTERM_SSH_INTEROP_AUTH_TOOL=$<TARGET_FILE:yanterm-ssh-interop-auth>;YANTERM_SSH_INTEROP_CHAN_TOOL=$<TARGET_FILE:yanterm-ssh-interop-channels>;YANTERM_SSH_INTEROP_SFTP_TOOL=$<TARGET_FILE:yanterm-ssh-interop-sftp>"
     )
 endif()

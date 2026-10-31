@@ -7,16 +7,16 @@
 | 层 | 内容 |
 | --- | --- |
 | L0 | `detail/config.hpp`、`error.hpp` |
-| L1 词汇 | `wire/message_ids`、`transport/packet_mode`、`auth/types`、`channels/types`、`crypto/algorithms` |
+| L1 词汇 | `wire/message_ids`、`transport/packet_mode`、`auth/types`、`channels/types`、`crypto/algorithms`、`sftp/types` |
 | L2 | `wire/types` + `wire/detail/messages`、`crypto/provider`、`crypto/secure_buffer` |
-| L3 | `crypto/openssl`、`keys/**`、`kex/algorithms` + `kex/detail/tables`、`channels/requests`、`memory/**` |
+| L3 | `crypto/openssl`、`keys/**`、`kex/algorithms` + `kex/detail/tables`、`channels/requests`、`memory/**`、`sftp/packets` |
 | L4 | `core/**`（`types` / `config` / `handler` / `connection` 公开，`detail/**` 私有） |
-| L5 门面 | `facade_types.hpp`、`options.hpp`、`session.hpp`、`channel.hpp`、`detail/session_impl.hpp` |
+| L5 门面 | `facade_types.hpp`、`options.hpp`、`session.hpp`、`channel.hpp`、`sftp.hpp`、`detail/session_impl.hpp` |
 
 ```mermaid
 flowchart TB
   subgraph L5["L5 门面"]
-    facade["session / channel / options / facade_types"]
+    facade["session / channel / options / facade_types / sftp"]
   end
   subgraph L4["L4 core"]
     core_pub["types / config / handler / connection"]
@@ -28,6 +28,7 @@ flowchart TB
     kexalg["kex/algorithms + kex/detail/tables"]
     reqs["channels/requests"]
     memory["memory/**"]
+    sftp_pkt["sftp/packets"]
   end
   subgraph L2["L2"]
     wtypes["wire/types"]
@@ -41,6 +42,7 @@ flowchart TB
     at["auth/types"]
     ct["channels/types"]
     calg["crypto/algorithms"]
+    sftp_ty["sftp/types"]
   end
   subgraph L0["L0"]
     cfg["detail/config.hpp"]
@@ -758,6 +760,8 @@ make_error_condition
 error_category                  // 声明；库身份，非分支契约
 ```
 
+SFTP 状态码不走上面的 `errc` 枚举。`sftp::status_code` 是 `std::error_code` 枚举，类别 `sftp::error_category()` 的 `name()` 为 `"yanterm-ssh.sftp"`。`default_error_condition` 把 `no_such_file` 映到 `std::errc::no_such_file_or_directory`，`permission_denied` 映到 `std::errc::permission_denied`，`op_unsupported` 映到 `std::errc::operation_not_supported`，`no_connection` / `connection_lost` 映到 `errc::session_closed`，`bad_message` 映到 `errc::protocol_violation`。`ok`、`eof`、`failure` 以及枚举外的数值留在该类别里，`error_code::value()` 仍是原始数值。
+
 ### [yanterm-ssh/version.hpp](include/yanterm-ssh/version.hpp)
 
 ```
@@ -770,3 +774,75 @@ YANTERM_SSH_VERSION_STRING
 version_string()
 default_software()            // "yanterm_ssh_" + 版本号；RFC 4253 软件版本字段
 ```
+
+## 7. SFTP
+
+客户端只说 SFTP v3（draft-ietf-secsh-filexfer-02），外加对端在 `SSH_FXP_VERSION` 里通告、且版本字符串完全一致的 OpenSSH 扩展。没有 SFTP 服务端，也没有 SCP。`ATTR_EXTENDED` 解码时校验并跳过，编码时不发送。路径是不透明字节。
+
+`open` 被取消时，服务端句柄可能一直留到通道关闭。`sftp_handle` 只保存句柄字节，析构不发送 `SSH_FXP_CLOSE`。
+
+- [yanterm-ssh/sftp/types.hpp](include/yanterm-ssh/sftp/types.hpp)
+- [yanterm-ssh/sftp/packets.hpp](include/yanterm-ssh/sftp/packets.hpp)
+- [yanterm-ssh/sftp.hpp](include/yanterm-ssh/sftp.hpp)
+
+### [yanterm-ssh/sftp/types.hpp](include/yanterm-ssh/sftp/types.hpp)
+
+```
+namespace yanterm::ssh::sftp
+
+protocol_version                // 3
+default_max_packet_length       // 262144
+fallback_io_length              // 32768
+max_handle_length               // 256
+enum class msg                  // 1–20、101–105、200–201
+enum class status_code          // 0–8；可与 error_code 比较
+open_flags::*                   // read / write / append / creat / trunc / excl
+attr_flags::*                   // size / uidgid / permissions / acmodtime / extended
+struct attrs
+struct name_entry
+struct limits_info
+struct statvfs_info
+enum class extension            // 11 个 OpenSSH 扩展
+class extension_set
+error_category()                // name() 为 "yanterm-ssh.sftp"
+make_error_code(status_code)
+result<T> / result<void>        // ec、message、value
+```
+
+### [yanterm-ssh/sftp/packets.hpp](include/yanterm-ssh/sftp/packets.hpp)
+
+帧与 v3 报文的 `encode_*` / `decode_*`。解码出的 `string_view` 和 `span` 借用输入。`SSH_FXP_SYMLINK` 按 OpenSSH 的顺序编码：先 `targetpath`，再 `linkpath`。`users-groups-by-id` 的请求和应答都是两段打包过的字符串，不是先写个数再写 `uint32`。扩展应答允许兼容的尾部。`advertised_extensions` 只接受下列名字和版本：
+
+```
+posix-rename@openssh.com            1
+statvfs@openssh.com                 2
+fstatvfs@openssh.com                2
+hardlink@openssh.com                1
+fsync@openssh.com                   1
+lsetstat@openssh.com                1
+limits@openssh.com                  1
+expand-path@openssh.com             1
+copy-data                           1
+home-directory                      1
+users-groups-by-id@openssh.com      1
+```
+
+### [yanterm-ssh/sftp.hpp](include/yanterm-ssh/sftp.hpp)
+
+```
+namespace yanterm::ssh
+
+struct sftp_options               // max_packet_length、max_inflight、query_limits
+class sftp_handle                 // 句柄字节；析构不 CLOSE
+sftp::id_name_lists               // users、groups
+basic_sftp_client<Stream>         // 要求 auv::stream_like<Stream>
+sftp_client                       // basic_sftp_client<channel>
+open_sftp(session&, sftp_options) // 打开 session 通道、请求 subsystem "sftp"、start()
+```
+
+`basic_sftp_client` 在 `start()` 里发送 `SSH_FXP_INIT` 3，不附带扩展；对端版本低于 3 时返回 `negotiation_failed`，客户端随之失效。之后的操作共用一条写串行和中继读：未完成的请求（包括还在写自己报文的那个）轮流负责读取，任何时候都有一个在读。取消进行中的请求会丢掉迟到的应答，不把客户端标成失败；基于 `channel` 时，等待应答期间同样可以取消。
+
+发出的帧长不超过 `sftp_options::max_packet_length`，对端在 `limits@openssh.com` 里报了 `max-packet-length` 时再取两者较小值。超出时只让这一次调用返回 `invalid_argument`，客户端仍可用。`write` 一次最多 `min(max-write-length, 帧长上限 − 21 − 句柄长度)` 字节，`write_all` 按这个长度分片。`read` 在 `dst` 为空时直接返回 0，不发请求。`read_all` / `write_all` 按 `max_inflight` 流水线分片。`read_all` 的 `value` 是 `dst` 开头连续读到的字节数；出错时也照样给出，此时 `ec` 是这段前缀之后第一个失败分片的错误。
+
+对端没通告的扩展返回 `status_code::op_unsupported`，不会写到线上；`start()` 之前调用扩展与基础操作一样返回 `invalid_state`。`home_directory` 把用户名原样送出；空字符串在 OpenSSH 10 表示当前登录用户，更早的 OpenSSH 会按字面查找。
+

@@ -82,6 +82,8 @@ TEST_CASE("each detail::code maps to the specified errc", "[error]") {
         {code::unsupported_key_format, errc::unsupported_key_format},
         {code::insecure_permissions, errc::insecure_permissions},
         {code::message_size, errc::invalid_argument},
+        {code::negotiation_failed, errc::negotiation_failed},
+        {code::invalid_argument, errc::invalid_argument},
     };
 
     for (row r : kMap) {

@@ -164,6 +164,8 @@ if(OpenSSL_FOUND)
         test_session_serve.cpp
         test_session_cancel.cpp
         test_session_memory.cpp
+        test_sftp_packets.cpp
+        test_sftp_client.cpp
     )
     # Exercises ossl1_1::openssl_backend next to the default 3.x backend; the
     # 1.1.1 API it uses is deprecated in OpenSSL 3.
@@ -205,6 +207,7 @@ if(OpenSSL_FOUND)
         fuzz/fuzz_keys.cpp
         fuzz/fuzz_wire.cpp
         fuzz/fuzz_connection_prekex.cpp
+        fuzz/fuzz_sftp.cpp
     )
     target_include_directories(yanterm-ssh-fuzz-replay PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR})
@@ -229,6 +232,7 @@ if(OpenSSL_FOUND)
             "yanterm-ssh-fuzz-keys:fuzz/fuzz_keys.cpp"
             "yanterm-ssh-fuzz-wire:fuzz/fuzz_wire.cpp"
             "yanterm-ssh-fuzz-connection-prekex:fuzz/fuzz_connection_prekex.cpp"
+            "yanterm-ssh-fuzz-sftp:fuzz/fuzz_sftp.cpp"
         )
             string(REPLACE ":" ";" _fuzz_parts "${_fuzz_pair}")
             list(GET _fuzz_parts 0 _bin)

@@ -24,6 +24,7 @@ yanterm-ssh 实现了 SSH-2 的线上协议与密码学协商，但**自身不�
 - **商密算法**：后端支持时（例如 Tongsuo）可使用 SM2 / SM3 / SM4 相关算法。
 - **内存与安全**：明文和密文放在引用计数的页内存里；敏感数据用 `secure_bytes` 等类型承载，释放时擦除。
 - **三种交付形态**：header-only、静态库、C++20 模块（实验性）。
+- **SFTP**：v3 客户端，以及 OpenSSH 的扩展（对端通告且版本字符串完全一致时才发送）。没有内置 SFTP 服务端。
 
 ### 暂未支持
 
@@ -35,7 +36,7 @@ yanterm-ssh 实现了 SSH-2 的线上协议与密码学协商，但**自身不�
 - **外部签名**：已提供外部签名接口，但未内置 ssh-agent 与 PKCS#11/智能卡客户端。
 - **agent 转发**：`auth-agent-req@openssh.com` 及对应通道。
 - **压缩**：`zlib@openssh.com` / `zlib`，目前只协商 `none`。
-- **SFTP / SCP**：未内置；可通过 `subsystem` 通道承载，但协议需自行实现。
+- **SCP**：未内置；可通过 `subsystem` 通道承载，但协议需自行实现。
 
 ## 支持的算法
 
@@ -57,7 +58,7 @@ yanterm-ssh 实现了 SSH-2 的线上协议与密码学协商，但**自身不�
 - **核心协议层**（`core/`、`wire/`、`kex/`、`auth/`、`channels/`、`transport/`）：纯 sans-I/O 状态机，入口是 `core::connection` 与回调接口 `core::handler`。
 - **加密层**（`crypto/`）：`crypto::provider` 抽象与 OpenSSL 实现 `crypto::openssl_backend`。
 - **密钥层**（`keys/`）：密钥与各类文件格式。其中 `keys/io.hpp` 是唯一做阻塞文件 I/O 的头文件，需要显式包含。
-- **协程门面**（`session.hpp`、`channel.hpp`、`options.hpp`、`facade_types.hpp`）：把核心层包装成 corral 协程，底层流由 `auv::stream` 提供。
+- **协程门面**（`session.hpp`、`channel.hpp`、`options.hpp`、`facade_types.hpp`、`sftp.hpp`）：把核心层包装成 corral 协程，底层流由 `auv::stream` 提供。SFTP 客户端在这条门面上。
 
 对应的 CMake 目标：
 
