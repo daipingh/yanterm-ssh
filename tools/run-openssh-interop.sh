@@ -780,6 +780,102 @@ PY
   fi
 fi
 
+# ---- SFTP v3 client interop (OpenSSH subsystem; unadvertised extensions are skips) ----
+SFTP_TOOL="${YANTERM_SSH_INTEROP_SFTP_TOOL:-$BUILD_DIR/yanterm-ssh-interop-sftp}"
+SFTP_SUBSYSTEM="/usr/lib/openssh/sftp-server"
+if [[ ! -x "$SFTP_SUBSYSTEM" ]]; then
+  if [[ -x /usr/lib/sftp-server ]]; then
+    SFTP_SUBSYSTEM="/usr/lib/sftp-server"
+  else
+    SFTP_SUBSYSTEM="internal-sftp"
+  fi
+fi
+
+start_sshd_sftp() {
+  cat >"$TMP/sshd_config" <<EOF
+Port ${PORT}
+ListenAddress 127.0.0.1
+HostKey ${TMP}/ssh_host_ed25519_key
+PidFile ${TMP}/sshd.pid
+StrictModes no
+UsePAM no
+PasswordAuthentication no
+KbdInteractiveAuthentication no
+ChallengeResponseAuthentication no
+PubkeyAuthentication yes
+AuthorizedKeysFile ${TMP}/user.pub
+AuthenticationMethods publickey
+PermitRootLogin yes
+AllowTcpForwarding no
+Subsystem sftp ${SFTP_SUBSYSTEM}
+KexAlgorithms curve25519-sha256
+Ciphers chacha20-poly1305@openssh.com
+HostKeyAlgorithms ssh-ed25519
+PubkeyAcceptedAlgorithms ssh-ed25519
+MACs hmac-sha2-256-etm@openssh.com,hmac-sha2-256
+LogLevel ERROR
+EOF
+
+  if ! "$SSHD_BIN" -f "$TMP/sshd_config" -t 2>"$TMP/sshd-t.err"; then
+    echo "sshd -t failed for sftp interop" >&2
+    cat "$TMP/sshd-t.err" >&2 || true
+    return 1
+  fi
+
+  "$SSHD_BIN" -f "$TMP/sshd_config" -E "$TMP/sshd.log"
+  for _ in $(seq 1 50); do
+    if [[ -f "$TMP/sshd.pid" ]] && kill -0 "$(cat "$TMP/sshd.pid")" 2>/dev/null; then
+      if bash -c "echo >/dev/tcp/127.0.0.1/${PORT}" 2>/dev/null; then
+        return 0
+      fi
+    fi
+    sleep 0.05
+  done
+  echo "sshd failed to start for sftp interop" >&2
+  cat "$TMP/sshd.log" >&2 || true
+  cat "$TMP/sshd-t.err" >&2 || true
+  return 1
+}
+
+if [[ ! -x "$SFTP_TOOL" ]]; then
+  echo "FAIL sftp interop tool not found/executable: $SFTP_TOOL" >&2
+  FAILURES=$((FAILURES + 1))
+else
+  USER="${USER:-$(id -un)}"
+  if [[ ! -f "$TMP/user" ]]; then
+    ssh-keygen -q -t ed25519 -N '' -f "$TMP/user"
+  fi
+  mkdir -p "$TMP/sftp-work"
+  chmod 755 "$TMP/sftp-work"
+  PORT="$(pick_port)"
+  echo "==> yanterm sftp client -> sshd subsystem (port $PORT, $SFTP_SUBSYSTEM)" >&2
+  stop_sshd || true
+  if ! start_sshd_sftp; then
+    echo "FAIL start_sshd sftp" >&2
+    FAILURES=$((FAILURES + 1))
+  elif ! "$SFTP_TOOL" --host 127.0.0.1 --port "$PORT" --user "$USER" \
+      --identity "$TMP/user" --workdir "$TMP/sftp-work" \
+      >"$TMP/sftp.out" 2>"$TMP/sftp.err"; then
+    echo "FAIL yanterm sftp client -> sshd" >&2
+    cat "$TMP/sftp.out" >&2 || true
+    cat "$TMP/sftp.err" >&2 || true
+    cat "$TMP/sshd.log" >&2 || true
+    FAILURES=$((FAILURES + 1))
+  elif ! grep -q '^sftp_ok handshake$' "$TMP/sftp.out" \
+      || ! grep -q '^sftp_ok upload ' "$TMP/sftp.out" \
+      || ! grep -q '^sftp_ok remove$' "$TMP/sftp.out"; then
+    echo "FAIL sftp interop missing required sftp_ok lines" >&2
+    cat "$TMP/sftp.out" >&2 || true
+    cat "$TMP/sftp.err" >&2 || true
+    FAILURES=$((FAILURES + 1))
+  else
+    echo "ok sftp ($(grep '^sftp_ok ' "$TMP/sftp.out" | wc -l) steps)" >&2
+    grep '^skip ' "$TMP/sftp.out" >&2 || true
+    RAN=$((RAN + 1))
+  fi
+  stop_sshd || true
+fi
+
 echo "interop done: ran=$RAN failures=$FAILURES openssh=$OPENSSH_TAG" >&2
 if [[ "$FAILURES" -ne 0 ]]; then
   exit 1

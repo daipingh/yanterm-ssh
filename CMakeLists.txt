@@ -72,6 +72,7 @@ add_library(yanterm-ssh-static STATIC
     src/keys.cpp
     src/keys_io.cpp
     src/bcrypt_pbkdf.cpp
+    src/sftp.cpp
 )
 add_library(yanterm::ssh-static ALIAS yanterm-ssh-static)
 
