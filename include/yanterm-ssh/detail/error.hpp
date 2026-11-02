@@ -16,7 +16,6 @@ enum class code : int {
     invalid_mpint,
     invalid_name_list,
     version_line_too_long,
-    unsupported_protocol_version,
     missing_version_banner,
     invalid_packet_length,
     invalid_padding,
@@ -39,6 +38,7 @@ enum class code : int {
     no_common_cipher,
     no_common_mac,
     no_common_compression,
+    unsupported_protocol_version,
 
     unsupported_algorithm,
     empty_algorithm_list,
@@ -64,6 +64,7 @@ enum class code : int {
     unsupported_key_format,
     insecure_permissions,
     message_size,
+    invalid_argument,
 };
 
 class ssh_error_category final : public std::error_category {
@@ -77,7 +78,6 @@ public:
         case code::invalid_mpint:                 return "mpint is negative or not canonically encoded";
         case code::invalid_name_list:             return "name-list contains an empty or non-US-ASCII name";
         case code::version_line_too_long:         return "identification line exceeds 255 bytes";
-        case code::unsupported_protocol_version:  return "peer does not speak SSH 2.0";
         case code::missing_version_banner:        return "peer sent no SSH identification string";
         case code::invalid_packet_length:         return "binary packet length is out of range or not a valid multiple";
         case code::invalid_padding:               return "binary packet padding length is out of range";
@@ -88,6 +88,7 @@ public:
         case code::no_common_cipher:              return "no common encryption algorithm";
         case code::no_common_mac:                 return "no common message authentication algorithm";
         case code::no_common_compression:         return "no common compression algorithm";
+        case code::unsupported_protocol_version:  return "peer uses an unsupported protocol version";
         case code::invalid_host_key:              return "host key blob is malformed";
         case code::signature_verification_failed: return "host key signature verification failed";
         case code::host_key_rejected:             return "host key was rejected by the application";
@@ -119,6 +120,7 @@ public:
         case code::sign_failure:                  return "signing primitive failed";
         case code::keygen_failure:                return "key generation failed";
         case code::message_size:                  return "message is too large to fit in one binary packet";
+        case code::invalid_argument:              return "invalid argument";
         }
         return "unknown yanterm-ssh error";
     }
@@ -130,7 +132,6 @@ public:
         case code::invalid_mpint:
         case code::invalid_name_list:
         case code::version_line_too_long:
-        case code::unsupported_protocol_version:
         case code::missing_version_banner:
         case code::invalid_packet_length:
         case code::invalid_padding:
@@ -153,6 +154,7 @@ public:
         case code::no_common_cipher:
         case code::no_common_mac:
         case code::no_common_compression:
+        case code::unsupported_protocol_version:
             return make_error_condition(errc::negotiation_failed);
         case code::unsupported_algorithm:
         case code::empty_algorithm_list:
@@ -188,6 +190,7 @@ public:
         case code::insecure_permissions:
             return make_error_condition(errc::insecure_permissions);
         case code::message_size:
+        case code::invalid_argument:
             return make_error_condition(errc::invalid_argument);
         }
         return std::error_condition(ev, *this);

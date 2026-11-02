@@ -1,5 +1,7 @@
 # yanterm-ssh 公共 API 清单
 
+本文档只罗列公开 API，不描述规格和约束.
+
 ## 0. 模块与依赖
 
 每层只能向下依赖。
@@ -7,16 +9,16 @@
 | 层 | 内容 |
 | --- | --- |
 | L0 | `detail/config.hpp`、`error.hpp` |
-| L1 词汇 | `wire/message_ids`、`transport/packet_mode`、`auth/types`、`channels/types`、`crypto/algorithms` |
+| L1 词汇 | `wire/message_ids`、`transport/packet_mode`、`auth/types`、`channels/types`、`crypto/algorithms`、`sftp/types` |
 | L2 | `wire/types` + `wire/detail/messages`、`crypto/provider`、`crypto/secure_buffer` |
-| L3 | `crypto/openssl`、`keys/**`、`kex/algorithms` + `kex/detail/tables`、`channels/requests`、`memory/**` |
+| L3 | `crypto/openssl`、`keys/**`、`kex/algorithms` + `kex/detail/tables`、`channels/requests`、`memory/**`、`sftp/packets` |
 | L4 | `core/**`（`types` / `config` / `handler` / `connection` 公开，`detail/**` 私有） |
-| L5 门面 | `facade_types.hpp`、`options.hpp`、`session.hpp`、`channel.hpp`、`detail/session_impl.hpp` |
+| L5 门面 | `facade_types.hpp`、`options.hpp`、`session.hpp`、`channel.hpp`、`sftp.hpp`、`detail/session_impl.hpp` |
 
 ```mermaid
 flowchart TB
   subgraph L5["L5 门面"]
-    facade["session / channel / options / facade_types"]
+    facade["session / channel / options / facade_types / sftp"]
   end
   subgraph L4["L4 core"]
     core_pub["types / config / handler / connection"]
@@ -28,6 +30,7 @@ flowchart TB
     kexalg["kex/algorithms + kex/detail/tables"]
     reqs["channels/requests"]
     memory["memory/**"]
+    sftp_pkt["sftp/packets"]
   end
   subgraph L2["L2"]
     wtypes["wire/types"]
@@ -41,6 +44,7 @@ flowchart TB
     at["auth/types"]
     ct["channels/types"]
     calg["crypto/algorithms"]
+    sftp_ty["sftp/types"]
   end
   subgraph L0["L0"]
     cfg["detail/config.hpp"]
@@ -758,6 +762,8 @@ make_error_condition
 error_category                  // 声明；库身份，非分支契约
 ```
 
+SFTP 状态码不走上面的 `errc` 枚举。`sftp::status_code` 是 `std::error_code` 枚举，类别 `sftp::error_category()` 的 `name()` 为 `"yanterm-ssh.sftp"`。`default_error_condition` 把 `no_such_file` 映到 `std::errc::no_such_file_or_directory`，`permission_denied` 映到 `std::errc::permission_denied`，`op_unsupported` 映到 `std::errc::operation_not_supported`，`no_connection` / `connection_lost` 映到 `errc::session_closed`，`bad_message` 映到 `errc::protocol_violation`。`ok`、`eof`、`failure` 以及枚举外的数值留在该类别里，`error_code::value()` 仍是原始数值。
+
 ### [yanterm-ssh/version.hpp](include/yanterm-ssh/version.hpp)
 
 ```
@@ -769,4 +775,136 @@ YANTERM_SSH_VERSION_PATCH
 YANTERM_SSH_VERSION_STRING
 version_string()
 default_software()            // "yanterm_ssh_" + 版本号；RFC 4253 软件版本字段
+```
+
+## 7. SFTP
+
+- [yanterm-ssh/sftp/types.hpp](include/yanterm-ssh/sftp/types.hpp)
+- [yanterm-ssh/sftp/packets.hpp](include/yanterm-ssh/sftp/packets.hpp)
+- [yanterm-ssh/sftp.hpp](include/yanterm-ssh/sftp.hpp)
+
+### [yanterm-ssh/sftp/types.hpp](include/yanterm-ssh/sftp/types.hpp)
+
+```
+namespace yanterm::ssh::sftp
+
+protocol_version                // 3
+default_max_packet_length       // 262144
+fallback_io_length              // 32768
+max_handle_length               // 256
+enum class msg                  // 1–20、101–105、200–201
+enum class status_code          // 0–8；可与 error_code 比较
+open_flags::*                   // read / write / append / creat / trunc / excl
+attr_flags::*                   // size / uidgid / permissions / acmodtime / extended
+struct attrs
+struct name_entry
+struct limits_info
+struct statvfs_info
+enum class extension            // OpenSSH 扩展
+class extension_set
+error_category()                // "yanterm-ssh.sftp"
+make_error_code(status_code)
+result<T> / result<void>        // ec、message、value
+```
+
+### [yanterm-ssh/sftp/packets.hpp](include/yanterm-ssh/sftp/packets.hpp)
+
+```
+namespace yanterm::ssh::sftp
+
+decode_frame_header
+encode_frame_header
+packet_type
+packet_request_id
+
+encode_init / decode_init
+encode_version / decode_version
+encode_attrs / decode_attrs
+encode_open / decode_open
+encode_close
+decode_handle_request
+encode_read / decode_read
+encode_write_header / decode_write
+encode_path_request / decode_path_request
+encode_setstat / decode_setstat
+encode_fsetstat / decode_fsetstat
+encode_rename / decode_rename
+encode_symlink
+encode_status / decode_status
+encode_handle / decode_handle
+encode_data / decode_data
+encode_name / decode_name
+encode_attrs_reply / decode_attrs_reply
+
+encode_extended
+encode_posix_rename
+encode_statvfs
+encode_fstatvfs
+encode_hardlink
+encode_fsync
+encode_lsetstat
+encode_limits
+encode_expand_path
+encode_copy_data
+encode_home_directory
+encode_users_groups_by_id
+
+encode_extended_reply
+encode_statvfs_reply / decode_statvfs_reply
+encode_limits_reply / decode_limits_reply
+encode_users_groups_by_id_reply / decode_users_groups_by_id_reply
+advertised_extensions
+```
+
+### [yanterm-ssh/sftp.hpp](include/yanterm-ssh/sftp.hpp)
+
+```
+namespace yanterm::ssh
+
+struct sftp_options               // max_packet_length、max_inflight、query_limits
+class sftp_handle                 // 文件句柄；析构不 CLOSE
+sftp::id_name_lists               // users、groups
+basic_sftp_client<Stream>         // 要求 auv::stream_like<Stream>
+sftp_client                       // basic_sftp_client<channel>
+open_sftp(session&, sftp_options) // 打开 session 通道、请求 subsystem "sftp"、handshake()
+
+sftp_handle::empty
+sftp_handle::clear
+
+basic_sftp_client::handshake
+basic_sftp_client::failure
+basic_sftp_client::supports
+basic_sftp_client::limits
+basic_sftp_client::open
+basic_sftp_client::read
+basic_sftp_client::write
+basic_sftp_client::close
+basic_sftp_client::stat
+basic_sftp_client::lstat
+basic_sftp_client::fstat
+basic_sftp_client::setstat
+basic_sftp_client::fsetstat
+basic_sftp_client::opendir
+basic_sftp_client::readdir
+basic_sftp_client::read_dir
+basic_sftp_client::remove
+basic_sftp_client::mkdir
+basic_sftp_client::rmdir
+basic_sftp_client::realpath
+basic_sftp_client::rename
+basic_sftp_client::readlink
+basic_sftp_client::symlink
+basic_sftp_client::read_all
+basic_sftp_client::write_all
+basic_sftp_client::posix_rename
+basic_sftp_client::statvfs
+basic_sftp_client::fstatvfs
+basic_sftp_client::hardlink
+basic_sftp_client::fsync
+basic_sftp_client::lsetstat
+basic_sftp_client::query_limits
+basic_sftp_client::expand_path
+basic_sftp_client::copy_data
+basic_sftp_client::home_directory
+basic_sftp_client::users_groups_by_id
 ```

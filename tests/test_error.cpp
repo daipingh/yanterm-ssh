@@ -34,7 +34,6 @@ TEST_CASE("each detail::code maps to the specified errc", "[error]") {
         {code::invalid_mpint, errc::malformed_input},
         {code::invalid_name_list, errc::malformed_input},
         {code::version_line_too_long, errc::malformed_input},
-        {code::unsupported_protocol_version, errc::malformed_input},
         {code::missing_version_banner, errc::malformed_input},
         {code::invalid_packet_length, errc::malformed_input},
         {code::invalid_padding, errc::malformed_input},
@@ -57,6 +56,7 @@ TEST_CASE("each detail::code maps to the specified errc", "[error]") {
         {code::no_common_cipher, errc::negotiation_failed},
         {code::no_common_mac, errc::negotiation_failed},
         {code::no_common_compression, errc::negotiation_failed},
+        {code::unsupported_protocol_version, errc::negotiation_failed},
 
         {code::unsupported_algorithm, errc::unsupported_algorithm},
         {code::empty_algorithm_list, errc::unsupported_algorithm},
@@ -82,6 +82,7 @@ TEST_CASE("each detail::code maps to the specified errc", "[error]") {
         {code::unsupported_key_format, errc::unsupported_key_format},
         {code::insecure_permissions, errc::insecure_permissions},
         {code::message_size, errc::invalid_argument},
+        {code::invalid_argument, errc::invalid_argument},
     };
 
     for (row r : kMap) {
