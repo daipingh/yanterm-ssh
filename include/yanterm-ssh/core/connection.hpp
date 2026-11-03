@@ -173,6 +173,12 @@ public:
 
     std::size_t channel_read(channel_ref ch, std::uint32_t ext_type, std::span<std::byte> dst);
 
+    // Inbound extended data of ext_type is buffered for channel_read only while
+    // captured; otherwise it is dropped and its window credited back. Release
+    // drops anything still buffered. At most one capture per type at a time.
+    std::error_code capture_extended_data(channel_ref ch, std::uint32_t ext_type);
+    std::error_code release_extended_data(channel_ref ch, std::uint32_t ext_type);
+
     void set_user_data(channel_ref ch, void* user);
 
     std::error_code channel_request(channel_ref ch, const channels::channel_request_spec& spec);
@@ -340,6 +346,9 @@ private:
     std::error_code channel_commit_write(channel_ref ref, std::uint32_t bytes);
     void release_channel(channel_ref ref);
     void notify_readable(const detail::channel& c, std::uint32_t ext_type);
+    // Batches credit until half the advertised window; local_window then grows
+    // even when send is false or the WINDOW_ADJUST write fails.
+    std::error_code credit_window(detail::channel& c, std::uint32_t bytes, bool send);
     [[nodiscard]] detail::channel* find_open_channel(channels::channel_id local) noexcept;
     void resume_writes();
     [[nodiscard]] static bool can_send_data(const detail::channel& c) noexcept;

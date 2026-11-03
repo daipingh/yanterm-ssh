@@ -41,6 +41,7 @@ public:
     bool sent_close = false;
     bool recv_close = false;
     bool want_writable = false;
+    bool ext_captured = false;  // stderr buffered into rx_ext; otherwise dropped on receipt
 
     std::deque<memory::detail::page_slice> rx_data;
     std::deque<memory::detail::page_slice> rx_ext;

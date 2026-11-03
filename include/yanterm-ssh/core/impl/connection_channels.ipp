@@ -232,28 +232,62 @@ YANTERM_SSH_INLINE std::size_t connection::channel_read(channel_ref ch, std::uin
             front = front.subslice(n, front.size() - n);
         }
     }
-    const bool recv_close = c->recv_close;
-    const auto remote = c->remote;
-    if (copied > 0 && !recv_close) {
-        c->pending_adjust += static_cast<std::uint32_t>(copied);
-        const auto threshold = (std::max)(1u, c->advertised_window / 2);
-        if (c->pending_adjust >= threshold) {
-            const auto bytes = c->pending_adjust;
-            c->local_window += bytes;
-            c->pending_adjust = 0;
-            if (!suppress_adjust) {
-                wire::detail::channel_window_adjust msg;
-                msg.recipient = remote;
-                msg.bytes = bytes;
-                if (auto ec = write_encoded(msg)) {
-                    fail(ec);
-                    phase_ = phase::dead;
-                }
-            }
+    if (copied > 0 && !c->recv_close) {
+        if (auto ec = credit_window(*c, static_cast<std::uint32_t>(copied), !suppress_adjust)) {
+            fail(ec);
+            phase_ = phase::dead;
         }
     }
     if (auto* again = slots_.find(ch); again && again->releasable()) release_channel(ch);
     return copied;
+}
+
+YANTERM_SSH_INLINE std::error_code connection::credit_window(detail::channel& c, std::uint32_t bytes,
+                                                             bool send) {
+    c.pending_adjust += bytes;
+    const auto threshold = (std::max)(1u, c.advertised_window / 2);
+    if (c.pending_adjust < threshold) return {};
+    wire::detail::channel_window_adjust msg;
+    msg.recipient = c.remote;
+    msg.bytes = c.pending_adjust;
+    c.local_window += c.pending_adjust;
+    c.pending_adjust = 0;
+    if (!send) return {};
+    return write_encoded(msg);
+}
+
+YANTERM_SSH_INLINE std::error_code connection::capture_extended_data(channel_ref ch,
+                                                                     std::uint32_t ext_type) {
+    if (ext_type != channels::extended_data_stderr) return code::invalid_argument;
+    if (!channels_active()) return code::invalid_state;
+    auto* c = slots_.find(ch);
+    if (!c || !c->remote_known || c->sent_close || c->recv_close || c->ext_captured) {
+        return code::invalid_state;
+    }
+    c->ext_captured = true;
+    return {};
+}
+
+YANTERM_SSH_INLINE std::error_code connection::release_extended_data(channel_ref ch,
+                                                                     std::uint32_t ext_type) {
+    if (ext_type != channels::extended_data_stderr) return code::invalid_argument;
+    auto* c = slots_.find(ch);
+    if (!c || !c->ext_captured) return code::invalid_state;
+    c->ext_captured = false;
+    std::size_t dropped = 0;
+    for (const auto& s : c->rx_ext) dropped += s.size();
+    c->rx_ext.clear();
+    std::error_code ec;
+    if (dropped > 0 && !c->recv_close) {
+        const bool send = !failure_ && phase_ != phase::dead;
+        ec = credit_window(*c, static_cast<std::uint32_t>(dropped), send);
+        if (ec) {
+            fail(ec);
+            phase_ = phase::dead;
+        }
+    }
+    if (auto* again = slots_.find(ch); again && again->releasable()) release_channel(ch);
+    return ec;
 }
 
 YANTERM_SSH_INLINE std::error_code connection::channel_request(channel_ref ch,
@@ -701,13 +735,8 @@ YANTERM_SSH_INLINE std::error_code connection::on_channel_data(memory::detail::p
     if (data.size() > c->local_max_packet) return code::unexpected_message;
     const auto n = static_cast<std::uint32_t>(data.size());
     c->local_window -= n;
-    if (ext && ext_type != channels::extended_data_stderr) {
-        c->local_window += n;
-        wire::detail::channel_window_adjust adj;
-        adj.recipient = c->remote;
-        adj.bytes = n;
-        if (auto ec = write_encoded(adj)) return ec;
-        return {};
+    if (ext && (ext_type != channels::extended_data_stderr || !c->ext_captured)) {
+        return credit_window(*c, n, true);
     }
     const auto off = static_cast<std::size_t>(data.data() - bytes.data());
     auto slice = pkt.subslice(off, data.size());

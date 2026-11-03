@@ -25,7 +25,8 @@ class connection;
 // synchronously call on_released; connection destruction never calls back.
 // For one channel, on_open_result precedes other notifications, on_eof precedes
 // on_closed, and on_released is exactly once and last. on_readable is emitted
-// only when an extended-data receive queue changes from empty to non-empty.
+// when a receive queue changes from empty to non-empty. Extended data that is
+// not captured is discarded and never triggers on_readable.
 
 // Slot handle. seq == 0 is invalid. channel_slots mints a per-connection
 // sequence at allocate time so a recycled channel id cannot match a stale ref.

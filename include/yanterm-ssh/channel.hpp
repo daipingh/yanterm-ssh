@@ -24,6 +24,62 @@
 namespace yanterm::ssh {
 
 class session;
+class channel;
+
+// One extended-data stream (RFC 4254 section 5.2) of a channel. While a handle
+// is held the channel buffers that type for read(); otherwise inbound data of
+// the type is discarded, so acquire before the remote side starts producing it.
+// Keeps the channel state alive but never closes the channel: shutdown() sends
+// nothing, and close() only stops buffering and ends pending reads with EOF.
+class extended_stream {
+public:
+    extended_stream() noexcept = default;
+    extended_stream(const extended_stream&) = delete;
+    extended_stream& operator=(const extended_stream&) = delete;
+    extended_stream(extended_stream&& other) noexcept;
+    extended_stream& operator=(extended_stream&& other) noexcept;
+    ~extended_stream();
+
+    corral::Task<auv::read_result> read(auv::read_allocator alloc_cb, void* alloc_arg);
+    corral::Task<std::error_code> write(const auv::buffer* bufs, std::size_t nbufs);
+    corral::Task<std::error_code> shutdown();
+    corral::Task<void> close();
+
+    template <typename Allocator>
+        requires auv::detail::read_allocator_callable<std::remove_reference_t<Allocator>>
+    auto read(Allocator&& alloc_cb) {
+        return read(
+            [](void* p) {
+                auto& cb = *static_cast<std::remove_reference_t<Allocator>*>(p);
+                return static_cast<auv::buffer>(cb());
+            },
+            &alloc_cb);
+    }
+
+    auto read(auv::buffer dest) {
+        return corral::just(dest) | corral::then([&](auto& buf) {
+                   return read([](void* p) { return *static_cast<auv::buffer*>(p); }, &buf);
+               });
+    }
+
+    [[nodiscard]] std::uint32_t type() const noexcept { return type_; }
+    explicit operator bool() const noexcept;
+
+private:
+    friend class channel;
+
+    extended_stream(std::shared_ptr<session_impl> impl, session_impl::channel_state* st,
+                    std::uint32_t type) noexcept;
+
+    void release_capture() noexcept;
+    void reset() noexcept;
+
+    std::shared_ptr<session_impl> impl_;
+    session_impl::channel_state* st_ = nullptr;
+    core::channel_ref ref_{};
+    std::uint32_t type_ = 0;
+    bool released_ = false;
+};
 
 class channel {
 public:
@@ -38,8 +94,11 @@ public:
     corral::Task<std::error_code> write(const auv::buffer* bufs, std::size_t nbufs);
     corral::Task<std::error_code> shutdown();
     corral::Task<void> close();
-    corral::Task<auv::read_result> read_stderr(auv::read_allocator alloc_cb, void* alloc_arg);
-    corral::Task<std::error_code> write_stderr(const auv::buffer* bufs, std::size_t nbufs);
+
+    // Empty when the channel is closed, the type is unsupported, or a handle
+    // for the type is already held.
+    [[nodiscard]] extended_stream extended(std::uint32_t type);
+    [[nodiscard]] extended_stream stderr_stream();
 
     template <typename Allocator>
         requires auv::detail::read_allocator_callable<std::remove_reference_t<Allocator>>
@@ -52,26 +111,9 @@ public:
             &alloc_cb);
     }
 
-    template <typename Allocator>
-        requires auv::detail::read_allocator_callable<std::remove_reference_t<Allocator>>
-    auto read_stderr(Allocator&& alloc_cb) {
-        return read_stderr(
-            [](void* p) {
-                auto& cb = *static_cast<std::remove_reference_t<Allocator>*>(p);
-                return static_cast<auv::buffer>(cb());
-            },
-            &alloc_cb);
-    }
-
     auto read(auv::buffer dest) {
         return corral::just(dest) | corral::then([&](auto& buf) {
                    return read([](void* p) { return *static_cast<auv::buffer*>(p); }, &buf);
-               });
-    }
-
-    auto read_stderr(auv::buffer dest) {
-        return corral::just(dest) | corral::then([&](auto& buf) {
-                   return read_stderr([](void* p) { return *static_cast<auv::buffer*>(p); }, &buf);
                });
     }
 
@@ -94,14 +136,20 @@ public:
 private:
     friend class session;
     friend class inbound_channel_open;
+    friend class extended_stream;
 
     channel(std::shared_ptr<session_impl> impl, session_impl::channel_state* st) noexcept;
 
     void close_now() noexcept;
-    corral::Task<auv::read_result> read_ext(std::uint32_t ext, auv::read_allocator alloc_cb,
-                                            void* alloc_arg);
-    corral::Task<std::error_code> write_ext(std::uint32_t ext, const auv::buffer* bufs,
-                                            std::size_t nbufs);
+    static corral::Task<auv::read_result> read_ext(session_impl& self,
+                                                   session_impl::channel_state& st,
+                                                   core::channel_ref ref, std::uint32_t ext,
+                                                   auv::read_allocator alloc_cb, void* alloc_arg,
+                                                   const bool* stop = nullptr);
+    static corral::Task<std::error_code> write_ext(session_impl& self,
+                                                   session_impl::channel_state& st,
+                                                   core::channel_ref ref, std::uint32_t ext,
+                                                   const auv::buffer* bufs, std::size_t nbufs);
     template <class Enqueue>
     corral::Task<std::error_code> enqueue_channel_request(bool want_reply, Enqueue enqueue);
     corral::Task<std::error_code> wait_channel_response();
@@ -264,51 +312,45 @@ inline void channel::close_now() noexcept {
 }
 
 inline corral::Task<auv::read_result> channel::read(auv::read_allocator alloc_cb, void* alloc_arg) {
-    co_return co_await read_ext(0, alloc_cb, alloc_arg);
-}
-
-inline corral::Task<auv::read_result> channel::read_stderr(auv::read_allocator alloc_cb,
-                                                           void* alloc_arg) {
-    co_return co_await read_ext(channels::extended_data_stderr, alloc_cb, alloc_arg);
-}
-
-inline corral::Task<auv::read_result> channel::read_ext(std::uint32_t ext,
-                                                        auv::read_allocator alloc_cb,
-                                                        void* alloc_arg) {
     if (!impl_ || st_ == nullptr) co_return {code::invalid_state, 0};
-    auto& self = *impl_;
-    auto& lot = (ext == 0) ? st_->rd_lot : st_->ext_lot;
+    co_return co_await read_ext(*impl_, *st_, ref_, 0, alloc_cb, alloc_arg);
+}
+
+inline corral::Task<auv::read_result> channel::read_ext(session_impl& self,
+                                                        session_impl::channel_state& st,
+                                                        core::channel_ref ref, std::uint32_t ext,
+                                                        auv::read_allocator alloc_cb,
+                                                        void* alloc_arg, const bool* stop) {
+    auto& lot = (ext == 0) ? st.rd_lot : st.ext_lot;
     for (;;) {
+        if (stop != nullptr && *stop) co_return {auv::make_error_code(auv::errc::eof), 0};
         auv::buffer buf = alloc_cb(alloc_arg);
         if (buf.size() == 0) {
             co_return {std::make_error_code(std::errc::no_buffer_space), 0};
         }
         auto dst = std::span<std::byte>(reinterpret_cast<std::byte*>(buf.data()), buf.size());
-        const std::size_t n = self.core_.channel_read(ref_, ext, dst);
+        const std::size_t n = self.core_.channel_read(ref, ext, dst);
         if (n > 0) {
             // channel_read may enqueue WINDOW_ADJUST, so unpark write_lot.
             self.write_lot_.unparkAll();
             co_return {std::error_code{}, n};
         }
-        if (st_->recv_eof || st_->recv_close) co_return {auv::make_error_code(auv::errc::eof), 0};
+        if (st.recv_eof || st.recv_close) co_return {auv::make_error_code(auv::errc::eof), 0};
         if (self.closed()) co_return {self.latch_, 0};
         co_await lot.park();
     }
 }
 
 inline corral::Task<std::error_code> channel::write(const auv::buffer* bufs, std::size_t nbufs) {
-    co_return co_await write_ext(0, bufs, nbufs);
-}
-
-inline corral::Task<std::error_code> channel::write_stderr(const auv::buffer* bufs,
-                                                           std::size_t nbufs) {
-    co_return co_await write_ext(channels::extended_data_stderr, bufs, nbufs);
-}
-
-inline corral::Task<std::error_code> channel::write_ext(std::uint32_t ext, const auv::buffer* bufs,
-                                                        std::size_t nbufs) {
     if (!impl_ || st_ == nullptr) co_return code::invalid_state;
-    auto& self = *impl_;
+    co_return co_await write_ext(*impl_, *st_, ref_, 0, bufs, nbufs);
+}
+
+inline corral::Task<std::error_code> channel::write_ext(session_impl& self,
+                                                        session_impl::channel_state& st,
+                                                        core::channel_ref ref, std::uint32_t ext,
+                                                        const auv::buffer* bufs,
+                                                        std::size_t nbufs) {
     if (self.closed()) co_return self.latch_;
 
     std::vector<std::span<const std::byte>> frags;
@@ -339,7 +381,7 @@ inline corral::Task<std::error_code> channel::write_ext(std::uint32_t ext, const
         return out;
     };
 
-    auto& wr = st_->wr_lot;
+    auto& wr = st.wr_lot;
     for (;;) {
         if (self.closed()) co_return self.latch_;
         while (self.core_.pending_output_bytes() >= self.max_output_bytes_) {
@@ -351,9 +393,9 @@ inline corral::Task<std::error_code> channel::write_ext(std::uint32_t ext, const
         std::size_t accepted = 0;
         std::error_code wec = [&] {
             if (ext == 0) {
-                return self.core_.channel_write(ref_, rem, accepted);
+                return self.core_.channel_write(ref, rem, accepted);
             }
-            return self.core_.channel_write_extended(ref_, ext, rem, accepted);
+            return self.core_.channel_write_extended(ref, ext, rem, accepted);
         }();
         if (wec) {
             self.note_core_failure();
@@ -395,6 +437,91 @@ inline corral::Task<void> channel::close() {
     while (!st_->recv_close && !self.closed()) {
         co_await st_->rd_lot.park();
     }
+}
+
+inline extended_stream channel::extended(std::uint32_t type) {
+    if (!impl_ || st_ == nullptr || app_closed_) return {};
+    if (impl_->closed() || st_->recv_close) return {};
+    if (impl_->core_.capture_extended_data(ref_, type)) return {};
+    ++st_->refs;
+    return extended_stream{impl_, st_, type};
+}
+
+inline extended_stream channel::stderr_stream() {
+    return extended(channels::extended_data_stderr);
+}
+
+inline extended_stream::extended_stream(std::shared_ptr<session_impl> impl,
+                                        session_impl::channel_state* st,
+                                        std::uint32_t type) noexcept
+    : impl_(std::move(impl)), st_(st), ref_(st->ref), type_(type) {}
+
+inline extended_stream::extended_stream(extended_stream&& other) noexcept
+    : impl_(std::move(other.impl_))
+    , st_(other.st_)
+    , ref_(other.ref_)
+    , type_(other.type_)
+    , released_(other.released_) {
+    other.st_ = nullptr;
+}
+
+inline extended_stream& extended_stream::operator=(extended_stream&& other) noexcept {
+    if (this != &other) {
+        reset();
+        impl_ = std::move(other.impl_);
+        st_ = other.st_;
+        ref_ = other.ref_;
+        type_ = other.type_;
+        released_ = other.released_;
+        other.st_ = nullptr;
+    }
+    return *this;
+}
+
+inline extended_stream::~extended_stream() { reset(); }
+
+inline extended_stream::operator bool() const noexcept {
+    return static_cast<bool>(impl_) && st_ != nullptr && !released_;
+}
+
+inline void extended_stream::release_capture() noexcept {
+    if (!impl_ || st_ == nullptr || released_) return;
+    released_ = true;
+    st_->ext_lot.unparkAll();
+    if (impl_->closed()) return;
+    (void)impl_->core_.release_extended_data(ref_, type_);
+    impl_->note_core_failure();
+    impl_->write_lot_.unparkAll();
+}
+
+inline void extended_stream::reset() noexcept {
+    release_capture();
+    if (!impl_ || st_ == nullptr) return;
+    impl_->release(std::exchange(st_, nullptr));
+    impl_.reset();
+}
+
+inline corral::Task<auv::read_result> extended_stream::read(auv::read_allocator alloc_cb,
+                                                            void* alloc_arg) {
+    if (!*this) co_return {code::invalid_state, 0};
+    co_return co_await channel::read_ext(*impl_, *st_, ref_, type_, alloc_cb, alloc_arg,
+                                         &released_);
+}
+
+inline corral::Task<std::error_code> extended_stream::write(const auv::buffer* bufs,
+                                                            std::size_t nbufs) {
+    if (!*this) co_return code::invalid_state;
+    co_return co_await channel::write_ext(*impl_, *st_, ref_, type_, bufs, nbufs);
+}
+
+inline corral::Task<std::error_code> extended_stream::shutdown() {
+    if (!*this) co_return code::invalid_state;
+    co_return {};
+}
+
+inline corral::Task<void> extended_stream::close() {
+    release_capture();
+    co_return;
 }
 
 inline inbound_channel_open::inbound_channel_open(session_impl& impl,
