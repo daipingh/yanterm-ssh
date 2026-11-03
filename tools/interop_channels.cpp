@@ -316,6 +316,14 @@ bool write_channel(core::connection& conn, core::channel_ref id, std::string& pe
     return true;
 }
 
+bool capture_stderr(core::connection& conn, core::channel_ref id) {
+    if (auto ec = conn.capture_extended_data(id, channels::extended_data_stderr)) {
+        std::cerr << "capture_extended_data: " << ec.message() << '\n';
+        return false;
+    }
+    return true;
+}
+
 void drain_channel(core::connection& conn, core::channel_ref id, std::string& acc) {
     std::byte buf[8 * 1024];
     for (;;) {
@@ -582,6 +590,10 @@ int run_client(const options& opt, crypto::provider p, keys::private_key& ident)
             } else if (ev.type == testing::legacy_event_type::channel_opened) {
                 if (phase != client_phase::wait_opened) return;
                 ch_id = ev.ref;
+                if (!capture_stderr(conn, ch_id)) {
+                    stop = true;
+                    return;
+                }
                 if (opt.scenario == "pty-shell") {
                     channels::pty_spec pty;
                     pty.term = "xterm-256color";
@@ -751,6 +763,10 @@ int run_server(const options& opt, crypto::provider p, keys::private_key& host,
                     bridge.ch = local;
                     bridge.attached = true;
                     conn.resolve(ev.inbound_open, channels::channel_open_verdict::accepted());
+                    if (!capture_stderr(conn, local)) {
+                        stop = true;
+                        return;
+                    }
                 } else {
                     conn.resolve(ev.inbound_open,
                                  channels::channel_open_verdict::rejected(

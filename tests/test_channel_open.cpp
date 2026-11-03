@@ -546,8 +546,10 @@ TEST_CASE("app channel_close after peer CLOSE does not send a second CLOSE", "[c
 }
 
 TEST_CASE("inbound extended data with unknown type is discarded", "[channel][open]") {
+    // Half of this window is 1, so the discarded byte is credited immediately
+    // and the following payload is exactly that window.
     auto cfg = scripted_peer::sut_config();
-    cfg.initial_window = 4;
+    cfg.initial_window = 2;
     cfg.max_channels = 4;
     peer_session s{core::role::client, cfg};
     s.authenticate();
@@ -570,7 +572,7 @@ TEST_CASE("inbound extended data with unknown type is discarded", "[channel][ope
 
     wire::detail::channel_data data;
     data.recipient = ch.sut_id;
-    data.data = std::as_bytes(std::span{"abcd", 4});
+    data.data = std::as_bytes(std::span{"ab", 2});
     s.peer.send_msg(data);
     REQUIRE_FALSE(s.peer.exchange(s.sut));
     REQUIRE(only_event<recording_handler::channel_readable>(s.sut.handler));

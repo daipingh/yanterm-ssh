@@ -106,12 +106,13 @@ corral::Task<void> pump_stdout_to_channel(piped_child& child, ssh::channel& ch,
 corral::Task<void> pump_stderr_to_channel(piped_child& child, ssh::channel& ch,
                                           std::uint64_t& to_client) {
     std::array<char, k_pump_buf> buf{};
+    auto errch = ch.stderr_stream();
     for (;;) {
         auto [ec, n] = co_await child.stderr_stream().read(
             [&] { return auv::buffer(buf.data(), buf.size()); });
         if (n == 0 || ec) co_return;
         auv::buffer wb{buf.data(), n};
-        auto wec = co_await ch.write_stderr(&wb, std::size_t{1});
+        auto wec = co_await errch.write(&wb, std::size_t{1});
         if (wec) {
             child.terminate();
             co_return;

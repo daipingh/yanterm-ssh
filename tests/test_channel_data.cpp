@@ -299,6 +299,7 @@ TEST_CASE("stderr write_extended is readable on ext 1 not stdout", "[channel][da
     auto server = make_server(p, cfg);
     bring_up_authed(client, server, hm);
     const auto ids = open_session(client, server);
+    REQUIRE_FALSE(client.conn.capture_extended_data(ids.client_ch, channels::extended_data_stderr));
 
     const auto err = bytes_of("err");
     std::span<const std::byte> frags[] = {err};
@@ -332,6 +333,7 @@ TEST_CASE("channel_read of unknown ext type does not consume stderr", "[channel]
     auto server = make_server(p, cfg);
     bring_up_authed(client, server, hm);
     const auto ids = open_session(client, server);
+    REQUIRE_FALSE(client.conn.capture_extended_data(ids.client_ch, channels::extended_data_stderr));
 
     const auto err = bytes_of("err");
     std::span<const std::byte> frags[] = {err};
@@ -836,7 +838,10 @@ TEST_CASE("inbound data larger than local_max_packet is rejected", "[channel][da
 }
 
 TEST_CASE("unknown extended data type is discarded with window credit", "[channel][data]") {
-    peer_session s{core::role::client, admission_cfg()};
+    // Half of this window is 4, so the discarded payload is credited in full.
+    auto cfg = admission_cfg();
+    cfg.initial_window = 8;
+    peer_session s{core::role::client, cfg};
     s.authenticate();
     const auto ch = open_confirmed(s, 100, 32);
     wire::detail::channel_extended_data msg;
@@ -937,4 +942,135 @@ TEST_CASE("rekey completion does not wake a closed channel", "[channel][data]") 
 
     peer_window_adjust(s, ch, 5);
     REQUIRE(writable_events(s.sut.handler, ch.local) == 0);
+}
+
+namespace {
+
+core::config ext_cfg() {
+    auto cfg = scripted_peer::sut_config();
+    cfg.initial_window = 32;
+    cfg.max_channel_packet = 64;
+    cfg.max_channels = 4;
+    return cfg;
+}
+
+int readable_events(const recording_handler& handler) {
+    int n = 0;
+    for (const auto& ev : handler.events) {
+        if (std::get_if<recording_handler::channel_readable>(&ev)) ++n;
+    }
+    return n;
+}
+
+}  // namespace
+
+TEST_CASE("uncaptured stderr beyond the receive window does not block stdout", "[channel][data]") {
+    peer_session s{core::role::client, ext_cfg()};
+    s.authenticate();
+    const auto ch = open_confirmed(s, 1000, 64);
+
+    const std::vector<std::byte> block(32, std::byte{'e'});
+    wire::detail::channel_extended_data ext;
+    ext.recipient = ch.sut_id;
+    ext.data_type = channels::extended_data_stderr;
+    ext.data = block;
+    s.peer.send_msg(ext);
+    REQUIRE_FALSE(s.peer.exchange(s.sut));
+    s.peer.send_msg(ext);
+    REQUIRE_FALSE(s.peer.exchange(s.sut));
+    REQUIRE(readable_events(s.sut.handler) == 0);
+
+    wire::detail::channel_data data;
+    data.recipient = ch.sut_id;
+    data.data = std::as_bytes(std::span{"OK", 2});
+    s.peer.send_msg(data);
+    REQUIRE_FALSE(s.peer.exchange(s.sut));
+
+    std::array<std::byte, 8> buf{};
+    REQUIRE(s.sut.conn.channel_read(ch.local, channels::extended_data_stderr, buf) == 0);
+    REQUIRE(s.sut.conn.channel_read(ch.local, 0, buf) == 2);
+    REQUIRE(std::memcmp(buf.data(), "OK", 2) == 0);
+    REQUIRE_FALSE(s.sut.conn.failure());
+}
+
+TEST_CASE("captured stderr is readable and not mixed into stdout", "[channel][data]") {
+    peer_session s{core::role::client, ext_cfg()};
+    s.authenticate();
+    const auto ch = open_confirmed(s, 1000, 64);
+    REQUIRE_FALSE(s.sut.conn.capture_extended_data(ch.local, channels::extended_data_stderr));
+
+    wire::detail::channel_extended_data ext;
+    ext.recipient = ch.sut_id;
+    ext.data_type = channels::extended_data_stderr;
+    ext.data = std::as_bytes(std::span{"err", 3});
+    s.peer.send_msg(ext);
+    wire::detail::channel_data data;
+    data.recipient = ch.sut_id;
+    data.data = std::as_bytes(std::span{"out", 3});
+    s.peer.send_msg(data);
+    REQUIRE_FALSE(s.peer.exchange(s.sut));
+
+    REQUIRE(read_text(s.sut.conn, ch.local, channels::extended_data_stderr, 8) == "err");
+    REQUIRE(read_text(s.sut.conn, ch.local, 0, 8) == "out");
+    REQUIRE_FALSE(s.sut.conn.failure());
+}
+
+TEST_CASE("release_extended_data drops buffered stderr and restores the window", "[channel][data]") {
+    peer_session s{core::role::client, ext_cfg()};
+    s.authenticate();
+    const auto ch = open_confirmed(s, 1000, 64);
+    REQUIRE_FALSE(s.sut.conn.capture_extended_data(ch.local, channels::extended_data_stderr));
+
+    const std::vector<std::byte> block(32, std::byte{'e'});
+    wire::detail::channel_extended_data ext;
+    ext.recipient = ch.sut_id;
+    ext.data_type = channels::extended_data_stderr;
+    ext.data = block;
+    s.peer.send_msg(ext);
+    REQUIRE_FALSE(s.peer.exchange(s.sut));
+    REQUIRE_FALSE(s.peer.take(wire::msg::channel_window_adjust));
+
+    REQUIRE_FALSE(s.sut.conn.release_extended_data(ch.local, channels::extended_data_stderr));
+    REQUIRE_FALSE(s.peer.exchange(s.sut));
+    const auto adj_bytes = s.peer.take(wire::msg::channel_window_adjust);
+    REQUIRE(adj_bytes);
+    wire::reader r{*adj_bytes};
+    wire::detail::channel_window_adjust adj;
+    REQUIRE(adj.decode(r));
+    REQUIRE(adj.bytes == 32);
+
+    const std::vector<std::byte> stdout_bytes(32, std::byte{'o'});
+    wire::detail::channel_data data;
+    data.recipient = ch.sut_id;
+    data.data = stdout_bytes;
+    s.peer.send_msg(data);
+    REQUIRE_FALSE(s.peer.exchange(s.sut));
+
+    std::vector<std::byte> buf(32);
+    REQUIRE(s.sut.conn.channel_read(ch.local, channels::extended_data_stderr, buf) == 0);
+    REQUIRE(s.sut.conn.channel_read(ch.local, 0, buf) == 32);
+    REQUIRE(std::all_of(buf.begin(), buf.end(), [](std::byte b) { return b == std::byte{'o'}; }));
+    REQUIRE_FALSE(s.sut.conn.failure());
+}
+
+TEST_CASE("capture_extended_data rejects non-stderr types", "[channel][data]") {
+    const std::uint32_t types[] = {0u, 2u, 99u};
+    peer_session s{core::role::client, admission_cfg()};
+    s.authenticate();
+    const auto ch = open_confirmed(s, 100, 32);
+    for (const auto type : types) {
+        INFO(type);
+        REQUIRE(s.sut.conn.capture_extended_data(ch.local, type) == code::invalid_argument);
+    }
+    REQUIRE_FALSE(s.sut.conn.failure());
+}
+
+TEST_CASE("capture_extended_data rejects a second capture", "[channel][data]") {
+    peer_session s{core::role::client, admission_cfg()};
+    s.authenticate();
+    const auto ch = open_confirmed(s, 100, 32);
+    REQUIRE_FALSE(s.sut.conn.capture_extended_data(ch.local, channels::extended_data_stderr));
+    REQUIRE(s.sut.conn.capture_extended_data(ch.local, channels::extended_data_stderr)
+            == code::invalid_state);
+    REQUIRE_FALSE(s.sut.conn.failure());
 }

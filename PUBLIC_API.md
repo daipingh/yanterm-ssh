@@ -157,6 +157,7 @@ server_session::authenticate
 namespace yanterm::ssh
 
 class channel                   // 已打开通道；满足 auv stream_like
+class extended_stream           // channel 的带外数据流，满足 auv stream_like
 struct channel_open_result      // 出站开通道结果
 class inbound_channel_open      // 入站 CHANNEL_OPEN；析构未结算则拒绝
 class inbound_channel_request   // 入站 CHANNEL_REQUEST
@@ -166,8 +167,16 @@ channel::read
 channel::write
 channel::shutdown
 channel::close
-channel::read_stderr
-channel::write_stderr
+channel::extended
+channel::stderr_stream          // extended(extended_data_stderr)
+
+extended_stream::read
+extended_stream::write
+extended_stream::shutdown
+extended_stream::close
+extended_stream::type
+extended_stream::operator bool
+
 channel::request_pty
 channel::request_shell
 channel::request_exec
@@ -317,6 +326,8 @@ connection::channel_close
 connection::channel_write
 connection::channel_write_extended
 connection::channel_read
+connection::capture_extended_data
+connection::release_extended_data
 connection::channel_request
 connection::request_pty
 connection::request_shell

@@ -214,6 +214,8 @@ corral::Task<void> run_uname(auv::stream tcp, ssh::crypto::provider provider,
 }
 ```
 
+`channel::read` delivers stdout only. stderr (RFC 4254 §5.2 extended data) is discarded by default and its window is credited back; call `stderr_stream()` before `request_exec`, `request_shell`, or `request_subsystem`, or early output is already gone.
+
 `run_with` starts the session's read/write loop in the background and disconnects once the user coroutine finishes. For finer lifetime control, you can `start(&client_session::run, &cs)` in your own nursery.
 
 ### Driving the sans-I/O core directly

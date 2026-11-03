@@ -20,6 +20,7 @@ using namespace yanterm::ssh;
 using namespace yanterm::ssh::testing;
 
 static_assert(auv::detail::stream_like<channel>);
+static_assert(auv::detail::stream_like<extended_stream>);
 
 namespace {
 
@@ -627,6 +628,245 @@ TEST_CASE("same-batch channel request then CLOSE does not latch", "[facade][chan
             REQUIRE_FALSE(fp.server.failure());
             REQUIRE_FALSE(fp.client.failure());
             REQUIRE(served == 1);
+
+            co_await fp.client.disconnect(disconnect_reason::by_application, "done");
+            co_return corral::cancel;
+        };
+    }());
+}
+
+TEST_CASE("stderr_stream reads peer stderr and a second handle is empty until release",
+          "[facade][channel]") {
+    auto fp = make_facade_pair();
+    corral::run(fp.loop, [&]() -> corral::Task<void> {
+        CORRAL_WITH_NURSERY(n) {
+            co_await n.start(&client_session::run, &fp.client);
+            co_await n.start(&server_session::run, &fp.server);
+            co_await handshake_and_password(fp.client, fp.server);
+
+            corral::Event serving;
+            corral::Event client_ready;
+            corral::Event first_written;
+            corral::Event reacquired;
+            corral::Event second_written;
+            n.start([&]() -> corral::Task<void> {
+                serving.trigger();
+                co_await fp.server.serve(
+                    [&](inbound_channel_open open) -> corral::Task<void> {
+                        channel ch = open.accept();
+                        auto err = ch.stderr_stream();
+                        REQUIRE(err);
+                        co_await client_ready;
+                        const char msg[] = "err";
+                        auv::buffer wb{msg, 3};
+                        auto wec1 = co_await err.write(&wb, std::size_t{1});
+                        REQUIRE_FALSE(wec1);
+                        first_written.trigger();
+                        co_await reacquired;
+                        const char msg2[] = "E2";
+                        auv::buffer wb2{msg2, 2};
+                        auto wec2 = co_await err.write(&wb2, std::size_t{1});
+                        REQUIRE_FALSE(wec2);
+                        second_written.trigger();
+                        co_await corral::SuspendForever{};
+                    },
+                    dummy_global);
+            });
+            co_await serving;
+
+            auto opened = co_await fp.client.open_session_channel();
+            REQUIRE_FALSE(opened.ec);
+            REQUIRE(opened.ch);
+            {
+                auto err = opened.ch.stderr_stream();
+                REQUIRE(err);
+                REQUIRE_FALSE(opened.ch.stderr_stream());
+                client_ready.trigger();
+                co_await first_written;
+                char buf[8];
+                auto [rec, nread] = co_await err.read([&] { return auv::buffer(buf, sizeof(buf)); });
+                REQUIRE_FALSE(rec);
+                REQUIRE(nread == 3);
+                REQUIRE(std::string_view(buf, nread) == "err");
+            }
+
+            auto err2 = opened.ch.stderr_stream();
+            REQUIRE(err2);
+            reacquired.trigger();
+            co_await second_written;
+            char buf[8];
+            auto [rec, nread] = co_await err2.read([&] { return auv::buffer(buf, sizeof(buf)); });
+            REQUIRE_FALSE(rec);
+            REQUIRE(nread == 2);
+            REQUIRE(std::string_view(buf, nread) == "E2");
+
+            co_await fp.client.disconnect(disconnect_reason::by_application, "done");
+            co_return corral::cancel;
+        };
+    }());
+}
+
+TEST_CASE("extended_stream outliving its channel reads EOF", "[facade][channel]") {
+    auto fp = make_facade_pair();
+    corral::run(fp.loop, [&]() -> corral::Task<void> {
+        CORRAL_WITH_NURSERY(n) {
+            co_await n.start(&client_session::run, &fp.client);
+            co_await n.start(&server_session::run, &fp.server);
+            co_await handshake_and_password(fp.client, fp.server);
+
+            corral::Event serving;
+            n.start([&]() -> corral::Task<void> {
+                serving.trigger();
+                co_await fp.server.serve(
+                    [&](inbound_channel_open open) -> corral::Task<void> {
+                        channel ch = open.accept();
+                        REQUIRE(ch);
+                        co_await corral::SuspendForever{};
+                    },
+                    dummy_global);
+            });
+            co_await serving;
+
+            extended_stream err;
+            {
+                auto opened = co_await fp.client.open_session_channel();
+                REQUIRE_FALSE(opened.ec);
+                REQUIRE(opened.ch);
+                err = opened.ch.stderr_stream();
+                REQUIRE(err);
+            }
+            char buf[8];
+            auto [rec, nread] = co_await err.read([&] { return auv::buffer(buf, sizeof(buf)); });
+            REQUIRE(rec);
+            REQUIRE(nread == 0);
+
+            co_await fp.client.disconnect(disconnect_reason::by_application, "done");
+            co_return corral::cancel;
+        };
+    }());
+}
+
+TEST_CASE("extended_stream shutdown does not end the channel", "[facade][channel]") {
+    auto fp = make_facade_pair();
+    corral::run(fp.loop, [&]() -> corral::Task<void> {
+        CORRAL_WITH_NURSERY(n) {
+            co_await n.start(&client_session::run, &fp.client);
+            co_await n.start(&server_session::run, &fp.server);
+            co_await handshake_and_password(fp.client, fp.server);
+
+            corral::Event serving;
+            corral::Event saw_hi;
+            corral::Event saw_yo;
+            n.start([&]() -> corral::Task<void> {
+                serving.trigger();
+                co_await fp.server.serve(
+                    [&](inbound_channel_open open) -> corral::Task<void> {
+                        channel ch = open.accept();
+                        char buf[8];
+                        auto [r1, n1] = co_await ch.read([&] { return auv::buffer(buf, sizeof(buf)); });
+                        REQUIRE_FALSE(r1);
+                        REQUIRE(n1 == 2);
+                        REQUIRE(std::string_view(buf, n1) == "hi");
+                        saw_hi.trigger();
+                        auto [r2, n2] = co_await ch.read([&] { return auv::buffer(buf, sizeof(buf)); });
+                        REQUIRE_FALSE(r2);
+                        REQUIRE(n2 == 2);
+                        REQUIRE(std::string_view(buf, n2) == "yo");
+                        saw_yo.trigger();
+                        co_await corral::SuspendForever{};
+                    },
+                    dummy_global);
+            });
+            co_await serving;
+
+            auto opened = co_await fp.client.open_session_channel();
+            REQUIRE_FALSE(opened.ec);
+            REQUIRE(opened.ch);
+            auto err = opened.ch.stderr_stream();
+            REQUIRE(err);
+            auto sec = co_await err.shutdown();
+            REQUIRE_FALSE(sec);
+            const char hi[] = "hi";
+            auv::buffer b1{hi, 2};
+            auto wec1 = co_await opened.ch.write(&b1, std::size_t{1});
+            REQUIRE_FALSE(wec1);
+            co_await saw_hi;
+            const char yo[] = "yo";
+            auv::buffer b2{yo, 2};
+            auto wec2 = co_await opened.ch.write(&b2, std::size_t{1});
+            REQUIRE_FALSE(wec2);
+            co_await saw_yo;
+
+            co_await fp.client.disconnect(disconnect_reason::by_application, "done");
+            co_return corral::cancel;
+        };
+    }());
+}
+
+TEST_CASE("close of a parked stderr_stream read returns EOF and stdout still flows",
+          "[facade][channel]") {
+    auto fp = make_facade_pair();
+    corral::run(fp.loop, [&]() -> corral::Task<void> {
+        CORRAL_WITH_NURSERY(n) {
+            co_await n.start(&client_session::run, &fp.client);
+            co_await n.start(&server_session::run, &fp.server);
+            co_await handshake_and_password(fp.client, fp.server);
+
+            corral::Event serving;
+            n.start([&]() -> corral::Task<void> {
+                serving.trigger();
+                co_await fp.server.serve(
+                    [&](inbound_channel_open open) -> corral::Task<void> {
+                        channel ch = open.accept();
+                        const char msg[] = "ok";
+                        auv::buffer wb{msg, 2};
+                        auto wec = co_await ch.write(&wb, std::size_t{1});
+                        REQUIRE_FALSE(wec);
+                        co_await corral::SuspendForever{};
+                    },
+                    dummy_global);
+            });
+            co_await serving;
+
+            auto opened = co_await fp.client.open_session_channel();
+            REQUIRE_FALSE(opened.ec);
+            REQUIRE(opened.ch);
+            auto err = opened.ch.stderr_stream();
+            REQUIRE(err);
+
+            auv::read_result parked;
+            corral::Event entered;
+            corral::Event read_done;
+            n.start([&]() -> corral::Task<void> {
+                char buf[8];
+                bool armed = false;
+                parked = co_await err.read([&] {
+                    if (!armed) {
+                        armed = true;
+                        entered.trigger();
+                    }
+                    return auv::buffer(buf, sizeof(buf));
+                });
+                read_done.trigger();
+            });
+            // entered fires from the allocator, before the read parks. The
+            // parking itself happens before this task is resumed.
+            co_await entered;
+            co_await err.close();
+            co_await read_done;
+            auto [rec, nread] = parked;
+            REQUIRE(rec == auv::errc::eof);
+            REQUIRE(nread == 0);
+            REQUIRE_FALSE(err);
+
+            char buf[8];
+            auto [r2, n2] = co_await opened.ch.read([&] { return auv::buffer(buf, sizeof(buf)); });
+            REQUIRE_FALSE(r2);
+            REQUIRE(n2 == 2);
+            REQUIRE(std::string_view(buf, n2) == "ok");
+
+            auto again = opened.ch.stderr_stream();
+            REQUIRE(again);
 
             co_await fp.client.disconnect(disconnect_reason::by_application, "done");
             co_return corral::cancel;
