@@ -339,18 +339,8 @@ std::string join_path(std::string_view dir, std::string_view name) {
 
 corral::Task<int> exercise(client_session& sess, std::string user, const keys::private_key& key,
                            std::string workdir) {
-    if (auto ec = co_await sess.handshake([](const host_key_view&) -> corral::Task<bool> {
-            co_return true;
-        })) {
-        std::cerr << "FAIL handshake " << ec.message() << std::endl;
-        co_return 1;
-    }
-    auto [aec, auth] = co_await sess.auth_publickey(user, key);
-    if (aec || !auth.success) {
-        std::cerr << "FAIL auth " << aec.message() << std::endl;
-        co_return 1;
-    }
-
+    (void)user;
+    (void)key;
     auto opened = co_await open_sftp(sess);
     if (std::get<0>(opened) || !std::get<1>(opened)) {
         std::cerr << "FAIL handshake " << std::get<0>(opened).message() << std::endl;
@@ -652,10 +642,37 @@ corral::Task<int> exercise(client_session& sess, std::string user, const keys::p
 
 corral::Task<int> session_main(client_session& sess, std::string user, const keys::private_key& key,
                                std::string workdir) {
+    // PROTO: self-driven handshake and auth, no run().
+    if (auto ec = co_await sess.handshake([](const host_key_view&) -> corral::Task<bool> {
+            co_return true;
+        })) {
+        std::cerr << "FAIL handshake " << ec.message() << std::endl;
+        co_return 1;
+    }
+    auto [aec, auth] = co_await sess.auth_publickey(user, key);
+    if (aec || !auth.success) {
+        std::cerr << "FAIL auth " << aec.message() << std::endl;
+        co_return 1;
+    }
+    std::cerr << "PROTO self-driven handshake+auth ok" << std::endl;
     int rc = 1;
-    co_await run_with(sess, [&]() -> corral::Task<void> {
+    auto reject_open = [](inbound_channel_open open) -> corral::Task<void> {
+        open.reject(channel_open_reason::administratively_prohibited, "client");
+        co_return;
+    };
+    auto reject_global = [](inbound_global_request req) -> corral::Task<void> {
+        std::cerr << "PROTO global request " << req.type() << std::endl;
+        req.reject();
+        co_return;
+    };
+    CORRAL_WITH_NURSERY(n) {
+        co_await n.start([&](corral::TaskStarted<> st) -> corral::Task<void> {
+            co_await sess.serve(reject_open, reject_global, std::move(st));
+        });
         rc = co_await exercise(sess, std::move(user), key, std::move(workdir));
-    });
+        co_await sess.disconnect(disconnect_reason::by_application, {});
+        co_return corral::join;
+    };
     co_return rc;
 }
 

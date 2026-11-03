@@ -857,11 +857,12 @@ else
       --identity "$TMP/user" --workdir "$TMP/sftp-work" \
       >"$TMP/sftp.out" 2>"$TMP/sftp.err"; then
     echo "FAIL yanterm sftp client -> sshd" >&2
+    cat "$TMP/sftp.err" >&2 || true
     cat "$TMP/sftp.out" >&2 || true
     cat "$TMP/sftp.err" >&2 || true
     cat "$TMP/sshd.log" >&2 || true
     FAILURES=$((FAILURES + 1))
-  elif ! grep -q '^sftp_ok handshake$' "$TMP/sftp.out" \
+  elif cat "$TMP/sftp.err" >&2 && ! grep -q '^sftp_ok handshake$' "$TMP/sftp.out" \
       || ! grep -q '^sftp_ok upload ' "$TMP/sftp.out" \
       || ! grep -q '^sftp_ok remove$' "$TMP/sftp.out"; then
     echo "FAIL sftp interop missing required sftp_ok lines" >&2

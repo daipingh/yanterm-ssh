@@ -60,6 +60,13 @@ struct session_impl : core::handler {
     auth_result take_auth_response();
     corral::Task<void> read_pump();
     corral::Task<void> write_pump();
+    // PROTO: handshake/auth progress without run(). With a pump running this
+    // parks on `lot`; otherwise the caller flushes, reads once and feeds.
+    corral::Task<void> step(corral::ParkingLot& lot);
+    corral::Task<void> drive_once();
+    corral::Task<std::error_code> flush_output();
+    // PROTO: returns true when bytes were consumed.
+    bool feed_buffered();
     corral::Task<std::tuple<std::error_code, auth_result>> wait_auth_response();
     void release_auth_stage() noexcept;
     void on_peer_identification(core::connection&, std::string_view) override {}
@@ -106,6 +113,49 @@ struct session_impl : core::handler {
     crypto::provider provider_{};
     auv::stream stream_;
     core::connection core_;
+
+    // PROTO: the receive block outlives a single pump so bytes read during
+    // handshake/auth survive into serve().
+    static constexpr std::size_t inbuf_size = memory::default_page_size;
+    struct recv_block {
+        std::pmr::memory_resource* mr = nullptr;
+        std::byte* data = nullptr;
+        std::size_t off = 0;
+        std::size_t end = 0;
+
+        explicit recv_block(std::pmr::memory_resource* resource) noexcept : mr(resource) {}
+        recv_block(const recv_block&) = delete;
+        recv_block& operator=(const recv_block&) = delete;
+        ~recv_block() { release(); }
+
+        void release() noexcept {
+            if (data == nullptr) return;
+            mr->deallocate(data, inbuf_size, alignof(std::max_align_t));
+            data = nullptr;
+            off = 0;
+            end = 0;
+        }
+
+        std::byte* acquire() {
+            if (data == nullptr) {
+                data = static_cast<std::byte*>(mr->allocate(inbuf_size, alignof(std::max_align_t)));
+            }
+            return data;
+        }
+
+        void compact() noexcept {
+            if (off == end) {
+                release();
+            } else if (off > 0) {
+                std::memmove(data, data + off, end - off);
+                end -= off;
+                off = 0;
+            }
+        }
+    };
+    recv_block in_{nullptr};
+    bool driving_ = false;
+    corral::ParkingLot drive_lot_;
 
     bool run_active_ = false;
     bool writer_done_ = false;
@@ -287,6 +337,7 @@ inline session_impl::session_impl(
                 return cfg;
             }(),
             *this, mr_)
+    , in_(mr_)
     , max_pending_requests_(o.max_pending_requests == 0 ? default_max_pending_requests
                                                         : o.max_pending_requests)
     , on_debug_(std::move(o.on_debug)) {
@@ -673,56 +724,34 @@ inline std::optional<session_impl::pending_inbound_global> session_impl::take_pe
     return g;
 }
 
+static_assert(session_impl::inbuf_size > 4 + core::detail::max_packet_length + 64,
+              "the receive block must hold one whole SSH binary packet");
+
+inline bool session_impl::feed_buffered() {
+    if (in_.off == in_.end) return false;
+    std::size_t accepted = 0;
+    auto ec = core_.feed(std::span(in_.data + in_.off, in_.end - in_.off), accepted);
+    in_.off += accepted;
+    write_lot_.unparkAll();
+    if (ec) {
+        note_core_failure();
+        latch(ec);
+        return false;
+    }
+    if (in_.off == in_.end) in_.release();
+    return accepted != 0;
+}
+
 inline corral::Task<void> session_impl::read_pump() {
-    // One page-sized block, held only while unread bytes remain.
-    static constexpr std::size_t inbuf_size = memory::default_page_size;
-    static_assert(inbuf_size > 4 + core::detail::max_packet_length + 64,
-                  "the receive block must hold one whole SSH binary packet");
-    struct recv_block {
-        std::pmr::memory_resource* mr = nullptr;
-        std::byte* data = nullptr;
-        std::size_t off = 0;
-        std::size_t end = 0;
-
-        explicit recv_block(std::pmr::memory_resource* resource) noexcept : mr(resource) {}
-        recv_block(const recv_block&) = delete;
-        recv_block& operator=(const recv_block&) = delete;
-        ~recv_block() { release(); }
-
-        void release() noexcept {
-            if (data == nullptr) return;
-            mr->deallocate(data, inbuf_size, alignof(std::max_align_t));
-            data = nullptr;
-            off = 0;
-            end = 0;
-        }
-
-        std::byte* acquire() {
-            if (data == nullptr) {
-                data = static_cast<std::byte*>(mr->allocate(inbuf_size, alignof(std::max_align_t)));
-            }
-            return data;
-        }
-    };
-
     auto inbound_blocked = [this] {
         return core_.inbound_requests_stalled() || inbound_queue_full();
     };
 
-    recv_block in{mr_};
     while (!closed()) {
-        if (in.off < in.end) {
-            std::size_t accepted = 0;
-            auto ec = core_.feed(std::span(in.data + in.off, in.end - in.off), accepted);
-            in.off += accepted;
-            write_lot_.unparkAll();
-            if (ec) {
-                note_core_failure();
-                latch(ec);
-                co_return;
-            }
-            if (in.off == in.end) in.release();
-            if (accepted != 0 && !inbound_blocked()) continue;
+        if (in_.off < in_.end) {
+            const bool progressed = feed_buffered();
+            if (latch_) co_return;
+            if (progressed && !inbound_blocked()) continue;
         }
         // Bytes already read stay a single feed, so a blocked inbound side
         // waits here even with an empty buffer.
@@ -730,16 +759,10 @@ inline corral::Task<void> session_impl::read_pump() {
             co_await unstall_lot_.park();
             continue;
         }
-        if (in.off == in.end) {
-            in.release();
-        } else if (in.off > 0) {
-            std::memmove(in.data, in.data + in.off, in.end - in.off);
-            in.end -= in.off;
-            in.off = 0;
-        }
-        auto [ec, n] = co_await stream_.read([&in] {
-            std::byte* buf = in.acquire();
-            return auv::buffer(reinterpret_cast<char*>(buf + in.end), inbuf_size - in.end);
+        in_.compact();
+        auto [ec, n] = co_await stream_.read([this] {
+            std::byte* buf = in_.acquire();
+            return auv::buffer(reinterpret_cast<char*>(buf + in_.end), inbuf_size - in_.end);
         });
         if (ec) {
             latch(ec, core::detail::format_transport_io("read", ec));
@@ -750,8 +773,81 @@ inline corral::Task<void> session_impl::read_pump() {
             latch(eof, core::detail::format_transport_io("read", eof));
             co_return;
         }
-        in.end += n;
+        in_.end += n;
     }
+}
+
+inline corral::Task<std::error_code> session_impl::flush_output() {
+    std::array<std::span<const std::byte>, 8> segs{};
+    std::array<auv::buffer, 8> bufs{};
+    // RFC 4253 §11.1: nothing may be sent after receiving DISCONNECT.
+    while (!have_disc_ && core_.pending_output_bytes() > 0) {
+        const std::size_t n = core_.pending_output(segs);
+        std::size_t bytes = 0;
+        for (std::size_t i = 0; i < n; ++i) {
+            bufs[i] = auv::buffer(reinterpret_cast<const char*>(segs[i].data()), segs[i].size());
+            bytes += segs[i].size();
+        }
+        auto ec = co_await stream_.write(bufs.data(), n);
+        if (ec) {
+            latch(ec, core::detail::format_transport_io("write", ec));
+            co_return ec;
+        }
+        core_.consume_output(bytes);
+        out_space_lot_.unparkAll();
+        flushed_lot_.unparkAll();
+    }
+    co_return std::error_code{};
+}
+
+inline corral::Task<void> session_impl::drive_once() {
+    if (driving_) {
+        co_await drive_lot_.park();
+        co_return;
+    }
+    driving_ = true;
+    struct driving_guard {
+        session_impl* s;
+        ~driving_guard() {
+            s->driving_ = false;
+            s->drive_lot_.unparkAll();
+        }
+    } guard{this};
+
+    if (co_await flush_output()) co_return;
+    if (latch_) co_return;
+    if (core_.inbound_requests_stalled()) {
+        // The caller resolves the pending ticket; nothing to read until then.
+        co_await unstall_lot_.park();
+        co_return;
+    }
+    if (feed_buffered() || latch_) co_return;
+    in_.compact();
+    auto [ec, n] = co_await stream_.read([this] {
+        std::byte* buf = in_.acquire();
+        return auv::buffer(reinterpret_cast<char*>(buf + in_.end), inbuf_size - in_.end);
+    });
+    if (ec) {
+        latch(ec, core::detail::format_transport_io("read", ec));
+        co_return;
+    }
+    if (n == 0) {
+        const auto eof = auv::make_error_code(auv::errc::eof);
+        latch(eof, core::detail::format_transport_io("read", eof));
+        co_return;
+    }
+    in_.end += n;
+    (void)feed_buffered();
+    if (!latch_) (void)co_await flush_output();
+}
+
+inline corral::Task<void> session_impl::step(corral::ParkingLot& lot) {
+    if (latch_) co_return;
+    if (run_active_) {
+        co_await lot.park();
+        co_return;
+    }
+    co_await drive_once();
 }
 
 inline corral::Task<void> session_impl::write_pump() {
@@ -796,14 +892,14 @@ inline auth_result session_impl::take_auth_response() {
 
 inline corral::Task<std::tuple<std::error_code, auth_result>> session_impl::wait_auth_response() {
     for (;;) {
-        if (closed()) co_return {latch_, {}};
+        if (latch_) co_return {latch_, {}};
         if (auth_ && auth_->pending_auth_resp) {
             auto r = take_auth_response();
             auth_->client_auth_outstanding = false;
             if (r.success) release_auth_stage();
             co_return {std::error_code{}, r};
         }
-        co_await auth_lot_.park();
+        co_await step(auth_lot_);
     }
 }
 

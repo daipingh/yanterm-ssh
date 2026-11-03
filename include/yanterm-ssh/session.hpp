@@ -39,7 +39,8 @@ public:
     corral::Task<void> disconnect(disconnect_reason reason, std::string_view description);
 
     template <class OnOpen, class OnGlobal>
-    corral::Task<void> serve(OnOpen on_open, OnGlobal on_global);
+    corral::Task<void> serve(OnOpen on_open, OnGlobal on_global,
+                             corral::TaskStarted<> started = {});
 
     corral::Task<channel_open_result> open_session_channel();
     corral::Task<channel_open_result> open_direct_tcpip(std::string_view host, std::uint32_t port,
@@ -82,6 +83,7 @@ protected:
     ~session();
 
     [[nodiscard]] std::error_code ready_or_closed() const;
+    [[nodiscard]] std::error_code handshake_ready() const;
 
     channel make_channel(session_impl::channel_state* st);
     corral::Task<channel_open_result> open_typed_channel(channels::channel_open_spec spec);
@@ -225,6 +227,15 @@ inline corral::Task<void> session::disconnect(disconnect_reason reason,
                                               std::string_view description) {
     if (!impl_) co_return;
     auto& self = *impl_;
+    if (!self.run_active_) {
+        // PROTO: no pump; send DISCONNECT ourselves (e.g. after failed auth).
+        if (self.latch_) co_return;
+        while (self.driving_) co_await self.drive_lot_.park();
+        (void)self.core_.disconnect(reason, description);
+        self.latch(code::session_closed);
+        (void)co_await self.flush_output();
+        co_return;
+    }
     if (!self.closed()) {
         (void)self.core_.disconnect(reason, description);
         self.latch(code::session_closed);
@@ -267,6 +278,11 @@ inline server_session::server_session(auv::stream stream, crypto::provider provi
     }
 }
 
+inline std::error_code session::handshake_ready() const {
+    if (!impl_) return code::invalid_state;
+    return impl_->latch_;
+}
+
 inline std::error_code session::ready_or_closed() const {
     if (!impl_) return code::invalid_state;
     if (!impl_->run_active_ && !impl_->latch_) return code::invalid_state;
@@ -275,16 +291,16 @@ inline std::error_code session::ready_or_closed() const {
 
 template <class Verifier>
 inline corral::Task<std::error_code> client_session::handshake(Verifier verify) {
-    if (auto ec = ready_or_closed()) co_return ec;
+    if (auto ec = handshake_ready()) co_return ec;
     auto& self = *impl_;
     for (;;) {
         if (self.hs_done_) co_return {};
-        if (self.closed()) co_return failure();
+        if (bool(self.latch_)) co_return failure();
         if (self.auth_ && self.auth_->pending_verify) {
             host_key_view view{self.auth_->pending_verify->key, self.provider_};
             core::host_key_ticket ticket = self.auth_->pending_verify->ticket;
             auto outcome = co_await corral::anyOf(verify(view), self.closed_ev_);
-            if (self.closed() || !std::get<0>(outcome)) {
+            if (bool(self.latch_) || !std::get<0>(outcome)) {
                 co_return failure();
             }
             const bool ok = *std::get<0>(outcome);
@@ -304,17 +320,17 @@ inline corral::Task<std::error_code> client_session::handshake(Verifier verify) 
             }
             continue;
         }
-        co_await self.hs_lot_.park();
+        co_await self.step(self.hs_lot_);
     }
 }
 
 inline corral::Task<std::error_code> server_session::handshake() {
-    if (auto ec = ready_or_closed()) co_return ec;
+    if (auto ec = handshake_ready()) co_return ec;
     auto& self = *impl_;
     for (;;) {
         if (self.hs_done_) co_return {};
-        if (self.closed()) co_return failure();
-        co_await self.hs_lot_.park();
+        if (bool(self.latch_)) co_return failure();
+        co_await self.step(self.hs_lot_);
     }
 }
 
@@ -565,9 +581,43 @@ inline corral::Task<std::error_code> session::cancel_streamlocal_forward(std::st
 }
 
 template <class OnOpen, class OnGlobal>
-inline corral::Task<void> session::serve(OnOpen on_open, OnGlobal on_global) {
-    if (!impl_) co_return;
+inline corral::Task<void> session::serve(OnOpen on_open, OnGlobal on_global,
+                                         corral::TaskStarted<> started) {
+    if (!impl_) {
+        started();
+        co_return;
+    }
     auto& self = *impl_;
+    if (!self.run_active_) {
+        // PROTO: after self-driven handshake/auth, serve() is the I/O pump.
+        while (self.driving_) co_await self.drive_lot_.park();
+        if (self.latch_) {
+            started();
+            co_return;
+        }
+        CORRAL_TRY {
+            self.run_active_ = true;
+            self.writer_done_ = false;
+            CORRAL_WITH_NURSERY(pumps) {
+                // Dispatch first so serving_ is set before buffered bytes are fed.
+                co_await pumps.start([&](corral::TaskStarted<> st) -> corral::Task<void> {
+                    co_await serve(std::move(on_open), std::move(on_global), std::move(st));
+                });
+                pumps.start(&session_impl::write_pump, &self);
+                pumps.start([&self]() -> corral::Task<void> {
+                    co_await corral::anyOf(self.read_pump(), self.closed_ev_);
+                });
+                started();
+                co_return corral::join;
+            };
+        }
+        CORRAL_FINALLY {
+            self.run_active_ = false;
+            self.latch(code::session_closed);
+            co_return;
+        };
+        co_return;
+    }
     struct serving_guard {
         session_impl* s;
         explicit serving_guard(session_impl* p) : s(p) { s->serving_ = true; }
@@ -581,6 +631,7 @@ inline corral::Task<void> session::serve(OnOpen on_open, OnGlobal on_global) {
         }
     } guard{&self};
 
+    started();
     CORRAL_WITH_NURSERY(n) {
         while (!self.closed()) {
             if (auto open = self.take_pending_open()) {
@@ -605,7 +656,7 @@ inline corral::Task<void> session::serve(OnOpen on_open, OnGlobal on_global) {
 
 inline corral::Task<std::tuple<std::error_code, auth_result>> client_session::auth_none(
     std::string_view user) {
-    if (auto ec = ready_or_closed()) co_return {ec, {}};
+    if (auto ec = handshake_ready()) co_return {ec, {}};
     auto& self = *impl_;
     if (!self.auth_) co_return {code::invalid_state, {}};
     if (!self.auth_->client_auth_outstanding) {
@@ -621,7 +672,7 @@ inline corral::Task<std::tuple<std::error_code, auth_result>> client_session::au
 
 inline corral::Task<std::tuple<std::error_code, auth_result>> client_session::auth_password(
     std::string_view user, std::string_view password) {
-    if (auto ec = ready_or_closed()) co_return {ec, {}};
+    if (auto ec = handshake_ready()) co_return {ec, {}};
     auto& self = *impl_;
     if (!self.auth_) co_return {code::invalid_state, {}};
     if (!self.auth_->client_auth_outstanding) {
@@ -637,7 +688,7 @@ inline corral::Task<std::tuple<std::error_code, auth_result>> client_session::au
 
 inline corral::Task<std::tuple<std::error_code, auth_result>> client_session::auth_publickey_query(
     std::string_view user, const keys::public_key& key) {
-    if (auto ec = ready_or_closed()) co_return {ec, {}};
+    if (auto ec = handshake_ready()) co_return {ec, {}};
     auto& self = *impl_;
     if (!self.auth_) co_return {code::invalid_state, {}};
     if (!self.auth_->client_auth_outstanding) {
@@ -653,7 +704,7 @@ inline corral::Task<std::tuple<std::error_code, auth_result>> client_session::au
 
 inline corral::Task<std::tuple<std::error_code, auth_result>> client_session::auth_publickey(
     std::string_view user, const keys::private_key& key) {
-    if (auto ec = ready_or_closed()) co_return {ec, {}};
+    if (auto ec = handshake_ready()) co_return {ec, {}};
     auto& self = *impl_;
     if (!self.auth_) co_return {code::invalid_state, {}};
     if (!self.auth_->client_auth_outstanding) {
@@ -670,7 +721,7 @@ inline corral::Task<std::tuple<std::error_code, auth_result>> client_session::au
 template <publickey_signer Signer>
 inline corral::Task<std::tuple<std::error_code, auth_result>> client_session::auth_publickey(
     std::string_view user, const keys::public_key& key, Signer signer) {
-    if (auto ec = ready_or_closed()) co_return {ec, {}};
+    if (auto ec = handshake_ready()) co_return {ec, {}};
     auto& self = *impl_;
     if (!self.auth_) co_return {code::invalid_state, {}};
     if (!self.auth_->client_auth_outstanding) {
@@ -681,7 +732,7 @@ inline corral::Task<std::tuple<std::error_code, auth_result>> client_session::au
             co_return {ec, {}};
         }
         auto outcome = co_await corral::anyOf(signer(std::as_const(req), data.data()), self.closed_ev_);
-        if (self.closed() || !std::get<0>(outcome)) co_return {failure(), {}};
+        if (bool(self.latch_) || !std::get<0>(outcome)) co_return {failure(), {}};
         std::tuple<std::error_code, std::vector<std::byte>> signed_data =
             std::move(*std::get<0>(outcome));
         auto& [sign_ec, signature] = signed_data;
@@ -704,7 +755,7 @@ inline corral::Task<std::tuple<std::error_code, auth_result>> client_session::au
 template <class Responder>
 inline corral::Task<std::tuple<std::error_code, auth_result>>
 client_session::auth_keyboard_interactive(std::string_view user, Responder responder) {
-    if (auto ec = ready_or_closed()) co_return {ec, {}};
+    if (auto ec = handshake_ready()) co_return {ec, {}};
     auto& self = *impl_;
     if (!self.auth_) co_return {code::invalid_state, {}};
     if (!self.auth_->client_auth_outstanding) {
@@ -716,7 +767,7 @@ client_session::auth_keyboard_interactive(std::string_view user, Responder respo
         self.write_lot_.unparkAll();
     }
     for (;;) {
-        if (self.closed()) co_return {failure(), {}};
+        if (bool(self.latch_)) co_return {failure(), {}};
         if (self.auth_ && self.auth_->pending_auth_resp) {
             auto r = self.take_auth_response();
             self.auth_->client_auth_outstanding = false;
@@ -731,7 +782,7 @@ client_session::auth_keyboard_interactive(std::string_view user, Responder respo
                 responder(std::string_view{name}, std::string_view{instruction},
                           std::span<const kbdint_prompt>{prompts}),
                 self.closed_ev_);
-            if (self.closed() || !std::get<0>(outcome)) co_return {failure(), {}};
+            if (bool(self.latch_) || !std::get<0>(outcome)) co_return {failure(), {}};
             auto answers = std::move(*std::get<0>(outcome));
             if (!self.auth_ || !self.auth_->pending_info_req) co_return {code::invalid_state, {}};
             const core::kbdint_ticket ticket = self.auth_->pending_info_req->ticket;
@@ -748,17 +799,17 @@ client_session::auth_keyboard_interactive(std::string_view user, Responder respo
             self.unstall_lot_.unparkAll();
             continue;
         }
-        co_await self.auth_lot_.park();
+        co_await self.step(self.auth_lot_);
     }
 }
 
 template <class Authenticator>
 inline corral::Task<std::error_code> server_session::authenticate(Authenticator authenticator) {
-    if (auto ec = ready_or_closed()) co_return ec;
+    if (auto ec = handshake_ready()) co_return ec;
     auto& self = *impl_;
     if (!self.auth_) co_return code::invalid_state;
     for (;;) {
-        if (self.closed()) co_return failure();
+        if (bool(self.latch_)) co_return failure();
         if (self.auth_ && self.auth_->pending_auth_req) {
             auth_request req;
             req.impl_ = &self;
@@ -776,7 +827,7 @@ inline corral::Task<std::error_code> server_session::authenticate(Authenticator 
             auto outcome = co_await corral::anyOf(authenticator(std::move(req)), self.closed_ev_);
             self.auth_->auth_callback_live = false;
             self.auth_->challenge_outstanding = false;
-            if (self.closed() || !std::get<0>(outcome)) {
+            if (bool(self.latch_) || !std::get<0>(outcome)) {
                 co_return failure();
             }
             auth_verdict v = std::move(*std::get<0>(outcome));
@@ -800,7 +851,7 @@ inline corral::Task<std::error_code> server_session::authenticate(Authenticator 
             }
             continue;
         }
-        co_await self.auth_lot_.park();
+        co_await self.step(self.auth_lot_);
     }
 }
 
@@ -812,7 +863,7 @@ auth_request::challenge(std::string_view name, std::string_view instruction,
         co_return std::make_tuple(code::invalid_state, std::vector<crypto::secure_string>{});
     }
     auto& self = *impl_;
-    if (self.closed()) {
+    if (bool(self.latch_)) {
         co_return std::make_tuple(self.latch_, std::vector<crypto::secure_string>{});
     }
     if (!self.auth_->challenge_outstanding) {
@@ -823,7 +874,7 @@ auth_request::challenge(std::string_view name, std::string_view instruction,
         self.auth_->challenge_outstanding = true;
     }
     for (;;) {
-        if (self.closed()) {
+        if (bool(self.latch_)) {
             co_return std::make_tuple(self.latch_, std::vector<crypto::secure_string>{});
         }
         if (self.auth_ && self.auth_->pending_info_resp) {
@@ -832,7 +883,7 @@ auth_request::challenge(std::string_view name, std::string_view instruction,
             self.auth_->challenge_outstanding = false;
             co_return std::make_tuple(std::error_code{}, std::move(answers));
         }
-        co_await self.auth_lot_.park();
+        co_await self.step(self.auth_lot_);
     }
 }
 

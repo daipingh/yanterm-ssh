@@ -162,6 +162,7 @@ if(OpenSSL_FOUND)
         test_session_auth.cpp
         test_session_channel.cpp
         test_session_serve.cpp
+        test_proto_self_drive.cpp
         test_session_cancel.cpp
         test_session_memory.cpp
         test_sftp_packets.cpp
