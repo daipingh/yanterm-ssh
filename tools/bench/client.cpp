@@ -243,6 +243,48 @@ corral::Task<std::error_code> transfer_throughput(ssh::client_session& cs, const
     co_return {};
 }
 
+// Each hop is served for as long as the hops behind it are in use.
+corral::Task<std::error_code> connect_hops(crypto::provider p, const client_config& cfg,
+                                           auv::stream transport,
+                                           const std::vector<hop_endpoint>& hops,
+                                           const std::vector<const keys::private_key*>& idptrs,
+                                           std::size_t index, chain_outcome& out,
+                                           std::optional<direction> tp_dir) {
+    ssh::client_options co;
+    apply_options(co, cfg);
+    ssh::client_session cs{std::move(transport), p, std::move(co)};
+
+    const uint64_t t0 = uv_hrtime();
+    if (auto aec = co_await authenticate_client(cs, hops[index].user, hops[index].password,
+                                                idptrs[index])) {
+        co_await cs.disconnect(ssh::disconnect_reason::by_application, {});
+        co_return aec;
+    }
+    out.hop_ms[index] = static_cast<double>(uv_hrtime() - t0) / 1.0e6;
+    if (const auto* neg = cs.negotiated()) out.names = describe(*neg);
+
+    std::error_code ec;
+    auto serve_ec = co_await cs.serve(
+        ssh::reject_inbound, ssh::reject_inbound, [&]() -> corral::Task<void> {
+            if (index + 1 < hops.size()) {
+                const auto& next = hops[index + 1];
+                auto opened = co_await cs.open_direct_tcpip(
+                    next.host, static_cast<std::uint32_t>(next.port), "127.0.0.1", 0);
+                if (opened.ec) {
+                    ec = opened.ec;
+                    co_return;
+                }
+                ec = co_await connect_hops(p, cfg, auv::stream::own(std::move(opened.ch)), hops,
+                                           idptrs, index + 1, out, tp_dir);
+                co_return;
+            }
+            if (tp_dir) ec = co_await transfer_throughput(cs, cfg, *tp_dir, out.stats);
+        });
+    if (ec) co_return ec;
+    if (serve_ec) co_return serve_ec;
+    co_return {};
+}
+
 corral::Task<chain_outcome> one_chain(uv_loop_t& loop, crypto::provider p, const client_config& cfg,
                                       const identity_cache& ids, std::optional<direction> tp_dir) {
     chain_outcome out;
@@ -265,54 +307,7 @@ corral::Task<chain_outcome> one_chain(uv_loop_t& loop, crypto::provider p, const
         out.ec = ec;
         co_return out;
     }
-    auv::stream transport = std::move(first);
-
-    std::vector<std::unique_ptr<ssh::client_session>> sessions;
-    sessions.reserve(hops.size());
-
-    CORRAL_WITH_NURSERY(n) {
-        CORRAL_TRY {
-            for (std::size_t i = 0; i < hops.size(); ++i) {
-                ssh::client_options co;
-                apply_options(co, cfg);
-                sessions.push_back(std::make_unique<ssh::client_session>(
-                    std::move(transport), p, std::move(co)));
-                auto* cs = sessions.back().get();
-                co_await n.start(&ssh::client_session::run, cs);
-
-                const uint64_t t0 = uv_hrtime();
-                if (auto aec = co_await authenticate_client(*cs, hops[i].user, hops[i].password,
-                                                            idptrs[i])) {
-                    out.ec = aec;
-                    break;
-                }
-                out.hop_ms[i] = static_cast<double>(uv_hrtime() - t0) / 1.0e6;
-                if (const auto* neg = cs->negotiated()) out.names = describe(*neg);
-
-                if (i + 1 < hops.size()) {
-                    const auto& next = hops[i + 1];
-                    auto opened = co_await cs->open_direct_tcpip(
-                        next.host, static_cast<std::uint32_t>(next.port), "127.0.0.1", 0);
-                    if (opened.ec) {
-                        out.ec = opened.ec;
-                        break;
-                    }
-                    transport = auv::stream::own(std::move(opened.ch));
-                }
-            }
-
-            if (!out.ec && tp_dir) {
-                out.ec = co_await transfer_throughput(*sessions.back(), cfg, *tp_dir, out.stats);
-            }
-        }
-        CORRAL_FINALLY {
-            for (auto it = sessions.rbegin(); it != sessions.rend(); ++it) {
-                co_await (*it)->disconnect(ssh::disconnect_reason::by_application, {});
-            }
-        };
-        co_return corral::cancel;
-    };
-
+    out.ec = co_await connect_hops(p, cfg, std::move(first), hops, idptrs, 0, out, tp_dir);
     co_return out;
 }
 

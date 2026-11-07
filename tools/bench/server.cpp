@@ -403,61 +403,58 @@ corral::Task<void> serve_connection(uv_loop_t& loop, auv::stream stream, crypto:
     ssh::server_session ss{std::move(stream), p, std::move(so)};
     const uint64_t t0 = uv_hrtime();
 
-    CORRAL_WITH_NURSERY(n) {
-        co_await n.start(&ssh::server_session::run, &ss);
-        if (auto ec = co_await ss.handshake()) {
-            std::cerr << "handshake failed: " << ec.message() << std::endl;
-            co_return corral::cancel;
-        }
-        const auto methods = allowed_methods(cfg, authorized);
-        const auto auth_ec = co_await ss.authenticate(
-            [&](ssh::auth_request req) -> corral::Task<ssh::auth_verdict> {
-                if (!user_ok(cfg, req.user())) {
-                    co_return ssh::auth_verdict::failure(methods);
-                }
-                if (req.method() == "password") {
-                    if (!cfg.password.empty() && req.password() == cfg.password) {
-                        co_return ssh::auth_verdict::success();
-                    }
-                    co_return ssh::auth_verdict::failure(methods);
-                }
-                if (req.method() == "publickey") {
-                    if (public_blob_authorized(authorized, req.public_blob())) {
-                        // Unsigned query → USERAUTH_PK_OK via success() (facade
-                        // does not treat that as authenticated). Signed → done.
-                        co_return ssh::auth_verdict::success();
-                    }
-                    co_return ssh::auth_verdict::failure(methods);
+    if (auto ec = co_await ss.handshake()) {
+        std::cerr << "handshake failed: " << ec.message() << std::endl;
+        co_return;
+    }
+    const auto methods = allowed_methods(cfg, authorized);
+    const auto auth_ec = co_await ss.authenticate(
+        [&](ssh::auth_request req) -> corral::Task<ssh::auth_verdict> {
+            if (!user_ok(cfg, req.user())) {
+                co_return ssh::auth_verdict::failure(methods);
+            }
+            if (req.method() == "password") {
+                if (!cfg.password.empty() && req.password() == cfg.password) {
+                    co_return ssh::auth_verdict::success();
                 }
                 co_return ssh::auth_verdict::failure(methods);
-            });
-        if (auth_ec) {
-            std::cerr << "auth failed: " << auth_ec.message() << std::endl;
-            co_return corral::cancel;
-        }
-        const uint64_t t1 = uv_hrtime();
-        std::cerr << "authenticated user=" << (cfg.user.empty() ? "-" : cfg.user) << " "
-                  << (static_cast<double>(t1 - t0) / 1.0e6) << " ms" << std::endl;
-        co_await ss.serve(
-            [&](ssh::inbound_channel_open open) -> corral::Task<void> {
-                if (open.type() == ssh::channel_type::session) {
-                    ssh::channel ch = open.accept();
-                    if (!ch) co_return;
-                    co_await handle_session(loop, std::move(ch));
-                    co_return;
+            }
+            if (req.method() == "publickey") {
+                if (public_blob_authorized(authorized, req.public_blob())) {
+                    // Unsigned query → USERAUTH_PK_OK via success() (facade
+                    // does not treat that as authenticated). Signed → done.
+                    co_return ssh::auth_verdict::success();
                 }
-                if (open.type() == ssh::channel_type::direct_tcpip) {
-                    co_await handle_direct_tcpip(loop, std::move(open));
-                    co_return;
-                }
-                open.reject(ssh::channel_open_reason::unknown_channel_type, "unsupported");
-            },
-            [](ssh::inbound_global_request req) -> corral::Task<void> {
-                req.reject();
+                co_return ssh::auth_verdict::failure(methods);
+            }
+            co_return ssh::auth_verdict::failure(methods);
+        });
+    if (auth_ec) {
+        std::cerr << "auth failed: " << auth_ec.message() << std::endl;
+        co_return;
+    }
+    const uint64_t t1 = uv_hrtime();
+    std::cerr << "authenticated user=" << (cfg.user.empty() ? "-" : cfg.user) << " "
+              << (static_cast<double>(t1 - t0) / 1.0e6) << " ms" << std::endl;
+    co_await ss.serve(
+        [&](ssh::inbound_channel_open open) -> corral::Task<void> {
+            if (open.type() == ssh::channel_type::session) {
+                ssh::channel ch = open.accept();
+                if (!ch) co_return;
+                co_await corral::anyOf(handle_session(loop, std::move(ch)), ss.until_closed());
                 co_return;
-            });
-        co_return corral::join;
-    };
+            }
+            if (open.type() == ssh::channel_type::direct_tcpip) {
+                co_await corral::anyOf(handle_direct_tcpip(loop, std::move(open)),
+                                       ss.until_closed());
+                co_return;
+            }
+            open.reject(ssh::channel_open_reason::unknown_channel_type, "unsupported");
+        },
+        [](ssh::inbound_global_request req) -> corral::Task<void> {
+            req.reject();
+            co_return;
+        });
 }
 
 }  // namespace

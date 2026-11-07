@@ -75,10 +75,9 @@ TEST_CASE("cancelling channel.read keeps data", "[facade][cancel]") {
     corral::Event read_cancelled;
 
     corral::run(fp.loop, [&]() -> corral::Task<void> {
+        co_await handshake_and_password(fp.client, fp.server);
+        co_await fp.client.serve(reject_inbound, reject_inbound, [&]() -> corral::Task<void> {
         CORRAL_WITH_NURSERY(n) {
-            co_await n.start(&client_session::run, &fp.client);
-            co_await n.start(&server_session::run, &fp.server);
-            co_await handshake_and_password(fp.client, fp.server);
 
             corral::Event serving;
             n.start([&]() -> corral::Task<void> {
@@ -117,6 +116,7 @@ TEST_CASE("cancelling channel.read keeps data", "[facade][cancel]") {
             co_await fp.client.disconnect(disconnect_reason::by_application, "done");
             co_return corral::cancel;
         };
+        });
     }());
 }
 
@@ -128,10 +128,9 @@ TEST_CASE("cancelled channel reply waiter does not steal next reply", "[facade][
     std::optional<std::error_code> second_ec;
 
     corral::run(fp.loop, [&]() -> corral::Task<void> {
+        co_await handshake_and_password(fp.client, fp.server);
+        co_await fp.client.serve(reject_inbound, reject_inbound, [&]() -> corral::Task<void> {
         CORRAL_WITH_NURSERY(n) {
-            co_await n.start(&client_session::run, &fp.client);
-            co_await n.start(&server_session::run, &fp.server);
-            co_await handshake_and_password(fp.client, fp.server);
 
             corral::Event serving;
             n.start([&]() -> corral::Task<void> {
@@ -179,6 +178,7 @@ TEST_CASE("cancelled channel reply waiter does not steal next reply", "[facade][
             co_await fp.client.disconnect(disconnect_reason::by_application, "done");
             co_return corral::cancel;
         };
+        });
     }());
 }
 
@@ -197,10 +197,9 @@ TEST_CASE("cancelling open_session_channel abandons", "[facade][cancel]") {
     bool saw_close = false;
 
     corral::run(loop, [&]() -> corral::Task<void> {
+        co_await handshake_and_password(client, server);
+        co_await client.serve(reject_inbound, reject_inbound, [&]() -> corral::Task<void> {
         CORRAL_WITH_NURSERY(n) {
-            co_await n.start(&client_session::run, &client);
-            co_await n.start(&server_session::run, &server);
-            co_await handshake_and_password(client, server);
             const std::size_t baseline_blocks = client_res.outstanding_blocks();
 
             corral::Event serving;
@@ -246,6 +245,7 @@ TEST_CASE("cancelling open_session_channel abandons", "[facade][cancel]") {
             co_await client.disconnect(disconnect_reason::by_application, "done");
             co_return corral::cancel;
         };
+        });
     }());
 }
 
@@ -262,10 +262,9 @@ TEST_CASE("session close while opening drops the channel state", "[facade][cance
     corral::Event allow_accept;
 
     corral::run(loop, [&]() -> corral::Task<void> {
+        co_await handshake_and_password(client, server);
+        co_await client.serve(reject_inbound, reject_inbound, [&]() -> corral::Task<void> {
         CORRAL_WITH_NURSERY(n) {
-            co_await n.start(&client_session::run, &client);
-            co_await n.start(&server_session::run, &server);
-            co_await handshake_and_password(client, server);
 
             corral::Event serving;
             n.start([&]() -> corral::Task<void> {
@@ -295,6 +294,7 @@ TEST_CASE("session close while opening drops the channel state", "[facade][cance
             REQUIRE_FALSE(opened.ch);
             co_return corral::cancel;
         };
+        });
     }());
 }
 
@@ -316,10 +316,9 @@ TEST_CASE("write waits for output watermark", "[facade][backpressure]") {
     std::error_code write_ec;
 
     corral::run(loop, [&]() -> corral::Task<void> {
+        co_await handshake_and_password(client, server);
+        co_await client.serve(reject_inbound, reject_inbound, [&]() -> corral::Task<void> {
         CORRAL_WITH_NURSERY(n) {
-            co_await n.start(&client_session::run, &client);
-            co_await n.start(&server_session::run, &server);
-            co_await handshake_and_password(client, server);
 
             corral::Event serving;
             n.start([&]() -> corral::Task<void> {
@@ -359,6 +358,7 @@ TEST_CASE("write waits for output watermark", "[facade][backpressure]") {
             co_await client.disconnect(disconnect_reason::by_application, "done");
             co_return corral::cancel;
         };
+        });
     }());
 }
 
@@ -366,10 +366,9 @@ TEST_CASE("rekey while echoing", "[facade][rekey]") {
     auto fp = make_facade_pair();
 
     corral::run(fp.loop, [&]() -> corral::Task<void> {
+        co_await handshake_and_password(fp.client, fp.server);
+        co_await fp.client.serve(reject_inbound, reject_inbound, [&]() -> corral::Task<void> {
         CORRAL_WITH_NURSERY(n) {
-            co_await n.start(&client_session::run, &fp.client);
-            co_await n.start(&server_session::run, &fp.server);
-            co_await handshake_and_password(fp.client, fp.server);
 
             corral::Event serving;
             n.start([&]() -> corral::Task<void> {
@@ -411,6 +410,7 @@ TEST_CASE("rekey while echoing", "[facade][rekey]") {
             co_await fp.client.disconnect(disconnect_reason::by_application, "done");
             co_return corral::cancel;
         };
+        });
     }());
 }
 
@@ -419,10 +419,9 @@ TEST_CASE("send_keepalive", "[facade][keepalive]") {
     bool saw_keepalive = false;
 
     corral::run(fp.loop, [&]() -> corral::Task<void> {
+        co_await handshake_and_password(fp.client, fp.server);
+        co_await fp.client.serve(reject_inbound, reject_inbound, [&]() -> corral::Task<void> {
         CORRAL_WITH_NURSERY(n) {
-            co_await n.start(&client_session::run, &fp.client);
-            co_await n.start(&server_session::run, &fp.server);
-            co_await handshake_and_password(fp.client, fp.server);
 
             corral::Event serving;
             n.start([&]() -> corral::Task<void> {
@@ -451,5 +450,6 @@ TEST_CASE("send_keepalive", "[facade][keepalive]") {
             co_await fp.client.disconnect(disconnect_reason::by_application, "done");
             co_return corral::cancel;
         };
+        });
     }());
 }

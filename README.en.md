@@ -188,16 +188,19 @@ corral::Task<void> run_uname(auv::stream tcp, ssh::crypto::provider provider,
                              const ssh::keys::private_key& identity) {
     ssh::client_session cs(std::move(tcp), provider, ssh::client_options{});
 
-    co_await ssh::run_with(cs, [&]() -> corral::Task<void> {
-        auto hs = co_await cs.handshake([](ssh::host_key_view key) -> corral::Task<bool> {
-            // Verify the host key here, e.g. check key.fingerprint() against known_hosts
-            co_return true;
-        });
-        if (hs) co_return;
+    auto hs = co_await cs.handshake([](ssh::host_key_view key) -> corral::Task<bool> {
+        // Verify the host key here, e.g. check key.fingerprint() against known_hosts
+        co_return true;
+    });
+    if (hs) co_return;
 
-        auto [aec, auth] = co_await cs.auth_publickey("user", identity);
-        if (aec || !auth.success) co_return;
+    auto [aec, auth] = co_await cs.auth_publickey("user", identity);
+    if (aec || !auth.success) {
+        co_await cs.disconnect(ssh::disconnect_reason::no_more_auth_methods_available, {});
+        co_return;
+    }
 
+    co_await cs.serve(ssh::reject_inbound, ssh::reject_inbound, [&]() -> corral::Task<void> {
         auto opened = co_await cs.open_session_channel();
         if (opened.ec) co_return;
         if (co_await opened.ch.request_exec("uname -a")) co_return;
@@ -215,8 +218,6 @@ corral::Task<void> run_uname(auv::stream tcp, ssh::crypto::provider provider,
 ```
 
 `channel::read` delivers stdout only. stderr (RFC 4254 §5.2 extended data) is discarded by default and its window is credited back; call `stderr_stream()` before `request_exec`, `request_shell`, or `request_subsystem`, or early output is already gone.
-
-`run_with` starts the session's read/write loop in the background and disconnects once the user coroutine finishes. For finer lifetime control, you can `start(&client_session::run, &cs)` in your own nursery.
 
 ### Driving the sans-I/O core directly
 

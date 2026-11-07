@@ -18,8 +18,6 @@ TEST_CASE("client and server handshake on memory pipe", "[facade][handshake]") {
 
     corral::run(fp.loop, [&]() -> corral::Task<void> {
         CORRAL_WITH_NURSERY(n) {
-            co_await n.start(&client_session::run, &fp.client);
-            co_await n.start(&server_session::run, &fp.server);
             auto [cec, sec] = co_await corral::allOf(
                 fp.client.handshake([](host_key_view k) -> corral::Task<bool> {
                     REQUIRE_FALSE(k.fingerprint().empty());
@@ -48,8 +46,6 @@ TEST_CASE("rejecting the host key fails the client", "[facade][handshake]") {
 
     corral::run(fp.loop, [&]() -> corral::Task<void> {
         CORRAL_WITH_NURSERY(n) {
-            co_await n.start(&client_session::run, &fp.client);
-            co_await n.start(&server_session::run, &fp.server);
             auto [cec, sec] = co_await corral::allOf(
                 fp.client.handshake([](host_key_view) -> corral::Task<bool> { co_return false; }),
                 fp.server.handshake());
@@ -71,6 +67,40 @@ TEST_CASE("rejecting the host key fails the client", "[facade][handshake]") {
     }());
 }
 
+TEST_CASE("host-key reject after transport eof sends no disconnect", "[facade][handshake]") {
+    TestLoop loop;
+    auto [client_end, server_end] = memory_pipe::make(loop);
+    auto stop_client_writes = client_end.fin();
+    auto stop_server_writes = server_end.fin();
+    auto p = prov();
+    server_options so;
+    so.host_keys.push_back(parse_host_key_file(p, "id_ed25519"));
+    client_session cs{auv::stream::own(std::move(client_end)), p, client_options{}};
+    server_session ss{auv::stream::own(std::move(server_end)), p, std::move(so)};
+    bool continued = false;
+    std::error_code client_ec;
+
+    corral::run(loop, [&]() -> corral::Task<void> {
+        co_await corral::allOf(
+            [&]() -> corral::Task<void> {
+                client_ec = co_await cs.handshake([&](host_key_view) -> corral::Task<bool> {
+                    stop_server_writes();
+                    co_await cs.until_closed();
+                    continued = true;
+                    co_return false;
+                });
+                // Anything the client wrote is in the pipe ahead of this EOF.
+                stop_client_writes();
+            }(),
+            ss.handshake());
+    }());
+
+    REQUIRE(continued);
+    REQUIRE(client_ec);
+    REQUIRE(client_ec != errc::host_key_rejected);
+    REQUIRE(ss.disconnected() == nullptr);
+}
+
 TEST_CASE("server offers ed25519 and rsa host keys", "[facade][handshake][hostkey]") {
     auto p = prov();
     client_options co;
@@ -86,8 +116,6 @@ TEST_CASE("server offers ed25519 and rsa host keys", "[facade][handshake][hostke
 
     corral::run(fp.loop, [&]() -> corral::Task<void> {
         CORRAL_WITH_NURSERY(n) {
-            co_await n.start(&client_session::run, &fp.client);
-            co_await n.start(&server_session::run, &fp.server);
             auto [cec, sec] = co_await corral::allOf(
                 fp.client.handshake([&](host_key_view k) -> corral::Task<bool> {
                     seen.assign(k.key().blob().begin(), k.key().blob().end());
@@ -109,8 +137,6 @@ TEST_CASE("cancelled host-key verifier does not poison handshake", "[facade][han
 
     corral::run(fp.loop, [&]() -> corral::Task<void> {
         CORRAL_WITH_NURSERY(n) {
-            co_await n.start(&client_session::run, &fp.client);
-            co_await n.start(&server_session::run, &fp.server);
             n.start([&]() -> corral::Task<void> {
                 (void)co_await fp.server.handshake();
                 co_return;
@@ -136,5 +162,31 @@ TEST_CASE("cancelled host-key verifier does not poison handshake", "[facade][han
             co_await fp.client.disconnect(disconnect_reason::by_application, "done");
             co_return corral::cancel;
         };
+    }());
+}
+
+TEST_CASE("cancelling a self-driven handshake leaves the session usable", "[facade][handshake]") {
+    auto fp = make_facade_pair();
+
+    corral::run(fp.loop, [&]() -> corral::Task<void> {
+        auto first = co_await corral::anyOf(
+            fp.client.handshake([](host_key_view) -> corral::Task<bool> { co_return true; }),
+            [&]() -> corral::Task<void> {
+                for (int i = 0; i < 3; ++i) {
+                    corral::Event turn;
+                    fp.loop.post([&] { turn.trigger(); });
+                    co_await turn;
+                }
+            }());
+        REQUIRE_FALSE(std::get<0>(first));
+        REQUIRE_FALSE(fp.client.failure());
+
+        auto [cec, sec] = co_await corral::allOf(
+            fp.client.handshake([](host_key_view) -> corral::Task<bool> { co_return true; }),
+            fp.server.handshake());
+        REQUIRE_FALSE(cec);
+        REQUIRE_FALSE(sec);
+        REQUIRE(fp.client.peer_identification().starts_with("SSH-2.0-"));
+        REQUIRE(fp.server.peer_identification().starts_with("SSH-2.0-"));
     }());
 }

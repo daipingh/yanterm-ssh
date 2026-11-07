@@ -188,16 +188,19 @@ corral::Task<void> run_uname(auv::stream tcp, ssh::crypto::provider provider,
                              const ssh::keys::private_key& identity) {
     ssh::client_session cs(std::move(tcp), provider, ssh::client_options{});
 
-    co_await ssh::run_with(cs, [&]() -> corral::Task<void> {
-        auto hs = co_await cs.handshake([](ssh::host_key_view key) -> corral::Task<bool> {
-            // 在这里用 key.fingerprint() 对照 known_hosts 校验主机密钥
-            co_return true;
-        });
-        if (hs) co_return;
+    auto hs = co_await cs.handshake([](ssh::host_key_view key) -> corral::Task<bool> {
+        // 在这里用 key.fingerprint() 对照 known_hosts 校验主机密钥
+        co_return true;
+    });
+    if (hs) co_return;
 
-        auto [aec, auth] = co_await cs.auth_publickey("user", identity);
-        if (aec || !auth.success) co_return;
+    auto [aec, auth] = co_await cs.auth_publickey("user", identity);
+    if (aec || !auth.success) {
+        co_await cs.disconnect(ssh::disconnect_reason::no_more_auth_methods_available, {});
+        co_return;
+    }
 
+    co_await cs.serve(ssh::reject_inbound, ssh::reject_inbound, [&]() -> corral::Task<void> {
         auto opened = co_await cs.open_session_channel();
         if (opened.ec) co_return;
         if (co_await opened.ch.request_exec("uname -a")) co_return;
@@ -215,8 +218,6 @@ corral::Task<void> run_uname(auv::stream tcp, ssh::crypto::provider provider,
 ```
 
 `channel::read` 只收到标准输出。stderr（RFC 4254 §5.2 的扩展数据）默认被丢弃并归还窗口；要读取须在 `request_exec` / `request_shell` / `request_subsystem` 之前取得 `stderr_stream()`，否则命令早期输出已经丢失。
-
-`run_with` 会在后台启动会话的读写循环，等用户协程结束后主动断开连接。需要更精细地控制生命周期时，可以自己在 nursery 里 `start(&client_session::run, &cs)`。
 
 ### 直接驱动 sans-I/O 核心
 

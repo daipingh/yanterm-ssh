@@ -58,6 +58,25 @@ struct stall_reads_flag {
     }
 };
 
+// Copyable handle: shuts this end's write direction like shutdown(), without
+// closing the peer, so the peer's read sees EOF while bytes can still flow back.
+struct fin_writes {
+    std::shared_ptr<state> st;
+    TestLoop* loop = nullptr;
+    bool is_a = false;
+
+    void operator()() const {
+        if (!st || !loop) return;
+        bool& shut = is_a ? st->a_shut : st->b_shut;
+        if (shut) return;
+        shut = true;
+        loop->post([st = st, is_a = is_a] {
+            (is_a ? st->b_rd : st->a_rd).unparkAll();
+            (is_a ? st->b_wr : st->a_wr).unparkAll();
+        });
+    }
+};
+
 class end {
 public:
     end(TestLoop* loop, std::shared_ptr<state> st, bool is_a)
@@ -87,6 +106,8 @@ public:
 
     // Survives moving `*this` into `auv::stream::own`.
     [[nodiscard]] stall_reads_flag stall_reads() const { return {st_, is_a_}; }
+    // Shuts this end's write direction without closing either side.
+    [[nodiscard]] fin_writes fin() const { return {st_, loop_, is_a_}; }
 
     corral::Task<auv::read_result> read(auv::read_allocator alloc_cb, void* alloc_arg) {
         if (!st_ || closed_flag()) {

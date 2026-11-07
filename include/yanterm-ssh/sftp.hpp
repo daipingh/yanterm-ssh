@@ -750,11 +750,11 @@ corral::Task<sftp::result<sftp::attrs>> basic_sftp_client<Stream>::attrs_path(sf
 
 template <class Stream>
 corral::Task<sftp::result<sftp::attrs>> basic_sftp_client<Stream>::stat(std::string_view path) {
-    co_return co_await attrs_path(sftp::msg::stat, path);
+    return attrs_path(sftp::msg::stat, path);
 }
 template <class Stream>
 corral::Task<sftp::result<sftp::attrs>> basic_sftp_client<Stream>::lstat(std::string_view path) {
-    co_return co_await attrs_path(sftp::msg::lstat, path);
+    return attrs_path(sftp::msg::lstat, path);
 }
 
 template <class Stream>
@@ -850,11 +850,11 @@ corral::Task<sftp::result<>> basic_sftp_client<Stream>::status_path(sftp::msg ty
 
 template <class Stream>
 corral::Task<sftp::result<>> basic_sftp_client<Stream>::remove(std::string_view path) {
-    co_return co_await status_path(sftp::msg::remove, path);
+    return status_path(sftp::msg::remove, path);
 }
 template <class Stream>
 corral::Task<sftp::result<>> basic_sftp_client<Stream>::rmdir(std::string_view path) {
-    co_return co_await status_path(sftp::msg::rmdir, path);
+    return status_path(sftp::msg::rmdir, path);
 }
 template <class Stream>
 corral::Task<sftp::result<>> basic_sftp_client<Stream>::mkdir(std::string_view path,

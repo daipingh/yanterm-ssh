@@ -70,8 +70,6 @@ TEST_CASE("password auth succeeds", "[facade][auth]") {
 
     corral::run(fp.loop, [&]() -> corral::Task<void> {
         CORRAL_WITH_NURSERY(n) {
-            co_await n.start(&client_session::run, &fp.client);
-            co_await n.start(&server_session::run, &fp.server);
             auto [cec, sec] = co_await corral::allOf(fp.client.handshake(accept_host),
                                                      fp.server.handshake());
             REQUIRE_FALSE(cec);
@@ -103,8 +101,6 @@ TEST_CASE("password auth rejected is auth_result not latch", "[facade][auth]") {
 
     corral::run(fp.loop, [&]() -> corral::Task<void> {
         CORRAL_WITH_NURSERY(n) {
-            co_await n.start(&client_session::run, &fp.client);
-            co_await n.start(&server_session::run, &fp.server);
             auto [cec, sec] = co_await corral::allOf(fp.client.handshake(accept_host),
                                                      fp.server.handshake());
             REQUIRE_FALSE(cec);
@@ -136,8 +132,6 @@ TEST_CASE("publickey auth succeeds", "[facade][auth]") {
 
     corral::run(fp.loop, [&]() -> corral::Task<void> {
         CORRAL_WITH_NURSERY(n) {
-            co_await n.start(&client_session::run, &fp.client);
-            co_await n.start(&server_session::run, &fp.server);
             auto [cec, sec] = co_await corral::allOf(fp.client.handshake(accept_host),
                                                      fp.server.handshake());
             REQUIRE_FALSE(cec);
@@ -169,8 +163,6 @@ TEST_CASE("publickey query reports pk_ok without authenticating", "[facade][auth
 
     corral::run(fp.loop, [&]() -> corral::Task<void> {
         CORRAL_WITH_NURSERY(n) {
-            co_await n.start(&client_session::run, &fp.client);
-            co_await n.start(&server_session::run, &fp.server);
             auto [cec, sec] = co_await corral::allOf(fp.client.handshake(accept_host),
                                                      fp.server.handshake());
             REQUIRE_FALSE(cec);
@@ -205,8 +197,6 @@ TEST_CASE("publickey query rejected returns methods", "[facade][auth][pkok]") {
 
     corral::run(fp.loop, [&]() -> corral::Task<void> {
         CORRAL_WITH_NURSERY(n) {
-            co_await n.start(&client_session::run, &fp.client);
-            co_await n.start(&server_session::run, &fp.server);
             auto [cec, sec] = co_await corral::allOf(fp.client.handshake(accept_host),
                                                      fp.server.handshake());
             REQUIRE_FALSE(cec);
@@ -234,8 +224,6 @@ TEST_CASE("kbdint one round", "[facade][auth]") {
 
         corral::run(fp.loop, [&]() -> corral::Task<void> {
             CORRAL_WITH_NURSERY(n) {
-                co_await n.start(&client_session::run, &fp.client);
-                co_await n.start(&server_session::run, &fp.server);
                 auto [cec, sec] = co_await corral::allOf(fp.client.handshake(accept_host),
                                                          fp.server.handshake());
                 REQUIRE_FALSE(cec);
@@ -274,14 +262,14 @@ TEST_CASE("kbdint one round", "[facade][auth]") {
         }());
     }
 
-    SECTION("challenge completes under noncancellable when session dies") {
+    SECTION("challenge continues after the session dies") {
         auto fp = make_facade_pair();
         std::error_code challenge_ec;
+        bool continued = false;
+        std::error_code auth_ec;
 
         corral::run(fp.loop, [&]() -> corral::Task<void> {
             CORRAL_WITH_NURSERY(n) {
-                co_await n.start(&client_session::run, &fp.client);
-                co_await n.start(&server_session::run, &fp.server);
                 auto [cec, sec] = co_await corral::allOf(fp.client.handshake(accept_host),
                                                          fp.server.handshake());
                 REQUIRE_FALSE(cec);
@@ -308,21 +296,93 @@ TEST_CASE("kbdint one round", "[facade][auth]") {
                     co_return;
                 });
 
-                auto auth_ec = co_await fp.server.authenticate(
+                auth_ec = co_await fp.server.authenticate(
                     [&](auth_request req) -> corral::Task<auth_verdict> {
-                        auto [ec, pw] =
-                            co_await corral::noncancellable(req.challenge("Password:", false));
+                        auto [ec, pw] = co_await req.challenge("Password:", false);
                         challenge_ec = ec;
                         (void)pw;
-                        co_return auth_verdict::failure("password");
+                        continued = true;
+                        co_return auth_verdict::success();
                     });
-                (void)auth_ec;
                 co_return corral::cancel;
             };
         }());
 
+        REQUIRE(continued);
         REQUIRE(challenge_ec);
+        REQUIRE(auth_ec);
     }
+}
+
+TEST_CASE("transport eof drops an auth success", "[facade][auth]") {
+    TestLoop loop;
+    auto [client_end, server_end] = memory_pipe::make(loop);
+    auto stop_client_writes = client_end.fin();
+    auto stop_server_writes = server_end.fin();
+    auto p = prov();
+    server_options so;
+    so.host_keys.push_back(parse_host_key_file(p, "id_ed25519"));
+    client_session cs{auv::stream::own(std::move(client_end)), p, client_options{}};
+    server_session ss{auv::stream::own(std::move(server_end)), p, std::move(so)};
+    bool continued = false;
+    bool responder_released = false;
+    std::error_code auth_ec;
+    std::error_code client_ec;
+    auth_result client_result;
+    corral::Event entered;
+    corral::Event release;
+    corral::Event server_done;
+
+    corral::run(loop, [&]() -> corral::Task<void> {
+        auto [hcec, hsec] = co_await corral::allOf(cs.handshake(accept_host), ss.handshake());
+        REQUIRE_FALSE(hcec);
+        REQUIRE_FALSE(hsec);
+
+        co_await corral::allOf(
+            [&]() -> corral::Task<void> {
+                auth_ec = co_await ss.authenticate(
+                    [&](auth_request req) -> corral::Task<auth_verdict> {
+                        REQUIRE(req.method() == "keyboard-interactive");
+                        auto [ec, pw] = co_await req.challenge("Password:", false);
+                        (void)ec;
+                        (void)pw;
+                        continued = true;
+                        co_return auth_verdict::success();
+                    });
+                server_done.trigger();
+            }(),
+            [&]() -> corral::Task<void> {
+                auto [ec, result] = co_await cs.auth_keyboard_interactive(
+                    "alice",
+                    [&](std::string_view, std::string_view,
+                        std::span<const kbdint_prompt> prompts)
+                        -> corral::Task<std::vector<std::string>> {
+                        REQUIRE(prompts.size() == 1);
+                        REQUIRE(prompts[0].prompt == "Password:");
+                        REQUIRE_FALSE(prompts[0].echo);
+                        entered.trigger();
+                        co_await release;
+                        responder_released = true;
+                        co_return std::vector<std::string>{"secret"};
+                    });
+                client_ec = ec;
+                client_result = result;
+            }(),
+            [&]() -> corral::Task<void> {
+                co_await entered;
+                stop_client_writes();
+                co_await server_done;
+                // Anything the server wrote is in the pipe ahead of this EOF.
+                stop_server_writes();
+                release.trigger();
+            }());
+    }());
+
+    REQUIRE(continued);
+    REQUIRE(auth_ec);
+    REQUIRE(responder_released);
+    REQUIRE(client_ec);
+    REQUIRE_FALSE(client_result.success);
 }
 
 TEST_CASE("server auth_banner reaches client on_banner", "[facade][auth][banner]") {
@@ -342,8 +402,6 @@ TEST_CASE("server auth_banner reaches client on_banner", "[facade][auth][banner]
 
         corral::run(fp.loop, [&]() -> corral::Task<void> {
             CORRAL_WITH_NURSERY(n) {
-                co_await n.start(&client_session::run, &fp.client);
-                co_await n.start(&server_session::run, &fp.server);
                 auto [cec, sec] = co_await corral::allOf(fp.client.handshake(accept_host),
                                                          fp.server.handshake());
                 REQUIRE_FALSE(cec);
@@ -379,8 +437,6 @@ TEST_CASE("server auth_banner reaches client on_banner", "[facade][auth][banner]
 
         corral::run(fp.loop, [&]() -> corral::Task<void> {
             CORRAL_WITH_NURSERY(n) {
-                co_await n.start(&client_session::run, &fp.client);
-                co_await n.start(&server_session::run, &fp.server);
                 auto [cec, sec] = co_await corral::allOf(fp.client.handshake(accept_host),
                                                          fp.server.handshake());
                 REQUIRE_FALSE(cec);
@@ -413,8 +469,6 @@ TEST_CASE("external signer publickey auth succeeds", "[facade][auth][signer]") {
 
     corral::run(fp.loop, [&]() -> corral::Task<void> {
         CORRAL_WITH_NURSERY(n) {
-            co_await n.start(&client_session::run, &fp.client);
-            co_await n.start(&server_session::run, &fp.server);
             auto [cec, sec] = co_await corral::allOf(fp.client.handshake(accept_host),
                                                      fp.server.handshake());
             REQUIRE_FALSE(cec);
@@ -449,8 +503,6 @@ TEST_CASE("external signer signing wrong data fails auth", "[facade][auth][signe
 
     corral::run(fp.loop, [&]() -> corral::Task<void> {
         CORRAL_WITH_NURSERY(n) {
-            co_await n.start(&client_session::run, &fp.client);
-            co_await n.start(&server_session::run, &fp.server);
             auto [cec, sec] = co_await corral::allOf(fp.client.handshake(accept_host),
                                                      fp.server.handshake());
             REQUIRE_FALSE(cec);
@@ -483,8 +535,6 @@ TEST_CASE("external signer downgraded to ssh-rsa is error", "[facade][auth][sign
 
     corral::run(fp.loop, [&]() -> corral::Task<void> {
         CORRAL_WITH_NURSERY(n) {
-            co_await n.start(&client_session::run, &fp.client);
-            co_await n.start(&server_session::run, &fp.server);
             auto [cec, sec] = co_await corral::allOf(fp.client.handshake(accept_host),
                                                      fp.server.handshake());
             REQUIRE_FALSE(cec);
@@ -522,8 +572,6 @@ TEST_CASE("external signer error propagates unchanged", "[facade][auth][signer]"
 
     corral::run(fp.loop, [&]() -> corral::Task<void> {
         CORRAL_WITH_NURSERY(n) {
-            co_await n.start(&client_session::run, &fp.client);
-            co_await n.start(&server_session::run, &fp.server);
             auto [cec, sec] = co_await corral::allOf(fp.client.handshake(accept_host),
                                                      fp.server.handshake());
             REQUIRE_FALSE(cec);
@@ -558,8 +606,6 @@ TEST_CASE("external signer gets rsa-sha2-512 when only it is advertised", "[faca
 
     corral::run(fp.loop, [&]() -> corral::Task<void> {
         CORRAL_WITH_NURSERY(n) {
-            co_await n.start(&client_session::run, &fp.client);
-            co_await n.start(&server_session::run, &fp.server);
             auto [cec, sec] = co_await corral::allOf(fp.client.handshake(accept_host),
                                                      fp.server.handshake());
             REQUIRE_FALSE(cec);
@@ -583,4 +629,34 @@ TEST_CASE("external signer gets rsa-sha2-512 when only it is advertised", "[faca
         };
     }());
     REQUIRE(requested == "rsa-sha2-512");
+}
+
+TEST_CASE("disconnect after failed auth with no pump is observed", "[facade][auth]") {
+    auto fp = make_facade_pair();
+
+    corral::run(fp.loop, [&]() -> corral::Task<void> {
+        co_await corral::allOf(
+            [&]() -> corral::Task<void> {
+                auto hs = co_await fp.server.handshake();
+                REQUIRE_FALSE(hs);
+                auto ec = co_await fp.server.authenticate(
+                    [](auth_request) -> corral::Task<auth_verdict> {
+                        co_return auth_verdict::failure("password");
+                    });
+                REQUIRE(ec == code::peer_disconnected);
+            }(),
+            [&]() -> corral::Task<void> {
+                auto hs = co_await fp.client.handshake(accept_host);
+                REQUIRE_FALSE(hs);
+                auto [ec, result] = co_await fp.client.auth_password("alice", "nope");
+                REQUIRE_FALSE(ec);
+                REQUIRE_FALSE(result.success);
+                co_await fp.client.disconnect(disconnect_reason::no_more_auth_methods_available,
+                                              "bye");
+            }());
+    }());
+
+    REQUIRE(fp.server.disconnected() != nullptr);
+    REQUIRE(fp.server.disconnected()->reason == disconnect_reason::no_more_auth_methods_available);
+    REQUIRE(fp.server.disconnected()->description == "bye");
 }

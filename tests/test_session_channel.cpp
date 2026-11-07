@@ -61,10 +61,9 @@ TEST_CASE("session channel echo", "[facade][channel]") {
     auto fp = make_facade_pair();
 
     corral::run(fp.loop, [&]() -> corral::Task<void> {
+        co_await handshake_and_password(fp.client, fp.server);
+        co_await fp.client.serve(reject_inbound, reject_inbound, [&]() -> corral::Task<void> {
         CORRAL_WITH_NURSERY(n) {
-            co_await n.start(&client_session::run, &fp.client);
-            co_await n.start(&server_session::run, &fp.server);
-            co_await handshake_and_password(fp.client, fp.server);
 
             corral::Event serving;
             n.start([&]() -> corral::Task<void> {
@@ -109,6 +108,7 @@ TEST_CASE("session channel echo", "[facade][channel]") {
             co_await fp.client.disconnect(disconnect_reason::by_application, "done");
             co_return corral::cancel;
         };
+        });
     }());
 }
 
@@ -117,10 +117,9 @@ TEST_CASE("channel destructor enqueues CLOSE", "[facade][channel]") {
     corral::Event saw_eof;
 
     corral::run(fp.loop, [&]() -> corral::Task<void> {
+        co_await handshake_and_password(fp.client, fp.server);
+        co_await fp.client.serve(reject_inbound, reject_inbound, [&]() -> corral::Task<void> {
         CORRAL_WITH_NURSERY(n) {
-            co_await n.start(&client_session::run, &fp.client);
-            co_await n.start(&server_session::run, &fp.server);
-            co_await handshake_and_password(fp.client, fp.server);
 
             corral::Event serving;
             n.start([&]() -> corral::Task<void> {
@@ -151,6 +150,7 @@ TEST_CASE("channel destructor enqueues CLOSE", "[facade][channel]") {
             co_await fp.client.disconnect(disconnect_reason::by_application, "done");
             co_return corral::cancel;
         };
+        });
     }());
 }
 
@@ -158,44 +158,31 @@ TEST_CASE("channel outlives session handle and drains buffered data", "[facade][
     auto fp = make_facade_pair();
     channel surviving;
     constexpr std::string_view payload = "payload-bytes";
-    corral::Event serving;
     corral::Event written;
 
     corral::run(fp.loop, [&]() -> corral::Task<void> {
-        auto client_body = [&]() -> corral::Task<void> {
-            co_await handshake_and_password(fp.client, fp.server);
-            co_await serving;
-            auto opened = co_await fp.client.open_session_channel();
-            REQUIRE_FALSE(opened.ec);
-            surviving = std::move(opened.ch);
-            REQUIRE(surviving);
-            REQUIRE_FALSE(opened.ch);
-            co_await written;
-            co_await drain_turns(fp.loop, 6);
-        };
-        auto server_body = [&]() -> corral::Task<void> {
-            CORRAL_WITH_NURSERY(sn) {
-                sn.start([&]() -> corral::Task<void> {
-                    serving.trigger();
-                    co_await fp.server.serve(
-                        [&](inbound_channel_open open) -> corral::Task<void> {
-                            channel ch = open.accept();
-                            auv::stream s = auv::stream::borrow(ch);
-                            auv::buffer wb{payload.data(), payload.size()};
-                            auto wec = co_await s.write(&wb, std::size_t{1});
-                            REQUIRE_FALSE(wec);
-                            written.trigger();
-                            co_await corral::SuspendForever{};
-                        },
-                        dummy_global);
-                });
+        co_await handshake_and_password(fp.client, fp.server);
+        co_await corral::allOf(
+            fp.server.serve(
+                [&](inbound_channel_open open) -> corral::Task<void> {
+                    channel ch = open.accept();
+                    auv::stream s = auv::stream::borrow(ch);
+                    auv::buffer wb{payload.data(), payload.size()};
+                    auto wec = co_await s.write(&wb, std::size_t{1});
+                    REQUIRE_FALSE(wec);
+                    written.trigger();
+                    co_await fp.server.until_closed();
+                },
+                dummy_global),
+            fp.client.serve(reject_inbound, reject_inbound, [&]() -> corral::Task<void> {
+                auto opened = co_await fp.client.open_session_channel();
+                REQUIRE_FALSE(opened.ec);
+                surviving = std::move(opened.ch);
+                REQUIRE(surviving);
+                REQUIRE_FALSE(opened.ch);
                 co_await written;
                 co_await drain_turns(fp.loop, 6);
-                co_return corral::cancel;
-            };
-        };
-
-        co_await corral::allOf(run_with(fp.client, client_body), run_with(fp.server, server_body));
+            }));
     }());
 
     fp.client = {};
@@ -231,10 +218,9 @@ TEST_CASE("channel close after peer CLOSE with unread data releases slot", "[fac
     constexpr std::string_view payload = "unread";
 
     corral::run(fp.loop, [&]() -> corral::Task<void> {
+        co_await handshake_and_password(fp.client, fp.server);
+        co_await fp.client.serve(reject_inbound, reject_inbound, [&]() -> corral::Task<void> {
         CORRAL_WITH_NURSERY(n) {
-            co_await n.start(&client_session::run, &fp.client);
-            co_await n.start(&server_session::run, &fp.server);
-            co_await handshake_and_password(fp.client, fp.server);
 
             corral::Event serving;
             corral::Event peer_closed;
@@ -298,6 +284,7 @@ TEST_CASE("channel close after peer CLOSE with unread data releases slot", "[fac
             co_await fp.client.disconnect(disconnect_reason::by_application, "done");
             co_return corral::cancel;
         };
+        });
     }());
 }
 
@@ -305,10 +292,9 @@ TEST_CASE("pty-req then shell then data", "[facade][channel][pty]") {
     auto fp = make_facade_pair();
 
     corral::run(fp.loop, [&]() -> corral::Task<void> {
+        co_await handshake_and_password(fp.client, fp.server);
+        co_await fp.client.serve(reject_inbound, reject_inbound, [&]() -> corral::Task<void> {
         CORRAL_WITH_NURSERY(n) {
-            co_await n.start(&client_session::run, &fp.client);
-            co_await n.start(&server_session::run, &fp.server);
-            co_await handshake_and_password(fp.client, fp.server);
 
             corral::Event serving;
             n.start([&]() -> corral::Task<void> {
@@ -375,6 +361,7 @@ TEST_CASE("pty-req then shell then data", "[facade][channel][pty]") {
             co_await fp.client.disconnect(disconnect_reason::by_application, "done");
             co_return corral::cancel;
         };
+        });
     }());
 }
 
@@ -382,10 +369,9 @@ TEST_CASE("direct-tcpip open payload round-trip", "[facade][channel][tcp]") {
     auto fp = make_facade_pair();
 
     corral::run(fp.loop, [&]() -> corral::Task<void> {
+        co_await handshake_and_password(fp.client, fp.server);
+        co_await fp.client.serve(reject_inbound, reject_inbound, [&]() -> corral::Task<void> {
         CORRAL_WITH_NURSERY(n) {
-            co_await n.start(&client_session::run, &fp.client);
-            co_await n.start(&server_session::run, &fp.server);
-            co_await handshake_and_password(fp.client, fp.server);
 
             corral::Event serving;
             n.start([&]() -> corral::Task<void> {
@@ -440,6 +426,7 @@ TEST_CASE("direct-tcpip open payload round-trip", "[facade][channel][tcp]") {
             co_await fp.client.disconnect(disconnect_reason::by_application, "done");
             co_return corral::cancel;
         };
+        });
     }());
 }
 
@@ -447,10 +434,9 @@ TEST_CASE("x11-req extra round-trips through serve_requests", "[facade][channel]
     auto fp = make_facade_pair();
 
     corral::run(fp.loop, [&]() -> corral::Task<void> {
+        co_await handshake_and_password(fp.client, fp.server);
+        co_await fp.client.serve(reject_inbound, reject_inbound, [&]() -> corral::Task<void> {
         CORRAL_WITH_NURSERY(n) {
-            co_await n.start(&client_session::run, &fp.client);
-            co_await n.start(&server_session::run, &fp.server);
-            co_await handshake_and_password(fp.client, fp.server);
 
             corral::Event serving;
             n.start([&]() -> corral::Task<void> {
@@ -484,6 +470,7 @@ TEST_CASE("x11-req extra round-trips through serve_requests", "[facade][channel]
             co_await fp.client.disconnect(disconnect_reason::by_application, "done");
             co_return corral::cancel;
         };
+        });
     }());
 }
 
@@ -491,10 +478,9 @@ TEST_CASE("forwarded-streamlocal open payload round-trip", "[facade][channel]") 
     auto fp = make_facade_pair();
 
     corral::run(fp.loop, [&]() -> corral::Task<void> {
+        co_await handshake_and_password(fp.client, fp.server);
+        co_await fp.client.serve(reject_inbound, reject_inbound, [&]() -> corral::Task<void> {
         CORRAL_WITH_NURSERY(n) {
-            co_await n.start(&client_session::run, &fp.client);
-            co_await n.start(&server_session::run, &fp.server);
-            co_await handshake_and_password(fp.client, fp.server);
 
             corral::Event serving;
             n.start([&]() -> corral::Task<void> {
@@ -524,6 +510,7 @@ TEST_CASE("forwarded-streamlocal open payload round-trip", "[facade][channel]") 
             co_await fp.client.disconnect(disconnect_reason::by_application, "done");
             co_return corral::cancel;
         };
+        });
     }());
 }
 
@@ -532,10 +519,9 @@ TEST_CASE("pipelined pty then shell both complete", "[facade][channel]") {
     int served = 0;
 
     corral::run(fp.loop, [&]() -> corral::Task<void> {
+        co_await handshake_and_password(fp.client, fp.server);
+        co_await fp.client.serve(reject_inbound, reject_inbound, [&]() -> corral::Task<void> {
         CORRAL_WITH_NURSERY(n) {
-            co_await n.start(&client_session::run, &fp.client);
-            co_await n.start(&server_session::run, &fp.server);
-            co_await handshake_and_password(fp.client, fp.server);
 
             corral::Event serving;
             n.start([&]() -> corral::Task<void> {
@@ -580,7 +566,106 @@ TEST_CASE("pipelined pty then shell both complete", "[facade][channel]") {
             co_await fp.client.disconnect(disconnect_reason::by_application, "done");
             co_return corral::cancel;
         };
+        });
     }());
+}
+
+TEST_CASE("channel request after transport eof is not a success", "[facade][channel]") {
+    TestLoop loop;
+    auto [client_end, server_end] = memory_pipe::make(loop);
+    auto stop_client_writes = client_end.fin();
+    auto stop_server_writes = server_end.fin();
+    auto p = prov();
+    server_options so;
+    so.host_keys.push_back(parse_host_key_file(p, "id_ed25519"));
+    client_session cs{auv::stream::own(std::move(client_end)), p, client_options{}};
+    server_session ss{auv::stream::own(std::move(server_end)), p, std::move(so)};
+    bool continued = false;
+    std::error_code request_ec;
+    corral::Event handler_entered;
+
+    corral::run(loop, [&]() -> corral::Task<void> {
+        co_await handshake_and_password(cs, ss);
+        co_await corral::allOf(
+            [&]() -> corral::Task<void> {
+                (void)co_await ss.serve(
+                    [&](inbound_channel_open open) -> corral::Task<void> {
+                        channel ch = open.accept();
+                        REQUIRE(ch);
+                        co_await ch.serve_requests(
+                            [&](inbound_channel_request req) -> corral::Task<bool> {
+                                REQUIRE(req.type() == "pty-req");
+                                handler_entered.trigger();
+                                co_await ss.until_closed();
+                                continued = true;
+                                co_return true;
+                            });
+                    },
+                    dummy_global);
+                // Anything the server wrote is in the pipe ahead of this EOF.
+                stop_server_writes();
+            }(),
+            cs.serve(reject_inbound, reject_inbound, [&]() -> corral::Task<void> {
+                auto opened = co_await cs.open_session_channel();
+                REQUIRE_FALSE(opened.ec);
+                REQUIRE(opened.ch);
+                co_await corral::allOf(
+                    [&]() -> corral::Task<void> {
+                        request_ec = co_await opened.ch.request_pty(pty_spec{"xterm", 80, 24});
+                    }(),
+                    [&]() -> corral::Task<void> {
+                        co_await handler_entered;
+                        stop_client_writes();
+                    }());
+            }));
+    }());
+
+    REQUIRE(continued);
+    REQUIRE(request_ec);
+    REQUIRE(request_ec == cs.failure());
+}
+
+TEST_CASE("channel request handler continues after disconnect", "[facade][channel]") {
+    auto fp = make_facade_pair();
+    bool continued = false;
+    std::error_code request_ec;
+    corral::Event handler_entered;
+
+    corral::run(fp.loop, [&]() -> corral::Task<void> {
+        co_await handshake_and_password(fp.client, fp.server);
+        co_await corral::allOf(
+            fp.server.serve(
+                [&](inbound_channel_open open) -> corral::Task<void> {
+                    channel ch = open.accept();
+                    REQUIRE(ch);
+                    co_await ch.serve_requests(
+                        [&](inbound_channel_request req) -> corral::Task<bool> {
+                            REQUIRE(req.type() == "pty-req");
+                            handler_entered.trigger();
+                            co_await fp.server.until_closed();
+                            continued = true;
+                            co_return true;
+                        });
+                },
+                dummy_global),
+            fp.client.serve(reject_inbound, reject_inbound, [&]() -> corral::Task<void> {
+                auto opened = co_await fp.client.open_session_channel();
+                REQUIRE_FALSE(opened.ec);
+                REQUIRE(opened.ch);
+                co_await corral::allOf(
+                    [&]() -> corral::Task<void> {
+                        request_ec = co_await opened.ch.request_pty(pty_spec{"xterm", 80, 24});
+                    }(),
+                    [&]() -> corral::Task<void> {
+                        co_await handler_entered;
+                        co_await fp.client.disconnect(disconnect_reason::by_application, "done");
+                    }());
+            }));
+    }());
+
+    REQUIRE(continued);
+    REQUIRE(request_ec);
+    REQUIRE(request_ec == fp.client.failure());
 }
 
 TEST_CASE("same-batch channel request then CLOSE does not latch", "[facade][channel]") {
@@ -588,10 +673,9 @@ TEST_CASE("same-batch channel request then CLOSE does not latch", "[facade][chan
     int served = 0;
 
     corral::run(fp.loop, [&]() -> corral::Task<void> {
+        co_await handshake_and_password(fp.client, fp.server);
+        co_await fp.client.serve(reject_inbound, reject_inbound, [&]() -> corral::Task<void> {
         CORRAL_WITH_NURSERY(n) {
-            co_await n.start(&client_session::run, &fp.client);
-            co_await n.start(&server_session::run, &fp.server);
-            co_await handshake_and_password(fp.client, fp.server);
 
             corral::Event serving;
             n.start([&]() -> corral::Task<void> {
@@ -632,6 +716,7 @@ TEST_CASE("same-batch channel request then CLOSE does not latch", "[facade][chan
             co_await fp.client.disconnect(disconnect_reason::by_application, "done");
             co_return corral::cancel;
         };
+        });
     }());
 }
 
@@ -639,10 +724,9 @@ TEST_CASE("stderr_stream reads peer stderr and a second handle is empty until re
           "[facade][channel]") {
     auto fp = make_facade_pair();
     corral::run(fp.loop, [&]() -> corral::Task<void> {
+        co_await handshake_and_password(fp.client, fp.server);
+        co_await fp.client.serve(reject_inbound, reject_inbound, [&]() -> corral::Task<void> {
         CORRAL_WITH_NURSERY(n) {
-            co_await n.start(&client_session::run, &fp.client);
-            co_await n.start(&server_session::run, &fp.server);
-            co_await handshake_and_password(fp.client, fp.server);
 
             corral::Event serving;
             corral::Event client_ready;
@@ -703,16 +787,16 @@ TEST_CASE("stderr_stream reads peer stderr and a second handle is empty until re
             co_await fp.client.disconnect(disconnect_reason::by_application, "done");
             co_return corral::cancel;
         };
+        });
     }());
 }
 
 TEST_CASE("extended_stream outliving its channel reads EOF", "[facade][channel]") {
     auto fp = make_facade_pair();
     corral::run(fp.loop, [&]() -> corral::Task<void> {
+        co_await handshake_and_password(fp.client, fp.server);
+        co_await fp.client.serve(reject_inbound, reject_inbound, [&]() -> corral::Task<void> {
         CORRAL_WITH_NURSERY(n) {
-            co_await n.start(&client_session::run, &fp.client);
-            co_await n.start(&server_session::run, &fp.server);
-            co_await handshake_and_password(fp.client, fp.server);
 
             corral::Event serving;
             n.start([&]() -> corral::Task<void> {
@@ -743,16 +827,16 @@ TEST_CASE("extended_stream outliving its channel reads EOF", "[facade][channel]"
             co_await fp.client.disconnect(disconnect_reason::by_application, "done");
             co_return corral::cancel;
         };
+        });
     }());
 }
 
 TEST_CASE("extended_stream shutdown does not end the channel", "[facade][channel]") {
     auto fp = make_facade_pair();
     corral::run(fp.loop, [&]() -> corral::Task<void> {
+        co_await handshake_and_password(fp.client, fp.server);
+        co_await fp.client.serve(reject_inbound, reject_inbound, [&]() -> corral::Task<void> {
         CORRAL_WITH_NURSERY(n) {
-            co_await n.start(&client_session::run, &fp.client);
-            co_await n.start(&server_session::run, &fp.server);
-            co_await handshake_and_password(fp.client, fp.server);
 
             corral::Event serving;
             corral::Event saw_hi;
@@ -800,6 +884,7 @@ TEST_CASE("extended_stream shutdown does not end the channel", "[facade][channel
             co_await fp.client.disconnect(disconnect_reason::by_application, "done");
             co_return corral::cancel;
         };
+        });
     }());
 }
 
@@ -807,10 +892,9 @@ TEST_CASE("close of a parked stderr_stream read returns EOF and stdout still flo
           "[facade][channel]") {
     auto fp = make_facade_pair();
     corral::run(fp.loop, [&]() -> corral::Task<void> {
+        co_await handshake_and_password(fp.client, fp.server);
+        co_await fp.client.serve(reject_inbound, reject_inbound, [&]() -> corral::Task<void> {
         CORRAL_WITH_NURSERY(n) {
-            co_await n.start(&client_session::run, &fp.client);
-            co_await n.start(&server_session::run, &fp.server);
-            co_await handshake_and_password(fp.client, fp.server);
 
             corral::Event serving;
             n.start([&]() -> corral::Task<void> {
@@ -871,5 +955,6 @@ TEST_CASE("close of a parked stderr_stream read returns EOF and stdout still flo
             co_await fp.client.disconnect(disconnect_reason::by_application, "done");
             co_return corral::cancel;
         };
+        });
     }());
 }

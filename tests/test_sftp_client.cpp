@@ -1378,10 +1378,7 @@ TEST_CASE("sftp cancels a channel request whose reply never arrives", "[sftp][ch
     auto dummy_global = [](inbound_global_request) -> corral::Task<void> { co_return; };
 
     corral::run(fp.loop, [&]() -> corral::Task<void> {
-        CORRAL_WITH_NURSERY(n) {
-            co_await n.start(&client_session::run, &fp.client);
-            co_await n.start(&server_session::run, &fp.server);
-            auto [cec, sec] = co_await corral::allOf(fp.client.handshake(accept_host), fp.server.handshake());
+        auto [cec, sec] = co_await corral::allOf(fp.client.handshake(accept_host), fp.server.handshake());
             REQUIRE_FALSE(cec);
             REQUIRE_FALSE(sec);
             auto [aec, auth] = co_await corral::allOf(
@@ -1396,6 +1393,8 @@ TEST_CASE("sftp cancels a channel request whose reply never arrives", "[sftp][ch
             REQUIRE(std::get<1>(aec).success);
             REQUIRE_FALSE(auth);
 
+        co_await fp.client.serve(reject_inbound, reject_inbound, [&]() -> corral::Task<void> {
+        CORRAL_WITH_NURSERY(n) {
             std::vector<std::byte> version = frame(encoded([&](wire::writer& w) {
                 sftp::encode_version(w, 3);
             }));
@@ -1447,5 +1446,6 @@ TEST_CASE("sftp cancels a channel request whose reply never arrives", "[sftp][ch
             co_await fp.client.disconnect(disconnect_reason::by_application, "done");
             co_return corral::cancel;
         };
+        });
     }());
 }

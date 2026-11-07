@@ -337,20 +337,7 @@ std::string join_path(std::string_view dir, std::string_view name) {
     return out;
 }
 
-corral::Task<int> exercise(client_session& sess, std::string user, const keys::private_key& key,
-                           std::string workdir) {
-    if (auto ec = co_await sess.handshake([](const host_key_view&) -> corral::Task<bool> {
-            co_return true;
-        })) {
-        std::cerr << "FAIL handshake " << ec.message() << std::endl;
-        co_return 1;
-    }
-    auto [aec, auth] = co_await sess.auth_publickey(user, key);
-    if (aec || !auth.success) {
-        std::cerr << "FAIL auth " << aec.message() << std::endl;
-        co_return 1;
-    }
-
+corral::Task<int> exercise(client_session& sess, std::string user, std::string workdir) {
     auto opened = co_await open_sftp(sess);
     if (std::get<0>(opened) || !std::get<1>(opened)) {
         std::cerr << "FAIL handshake " << std::get<0>(opened).message() << std::endl;
@@ -652,9 +639,20 @@ corral::Task<int> exercise(client_session& sess, std::string user, const keys::p
 
 corral::Task<int> session_main(client_session& sess, std::string user, const keys::private_key& key,
                                std::string workdir) {
+    if (auto ec = co_await sess.handshake([](const host_key_view&) -> corral::Task<bool> {
+            co_return true;
+        })) {
+        std::cerr << "FAIL handshake " << ec.message() << std::endl;
+        co_return 1;
+    }
+    auto [aec, auth] = co_await sess.auth_publickey(user, key);
+    if (aec || !auth.success) {
+        std::cerr << "FAIL auth " << aec.message() << std::endl;
+        co_return 1;
+    }
     int rc = 1;
-    co_await run_with(sess, [&]() -> corral::Task<void> {
-        rc = co_await exercise(sess, std::move(user), key, std::move(workdir));
+    (void)co_await sess.serve(reject_inbound, reject_inbound, [&]() -> corral::Task<void> {
+        rc = co_await exercise(sess, std::move(user), std::move(workdir));
     });
     co_return rc;
 }

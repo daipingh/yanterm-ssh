@@ -33,6 +33,7 @@
 #include <string_view>
 #include <system_error>
 #include <tuple>
+#include <type_traits>
 #include <utility>
 #include <vector>
 
@@ -53,13 +54,32 @@ struct session_impl : core::handler {
         if (latch_ || !core_.failure()) return;
         latch(core_.failure(), std::string(core_.failure_detail()));
     }
+    // One waiter list for both pumps: output was queued, or a stalled read may proceed.
+    void wake_pumps() noexcept { pump_lot_.unparkAll(); }
     
-    // Calls may suspend only while run() is active and no error has been latched.
-    [[nodiscard]] bool closed() const noexcept { return !run_active_ || bool(latch_); }
+    [[nodiscard]] bool closed() const noexcept { return bool(latch_); }
     [[nodiscard]] bool inbound_queue_full() const noexcept;
+    // Sends DISCONNECT and latches session_closed unless already latched.
+    void close_locally(disconnect_reason reason, std::string_view description);
+    // serve()'s result: a by_application close from either side is not an error.
+    [[nodiscard]] std::error_code close_status() const noexcept;
     auth_result take_auth_response();
+
+    static constexpr std::size_t output_batch = 8;
+    std::size_t next_output(std::array<auv::buffer, output_batch>& bufs, std::size_t& bytes) const;
+    bool feed_buffered(std::size_t& accepted);
+    bool input_read(std::error_code ec, std::size_t n);
+    // Runs steps beside the read pump and a write pump. The read pump never
+    // finishes on its own, so a closed session does not cancel steps; steps
+    // finishing cancels the read pump, then the write pump drains and exits.
+    // The write pump is started first, so steps always observe writing_.
+    // steps() must return a non-void awaitable; that value is the phase result.
+    // Not a coroutine: the stop flag lives in the awaitable chain.
+    template <class Steps>
+    auto run_phase(Steps&& steps);
     corral::Task<void> read_pump();
-    corral::Task<void> write_pump();
+    // `stop` becomes true once steps have returned. Empty output then ends the pump.
+    corral::Task<void> write_pump(const bool& stop);
     corral::Task<std::tuple<std::error_code, auth_result>> wait_auth_response();
     void release_auth_stage() noexcept;
     void on_peer_identification(core::connection&, std::string_view) override {}
@@ -107,23 +127,45 @@ struct session_impl : core::handler {
     auv::stream stream_;
     core::connection core_;
 
-    bool run_active_ = false;
-    bool writer_done_ = false;
+    // Unread bytes survive between self-driven steps and into serve()'s pumps.
+    // The page is held only while such bytes remain.
+    struct recv_buffer {
+        static constexpr std::size_t capacity = memory::default_page_size;
+        std::byte* data = nullptr;
+        std::size_t off = 0;
+        std::size_t end = 0;
+
+        [[nodiscard]] bool empty() const noexcept { return off == end; }
+        void release(std::pmr::memory_resource* mr) noexcept;
+        void compact(std::pmr::memory_resource* mr) noexcept;
+        auv::buffer space(std::pmr::memory_resource* mr);
+    };
+    static_assert(recv_buffer::capacity > 4 + core::detail::max_packet_length + 64,
+                  "the receive buffer must hold one whole SSH binary packet");
+    recv_buffer in_;
+
+    bool serving_ = false;
+    bool reading_ = false;
+    bool writing_ = false;
+    // Peer DISCONNECT or a failed transport write: nothing further may be sent.
+    bool output_closed_ = false;
+    bool local_close_ = false;
     std::uint32_t max_pending_requests_ = default_max_pending_requests;
     std::error_code latch_{};
     std::string latch_detail_;
     disconnect_info disc_{};
     bool have_disc_ = false;
-    corral::ParkingLot write_lot_;
-    corral::ParkingLot unstall_lot_;
-    corral::ParkingLot out_space_lot_;
-    corral::ParkingLot flushed_lot_;
+    // Core delivered something the current phase's steps are waiting for.
+    corral::ParkingLot inbound_lot_;
+    // Output was queued, or a read blocked on a stall may continue.
+    corral::ParkingLot pump_lot_;
+    // A write finished or the write pump exited. Channel backpressure and disconnect wait here.
+    corral::ParkingLot written_lot_;
     corral::ParkingLot rekey_lot_;
     std::uint64_t rekey_gen_ = 0;
     corral::Event closed_ev_;
     std::function<void(bool always_display, std::string_view text, std::string_view language)>
         on_debug_;
-    corral::ParkingLot hs_lot_;
     bool hs_done_ = false;
     struct reply_waiter : detail::intrusive_list_item<reply_waiter> {
         std::uint64_t seq = 0;
@@ -173,11 +215,6 @@ struct session_impl : core::handler {
         bool challenge_outstanding = false;
     };
     std::unique_ptr<auth_stage> auth_;
-
-    corral::ParkingLot auth_lot_;
-
-    bool serving_ = false;
-    corral::ParkingLot serve_lot_;
 
     struct pending_inbound_request {
         core::channel_request_ticket ticket{};
@@ -244,7 +281,6 @@ struct session_impl : core::handler {
     void fail_reply_waiters(channel_state& st);
     void wake_reply_waiters();
     void unpark_live_channels();
-    void reject_pending_opens_and_globals();
     void reject_pending_inbound();
     std::optional<pending_inbound_open> take_pending_open();
     std::optional<pending_inbound_global> take_pending_global();
@@ -295,6 +331,7 @@ inline session_impl::session_impl(
 }
 
 inline session_impl::~session_impl() {
+    in_.release(mr_);
     for (auto it = live_channels_.begin(); it != live_channels_.end();) {
         channel_state& st = *it;
         assert(st.refs == 1);
@@ -329,12 +366,12 @@ inline void session_impl::on_host_key(core::connection&, core::host_key_ticket t
         return;
     }
     auth_->pending_verify = std::move(pending);
-    hs_lot_.unparkAll();
+    inbound_lot_.unparkAll();
 }
 
 inline void session_impl::on_handshake_done(core::connection&) {
     hs_done_ = true;
-    hs_lot_.unparkAll();
+    inbound_lot_.unparkAll();
 }
 
 inline void session_impl::on_rekey_done(core::connection&) {
@@ -354,6 +391,8 @@ inline void session_impl::on_disconnect(core::connection&, wire::disconnect_reas
     disc_.description.assign(description.begin(), description.end());
     disc_.language.assign(language.begin(), language.end());
     have_disc_ = true;
+    // RFC 4253 §11.1: nothing may be sent after receiving DISCONNECT.
+    output_closed_ = true;
     latch(code::peer_disconnected);
 }
 
@@ -368,7 +407,7 @@ inline void session_impl::on_auth_result(core::connection&, const auth::auth_res
     auth_->last_auth_methods.assign(result.methods.begin(), result.methods.end());
     auth_->pending_auth_resp = pending_auth_response{result};
     auth_->pending_auth_resp->result.methods = auth_->last_auth_methods;
-    auth_lot_.unparkAll();
+    inbound_lot_.unparkAll();
 }
 
 inline void session_impl::on_kbdint_request(core::connection&, core::kbdint_ticket ticket,
@@ -380,7 +419,7 @@ inline void session_impl::on_kbdint_request(core::connection&, core::kbdint_tick
     info.instruction.assign(request.instruction.begin(), request.instruction.end());
     info.prompts.assign(request.prompts.begin(), request.prompts.end());
     auth_->pending_info_req = std::move(info);
-    auth_lot_.unparkAll();
+    inbound_lot_.unparkAll();
 }
 
 inline void session_impl::on_auth_request(core::connection&, core::auth_ticket ticket,
@@ -396,7 +435,7 @@ inline void session_impl::on_auth_request(core::connection&, core::auth_ticket t
     req.public_blob.assign(request.public_blob.begin(), request.public_blob.end());
     req.password.assign(request.password);
     auth_->pending_auth_req = std::move(req);
-    auth_lot_.unparkAll();
+    inbound_lot_.unparkAll();
 }
 
 inline void session_impl::on_kbdint_response(core::connection&, core::auth_ticket,
@@ -410,17 +449,18 @@ inline void session_impl::on_kbdint_response(core::connection&, core::auth_ticke
         resp.responses.push_back(std::move(answer));
     }
     auth_->pending_info_resp = std::move(resp);
-    auth_lot_.unparkAll();
+    inbound_lot_.unparkAll();
 }
 
+// Before serve() nothing stalls reading for a full queue, so requests past the
+// bound are rejected instead.
 inline void session_impl::on_open_request(core::connection& c, core::open_ticket ticket,
                                           const channels::open_request_view& request) {
-    if (!serving_) {
+    if (!serving_ && pending_opens_.size() >= max_pending_requests_) {
         (void)c.resolve(ticket, channels::channel_open_verdict::rejected(
-                                  channels::channel_open_reason::administratively_prohibited,
-                                  "serve not installed"));
-        write_lot_.unparkAll();
-        unstall_lot_.unparkAll();
+                                  channels::channel_open_reason::resource_shortage,
+                                  "too many pending requests"));
+        wake_pumps();
         return;
     }
     const auto ref = core::connection::channel_ref_of(ticket);
@@ -437,7 +477,7 @@ inline void session_impl::on_open_request(core::connection& c, core::open_ticket
     o.socket_path.assign(request.socket_path.begin(), request.socket_path.end());
     o.extra.assign(request.extra.begin(), request.extra.end());
     pending_opens_.push_back(std::move(o));
-    serve_lot_.unparkAll();
+    inbound_lot_.unparkAll();
 }
 
 inline void session_impl::on_open_result(core::connection&, core::channel_ref, void* user,
@@ -468,8 +508,7 @@ inline void session_impl::on_channel_request(core::connection& c, core::channel_
         return;
     }
     (void)c.resolve(ticket, false);
-    write_lot_.unparkAll();
-    unstall_lot_.unparkAll();
+    wake_pumps();
 }
 
 inline void session_impl::on_channel_reply(core::connection&, core::channel_ref, void* user,
@@ -479,10 +518,9 @@ inline void session_impl::on_channel_reply(core::connection&, core::channel_ref,
 
 inline void session_impl::on_global_request(core::connection& c, core::global_request_ticket ticket,
                                             const channels::request_view& request) {
-    if (!serving_) {
+    if (!serving_ && pending_globals_.size() >= max_pending_requests_) {
         (void)c.resolve(ticket, false);
-        write_lot_.unparkAll();
-        unstall_lot_.unparkAll();
+        wake_pumps();
         return;
     }
     pending_inbound_global g;
@@ -491,7 +529,7 @@ inline void session_impl::on_global_request(core::connection& c, core::global_re
     g.payload.assign(request.payload.begin(), request.payload.end());
     g.want_reply = request.want_reply;
     pending_globals_.push_back(std::move(g));
-    serve_lot_.unparkAll();
+    inbound_lot_.unparkAll();
 }
 
 inline void session_impl::on_global_reply(core::connection&, bool success,
@@ -533,7 +571,7 @@ inline void session_impl::on_closed(core::connection&, core::channel_ref, void* 
 
 inline void session_impl::on_released(core::connection&, core::channel_ref, void* user) {
     if (user != nullptr) release(static_cast<channel_state*>(user));
-    unstall_lot_.unparkAll();
+    wake_pumps();
 }
 
 inline void session_impl::latch(std::error_code ec, std::string detail) {
@@ -541,18 +579,15 @@ inline void session_impl::latch(std::error_code ec, std::string detail) {
         latch_ = ec;
         latch_detail_ = std::move(detail);
     }
-    closed_ev_.trigger();
     wake_reply_waiters();
-    write_lot_.unparkAll();
-    unstall_lot_.unparkAll();
-    out_space_lot_.unparkAll();
-    flushed_lot_.unparkAll();
+    inbound_lot_.unparkAll();
+    wake_pumps();
+    written_lot_.unparkAll();
     rekey_lot_.unparkAll();
-    hs_lot_.unparkAll();
-    auth_lot_.unparkAll();
-    serve_lot_.unparkAll();
     unpark_live_channels();
     reject_pending_inbound();
+    // until_closed() runs only after all library-side cleanup above is done.
+    closed_ev_.trigger();
 }
 
 inline void session_impl::complete_channel_reply(channel_state& st, bool success) {
@@ -629,7 +664,7 @@ inline void session_impl::unpark_live_channels() {
     }
 }
 
-inline void session_impl::reject_pending_opens_and_globals() {
+inline void session_impl::reject_pending_inbound() {
     while (auto o = take_pending_open()) {
         (void)core_.resolve(o->ticket, channels::channel_open_verdict::rejected(
                                  channels::channel_open_reason::administratively_prohibited,
@@ -638,14 +673,9 @@ inline void session_impl::reject_pending_opens_and_globals() {
     while (auto g = take_pending_global()) {
         (void)core_.resolve(g->ticket, false);
     }
-}
-
-inline void session_impl::reject_pending_inbound() {
-    reject_pending_opens_and_globals();
     // A channel ticket still ahead of the in-flight head cannot be settled.
     // Leave it at the front so the serve_requests guard can reject the head
-    // first, then this one. Globals are dropped: nothing retries that queue
-    // after run_active_ becomes false.
+    // first, then this one. Nothing retries the queue once serve() returns.
     for (auto it = live_channels_.begin(); it != live_channels_.end();) {
         channel_state& st = *it++;
         while (!st.pending_reqs.empty()) {
@@ -673,115 +703,178 @@ inline std::optional<session_impl::pending_inbound_global> session_impl::take_pe
     return g;
 }
 
-inline corral::Task<void> session_impl::read_pump() {
-    // One page-sized block, held only while unread bytes remain.
-    static constexpr std::size_t inbuf_size = memory::default_page_size;
-    static_assert(inbuf_size > 4 + core::detail::max_packet_length + 64,
-                  "the receive block must hold one whole SSH binary packet");
-    struct recv_block {
-        std::pmr::memory_resource* mr = nullptr;
-        std::byte* data = nullptr;
-        std::size_t off = 0;
-        std::size_t end = 0;
+inline void session_impl::close_locally(disconnect_reason reason, std::string_view description) {
+    if (latch_) return;
+    local_close_ = true;
+    (void)core_.disconnect(reason, description);
+    latch(code::session_closed);
+}
 
-        explicit recv_block(std::pmr::memory_resource* resource) noexcept : mr(resource) {}
-        recv_block(const recv_block&) = delete;
-        recv_block& operator=(const recv_block&) = delete;
-        ~recv_block() { release(); }
+inline std::error_code session_impl::close_status() const noexcept {
+    if (local_close_) return {};
+    if (have_disc_ && disc_.reason == disconnect_reason::by_application) return {};
+    return latch_;
+}
 
-        void release() noexcept {
-            if (data == nullptr) return;
-            mr->deallocate(data, inbuf_size, alignof(std::max_align_t));
-            data = nullptr;
-            off = 0;
-            end = 0;
-        }
+inline void session_impl::recv_buffer::release(std::pmr::memory_resource* mr) noexcept {
+    if (data == nullptr) return;
+    mr->deallocate(data, capacity, alignof(std::max_align_t));
+    data = nullptr;
+    off = 0;
+    end = 0;
+}
 
-        std::byte* acquire() {
-            if (data == nullptr) {
-                data = static_cast<std::byte*>(mr->allocate(inbuf_size, alignof(std::max_align_t)));
-            }
-            return data;
-        }
-    };
-
-    auto inbound_blocked = [this] {
-        return core_.inbound_requests_stalled() || inbound_queue_full();
-    };
-
-    recv_block in{mr_};
-    while (!closed()) {
-        if (in.off < in.end) {
-            std::size_t accepted = 0;
-            auto ec = core_.feed(std::span(in.data + in.off, in.end - in.off), accepted);
-            in.off += accepted;
-            write_lot_.unparkAll();
-            if (ec) {
-                note_core_failure();
-                latch(ec);
-                co_return;
-            }
-            if (in.off == in.end) in.release();
-            if (accepted != 0 && !inbound_blocked()) continue;
-        }
-        // Bytes already read stay a single feed, so a blocked inbound side
-        // waits here even with an empty buffer.
-        if (inbound_blocked()) {
-            co_await unstall_lot_.park();
-            continue;
-        }
-        if (in.off == in.end) {
-            in.release();
-        } else if (in.off > 0) {
-            std::memmove(in.data, in.data + in.off, in.end - in.off);
-            in.end -= in.off;
-            in.off = 0;
-        }
-        auto [ec, n] = co_await stream_.read([&in] {
-            std::byte* buf = in.acquire();
-            return auv::buffer(reinterpret_cast<char*>(buf + in.end), inbuf_size - in.end);
-        });
-        if (ec) {
-            latch(ec, core::detail::format_transport_io("read", ec));
-            co_return;
-        }
-        if (n == 0) {
-            const auto eof = auv::make_error_code(auv::errc::eof);
-            latch(eof, core::detail::format_transport_io("read", eof));
-            co_return;
-        }
-        in.end += n;
+inline void session_impl::recv_buffer::compact(std::pmr::memory_resource* mr) noexcept {
+    if (empty()) {
+        release(mr);
+    } else if (off > 0) {
+        std::memmove(data, data + off, end - off);
+        end -= off;
+        off = 0;
     }
 }
 
-inline corral::Task<void> session_impl::write_pump() {
-    std::array<std::span<const std::byte>, 8> segs{};
-    std::array<auv::buffer, 8> bufs{};
-    for (;;) {
-        // RFC 4253 §11.1: nothing may be sent after receiving DISCONNECT.
-        if (have_disc_) break;
-        if (core_.pending_output_bytes() == 0) {
-            if (latch_) break;
-            co_await write_lot_.park();
+inline auv::buffer session_impl::recv_buffer::space(std::pmr::memory_resource* mr) {
+    if (data == nullptr) {
+        data = static_cast<std::byte*>(mr->allocate(capacity, alignof(std::max_align_t)));
+    }
+    return auv::buffer(reinterpret_cast<char*>(data + end), capacity - end);
+}
+
+inline std::size_t session_impl::next_output(std::array<auv::buffer, output_batch>& bufs,
+                                             std::size_t& bytes) const {
+    bytes = 0;
+    if (output_closed_ || core_.pending_output_bytes() == 0) return 0;
+    std::array<std::span<const std::byte>, output_batch> segs{};
+    const std::size_t n = core_.pending_output(segs);
+    for (std::size_t i = 0; i < n; ++i) {
+        bufs[i] = auv::buffer(reinterpret_cast<const char*>(segs[i].data()), segs[i].size());
+        bytes += segs[i].size();
+    }
+    return n;
+}
+
+inline bool session_impl::feed_buffered(std::size_t& accepted) {
+    accepted = 0;
+    if (in_.empty()) return true;
+    auto ec = core_.feed(std::span(in_.data + in_.off, in_.end - in_.off), accepted);
+    in_.off += accepted;
+    wake_pumps();
+    if (ec) {
+        note_core_failure();
+        latch(ec);
+        return false;
+    }
+    if (in_.empty()) in_.release(mr_);
+    return true;
+}
+
+inline bool session_impl::input_read(std::error_code ec, std::size_t n) {
+    if (!ec && n == 0) ec = auv::make_error_code(auv::errc::eof);
+    if (ec) {
+        if (in_.empty()) in_.release(mr_);
+        latch(ec, core::detail::format_transport_io("read", ec));
+        return false;
+    }
+    in_.end += n;
+    return true;
+}
+
+template <class Steps>
+inline auto session_impl::run_phase(Steps&& steps) {
+    return corral::just(false) | corral::then([&](bool& stop) {
+        assert(!reading_ && !writing_);
+        return corral::allOf(
+            corral::anyOf(read_pump(), write_pump(stop)),
+            steps() | corral::then([&](auto v) {
+                stop = true;
+                wake_pumps();
+                return corral::just(std::move(v));
+            }));
+    }) | corral::then([](auto t) { return corral::just(std::move(std::get<1>(t))); });
+}
+
+inline corral::Task<void> session_impl::read_pump() {
+    struct reading_guard {
+        session_impl* s;
+        explicit reading_guard(session_impl* p) : s(p) {
+            assert(!s->reading_);
+            s->reading_ = true;
+        }
+        reading_guard(const reading_guard&) = delete;
+        reading_guard& operator=(const reading_guard&) = delete;
+        ~reading_guard() { s->reading_ = false; }
+    } guard{this};
+
+    // Never co_returns: a closed session suspends here so the phase's steps
+    // are not cancelled. Only cancelling the phase ends this pump.
+    while (!closed()) {
+        // Before serve() nothing drains the inbound queues; their callbacks
+        // reject past the bound instead.
+        const bool blocked =
+            core_.inbound_requests_stalled() || (serving_ && inbound_queue_full());
+        if (!blocked && !in_.empty()) {
+            std::size_t accepted = 0;
+            if (!feed_buffered(accepted) || accepted != 0) continue;
+        }
+        in_.compact(mr_);
+        if (!blocked) {
+            auto [ec, n] = co_await stream_.read([this] { return in_.space(mr_); });
+            // A close that won the race drops this read. Feeding it would parse
+            // past the latch, and a later error must not replace the recorded one.
+            if (closed() || !input_read(ec, n)) continue;
             continue;
         }
-        const std::size_t n = core_.pending_output(segs);
-        std::size_t bytes = 0;
-        for (std::size_t i = 0; i < n; ++i) {
-            bufs[i] = auv::buffer(reinterpret_cast<const char*>(segs[i].data()), segs[i].size());
-            bytes += segs[i].size();
+        // Core takes nothing while blocked, but reading on into the buffer
+        // still lets a transport EOF or read error reach the latch.
+        if (in_.end == recv_buffer::capacity) {
+            co_await pump_lot_.park();
+            continue;
         }
-        auto ec = co_await stream_.write(bufs.data(), n);
+        // A cancelled read delivers nothing, so the session stays consistent.
+        auto r = co_await corral::anyOf(stream_.read([this] { return in_.space(mr_); }),
+                                        pump_lot_.park());
+        if (closed() || !std::get<0>(r)) continue;
+        auto [ec, n] = *std::get<0>(r);
+        if (!input_read(ec, n)) continue;
+    }
+    co_await corral::suspendForever;
+}
+
+inline corral::Task<void> session_impl::write_pump(const bool& stop) {
+    struct writing_guard {
+        session_impl* s;
+        explicit writing_guard(session_impl* p) : s(p) {
+            assert(!s->writing_);
+            s->writing_ = true;
+        }
+        writing_guard(const writing_guard&) = delete;
+        writing_guard& operator=(const writing_guard&) = delete;
+        ~writing_guard() {
+            s->writing_ = false;
+            s->written_lot_.unparkAll();
+        }
+    } guard{this};
+
+    std::array<auv::buffer, output_batch> bufs{};
+    while (!output_closed_) {
+        std::size_t bytes = 0;
+        const std::size_t n = next_output(bufs, bytes);
+        if (n == 0) {
+            if (closed() || stop) co_return;
+            co_await pump_lot_.park();
+            continue;
+        }
+        // A write error latches and closes output; the next pass exits.
+        const std::error_code ec = co_await stream_.write(bufs.data(), n);
         if (ec) {
+            output_closed_ = true;
             latch(ec, core::detail::format_transport_io("write", ec));
-            break;
+            continue;
         }
         core_.consume_output(bytes);
-        out_space_lot_.unparkAll();
-        flushed_lot_.unparkAll();
+        written_lot_.unparkAll();
     }
-    writer_done_ = true;
-    flushed_lot_.unparkAll();
 }
 
 inline void session_impl::release_auth_stage() noexcept { auth_.reset(); }
@@ -803,7 +896,7 @@ inline corral::Task<std::tuple<std::error_code, auth_result>> session_impl::wait
             if (r.success) release_auth_stage();
             co_return {std::error_code{}, r};
         }
-        co_await auth_lot_.park();
+        co_await inbound_lot_.park();
     }
 }
 

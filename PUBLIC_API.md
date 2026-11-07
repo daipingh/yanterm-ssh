@@ -115,9 +115,9 @@ namespace yanterm::ssh
 class session                   // 会话基类：I/O 循环、开通道、全局请求
 class client_session            // 客户端：handshake 与认证
 class server_session            // 服务端：handshake 与 authenticate
-run_with                        // 启动 session::run 并跑用户协程
+struct reject_inbound_t         // serve 的入站处理器：一律拒绝
+reject_inbound                  // reject_inbound_t 的实例
 
-session::run
 session::disconnect
 session::serve
 session::open_session_channel
@@ -133,6 +133,7 @@ session::cancel_streamlocal_forward
 session::send_global_request
 session::rekey
 session::send_keepalive
+session::until_closed
 session::failure
 session::failure_detail
 session::disconnected

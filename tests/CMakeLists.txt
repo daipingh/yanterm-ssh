@@ -157,7 +157,7 @@ if(OpenSSL_FOUND)
         test_handles.cpp
         test_global_requests.cpp
         test_memory_pipe.cpp
-        test_session_run.cpp
+        test_session_lifecycle.cpp
         test_session_handshake.cpp
         test_session_auth.cpp
         test_session_channel.cpp
