@@ -13,6 +13,7 @@ int fuzz_keys_one(std::span<const std::byte> input);
 int fuzz_wire_one(std::span<const std::byte> input);
 int fuzz_connection_prekex_one(std::span<const std::byte> input);
 int fuzz_sftp_one(std::span<const std::byte> input);
+int fuzz_agent_one(std::span<const std::byte> input);
 }  // namespace yanterm::ssh::fuzz
 
 namespace {
@@ -95,6 +96,9 @@ int main(int argc, char** argv) {
         return 1;
     }
     if (!replay_directory(root / "sftp", &yanterm::ssh::fuzz::fuzz_sftp_one)) {
+        return 1;
+    }
+    if (!replay_directory(root / "agent", &yanterm::ssh::fuzz::fuzz_agent_one)) {
         return 1;
     }
     return 0;

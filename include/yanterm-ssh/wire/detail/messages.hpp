@@ -180,9 +180,11 @@ struct userauth_request_password {
 struct userauth_request_publickey {
     std::string_view user;
     std::string_view service = "ssh-connection";
+    std::string_view method = "publickey";
     bool has_signature = false;
     std::string_view algorithm;
     std::span<const std::byte> blob;
+    std::span<const std::byte> server_host_key{};
     std::span<const std::byte> signature{};
 
     bool decode(reader& r) noexcept;

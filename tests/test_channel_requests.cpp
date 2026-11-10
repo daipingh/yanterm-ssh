@@ -297,3 +297,77 @@ TEST_CASE("all inbound channel requests are delivered while earlier views stay v
     REQUIRE_FALSE(server.conn.resolve(head_ticket, true));
     (void)ids;
 }
+
+TEST_CASE("core rejects an unsolicited agent channel before the handler", "[agent][forward]") {
+    auto p = prov();
+    auto hm = make_ed25519_host(p);
+    auto client = make_client(p);
+    auto server = make_server(p);
+    bring_up_authed(client, server, hm);
+
+    channels::channel_open_spec spec;
+    spec.type = channels::channel_type::auth_agent;
+    core::channel_ref sid{};
+    REQUIRE_FALSE(server.conn.open_channel(spec, nullptr, sid));
+
+    std::vector<recording_handler::recorded_event> cap;
+    transfer_all_capture(server, client, cap);
+    REQUIRE(find_first<recording_handler::channel_open_request>(cap) == nullptr);
+    REQUIRE_FALSE(client.conn.failure());
+
+    transfer_all_capture(client, server, cap);
+    const auto* failed = find_first<recording_handler::channel_open_failed>(cap);
+    REQUIRE(failed);
+    REQUIRE(failed->ref == sid);
+    REQUIRE(failed->reason == channels::channel_open_reason::administratively_prohibited);
+    REQUIRE_FALSE(server.conn.failure());
+}
+
+TEST_CASE("agent forwarding uses RFC names after agent-forward and legacy names without it",
+          "[agent][forward]") {
+    struct row {
+        const char* name;
+        bool advertise;
+        const char* request;
+        const char* open_type;
+    };
+    const row rows[] = {
+        {"advertised", true, "agent-req", "agent-connect"},
+        {"legacy", false, "auth-agent-req@openssh.com", "auth-agent@openssh.com"},
+    };
+    for (const auto& row : rows) {
+        INFO(row.name);
+        auto p = prov();
+        auto hm = make_ed25519_host(p);
+        core::config cfg;
+        cfg.advertise_ext_info = row.advertise;
+        auto client = make_client(p);
+        auto server = make_server(p, cfg);
+        bring_up_authed(client, server, hm);
+        REQUIRE(client.conn.supports_agent_forward() == row.advertise);
+
+        const auto ids = open_session(client, server);
+        REQUIRE_FALSE(client.conn.request_auth_agent(ids.client_ch));
+        std::vector<recording_handler::recorded_event> cap;
+        transfer_all_capture(client, server, cap);
+        const auto* req = find_first<recording_handler::channel_request>(cap);
+        REQUIRE(req);
+        REQUIRE(req->type == row.request);
+        REQUIRE(req->want_reply);
+        REQUIRE(req->payload.empty());
+        REQUIRE_FALSE(server.conn.resolve(req->ticket, true));
+
+        channels::channel_open_spec spec;
+        spec.type = channels::channel_type::auth_agent;
+        core::channel_ref opened{};
+        REQUIRE_FALSE(server.conn.open_channel(spec, nullptr, opened));
+        cap.clear();
+        transfer_all_capture(server, client, cap);
+        const auto* inbound = find_first<recording_handler::channel_open_request>(cap);
+        REQUIRE(inbound);
+        REQUIRE(inbound->type == channels::channel_type::auth_agent);
+        REQUIRE(inbound->type_name == row.open_type);
+        REQUIRE_FALSE(client.conn.failure());
+        REQUIRE_FALSE(server.conn.failure());
+    }
+}

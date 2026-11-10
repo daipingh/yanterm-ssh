@@ -188,6 +188,58 @@ TEST_CASE("manual rekey completes with rekey_done", "[rekey]") {
             == sid_before);
 }
 
+TEST_CASE("first host key and KEX signature stay empty until the handshake and verify H0 after rekey",
+          "[rekey][auth]") {
+    crypto::provider p = prov();
+    auto hm = make_ed25519_host(p);
+    auto client = make_client(p);
+    auto server = make_server(p);
+    configure_server(server, hm);
+    REQUIRE(client.conn.initial_host_key().empty());
+    REQUIRE(client.conn.initial_kex_signature().empty());
+    REQUIRE(server.conn.initial_host_key().empty());
+    REQUIRE(server.conn.initial_kex_signature().empty());
+    REQUIRE_FALSE(client.conn.supports_hostbound_publickey());
+
+    REQUIRE(run_handshake(client, server));
+    REQUIRE(client.conn.supports_hostbound_publickey());
+    const auto host = std::vector<std::byte>{client.conn.initial_host_key().begin(),
+                                             client.conn.initial_host_key().end()};
+    const auto sig = std::vector<std::byte>{client.conn.initial_kex_signature().begin(),
+                                            client.conn.initial_kex_signature().end()};
+    const auto sid =
+        std::vector<std::byte>{client.conn.session_id().begin(), client.conn.session_id().end()};
+    REQUIRE(host == hm.blob);
+    REQUIRE(std::vector<std::byte>{server.conn.initial_host_key().begin(),
+                                   server.conn.initial_host_key().end()} == host);
+    REQUIRE(std::vector<std::byte>{server.conn.initial_kex_signature().begin(),
+                                   server.conn.initial_kex_signature().end()} == sig);
+    REQUIRE_FALSE(sig.empty());
+
+    core::detail::host_key_view key;
+    REQUIRE_FALSE(core::detail::parse_host_key(host, key));
+    REQUIRE_FALSE(core::detail::verify_signature(p, key, "ssh-ed25519", sig, sid));
+    auto flipped = sig;
+    flipped.back() ^= std::byte{0x01};
+    REQUIRE(core::detail::verify_signature(p, key, "ssh-ed25519", flipped, sid)
+            == code::signature_verification_failed);
+
+    rekey_capture cap;
+    REQUIRE_FALSE(client.conn.rekey());
+    REQUIRE(drive_rekey(client, server, cap));
+    REQUIRE(cap.client_rekey_done == 1);
+    REQUIRE(std::vector<std::byte>{client.conn.initial_host_key().begin(),
+                                   client.conn.initial_host_key().end()} == host);
+    REQUIRE(std::vector<std::byte>{client.conn.initial_kex_signature().begin(),
+                                   client.conn.initial_kex_signature().end()} == sig);
+    REQUIRE(std::vector<std::byte>{client.conn.session_id().begin(), client.conn.session_id().end()}
+            == sid);
+    REQUIRE(std::vector<std::byte>{server.conn.initial_host_key().begin(),
+                                   server.conn.initial_host_key().end()} == host);
+    REQUIRE_FALSE(core::detail::verify_signature(p, key, "ssh-ed25519", sig, sid));
+    REQUIRE(client.conn.supports_hostbound_publickey());
+}
+
 TEST_CASE("post-rekey IGNORE still works", "[rekey]") {
     crypto::provider p = prov();
     auto hm = make_ed25519_host(p);

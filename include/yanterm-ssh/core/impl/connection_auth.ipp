@@ -202,6 +202,19 @@ YANTERM_SSH_INLINE std::error_code connection::send_auth_banner(std::string_view
     return write_control_packet(payload.data());
 }
 
+YANTERM_SSH_INLINE std::error_code connection::select_publickey_shape(
+    std::string_view& method, std::span<const std::byte>& server_host_key) const {
+    if (!hostbound_publickey_) {
+        method = auth::method_publickey;
+        server_host_key = {};
+        return {};
+    }
+    if (first_host_key_blob_.empty()) return code::invalid_state;
+    method = auth::method_hostbound_publickey;
+    server_host_key = first_host_key_blob_;
+    return {};
+}
+
 YANTERM_SSH_INLINE std::error_code connection::auth_publickey(std::string_view user, std::span<const std::byte> public_blob,
                                const crypto::private_key_material& priv) {
     publickey_sign_request req;
@@ -249,9 +262,12 @@ YANTERM_SSH_INLINE std::error_code connection::auth_publickey_sign_request(
     if (role_ != role::client || auth_->phase != detail::auth_phase::ready) {
         return code::invalid_state;
     }
+    std::string_view method;
+    std::span<const std::byte> server_host_key;
+    if (auto ec = select_publickey_shape(method, server_host_key)) return ec;
     if (auto ec = auth_select_publickey_sig(public_blob, req)) return ec;
     detail::write_publickey_signed_data(out, session_id_, user, auth::service_connection,
-                                        req.algorithm, public_blob);
+                                        req.algorithm, public_blob, method, server_host_key);
     return {};
 }
 
@@ -262,6 +278,9 @@ YANTERM_SSH_INLINE std::error_code connection::auth_publickey_signed(
     if (role_ != role::client || auth_->phase != detail::auth_phase::ready) {
         return code::invalid_state;
     }
+    std::string_view method;
+    std::span<const std::byte> server_host_key;
+    if (auto ec = select_publickey_shape(method, server_host_key)) return ec;
     publickey_sign_request req;
     if (auto ec = auth_select_publickey_sig(public_blob, req)) return ec;
     wire::reader r{signature};
@@ -272,13 +291,15 @@ YANTERM_SSH_INLINE std::error_code connection::auth_publickey_signed(
     }
     // An agent that ignores the RSA SHA-2 flags answers with an ssh-rsa signature.
     if (sig_alg != req.algorithm) return code::sign_failure;
-    return auth_client_start(auth::method_publickey, false, [&]() -> std::error_code {
+    return auth_client_start(method, false, [&]() -> std::error_code {
         wire::detail::userauth_request_publickey msg;
         msg.user = user;
         msg.service = auth::service_connection;
+        msg.method = method;
         msg.has_signature = true;
         msg.algorithm = req.algorithm;
         msg.blob = public_blob;
+        msg.server_host_key = server_host_key;
         msg.signature = signature;
         wire::writer w;
         msg.encode(w);
@@ -292,15 +313,20 @@ YANTERM_SSH_INLINE std::error_code connection::auth_publickey_query(std::string_
     if (role_ != role::client || auth_->phase != detail::auth_phase::ready) {
         return code::invalid_state;
     }
+    std::string_view method;
+    std::span<const std::byte> server_host_key;
+    if (auto ec = select_publickey_shape(method, server_host_key)) return ec;
     publickey_sign_request req;
     if (auto ec = auth_select_publickey_sig(public_blob, req)) return ec;
-    return auth_client_start(auth::method_publickey, true, [&]() -> std::error_code {
+    return auth_client_start(method, true, [&]() -> std::error_code {
         wire::detail::userauth_request_publickey msg;
         msg.user = user;
         msg.service = auth::service_connection;
+        msg.method = method;
         msg.has_signature = false;
         msg.algorithm = req.algorithm;
         msg.blob = public_blob;
+        msg.server_host_key = server_host_key;
         wire::writer w;
         msg.encode(w);
         return write_control_packet(w.data());
@@ -352,7 +378,7 @@ YANTERM_SSH_INLINE std::error_code connection::auth_resolve_verdict(std::uint64_
         return code::invalid_state;
     }
     if (verdict.kind == auth::verdict_kind::success) {
-        if (auth_->method == auth::method_publickey && !auth_->pk_has_signature) {
+        if (auth::is_publickey_method(auth_->method) && !auth_->pk_has_signature) {
             wire::detail::userauth_pk_ok msg;
             msg.algorithm = auth_->pk_alg;
             msg.blob = auth_->pk_blob;
@@ -495,7 +521,7 @@ YANTERM_SSH_INLINE std::error_code connection::auth_on_client_payload(
         if (auth_->method == auth::method_kbdint) {
             return auth_take_info_request(payload);
         }
-        if (auth_->method != auth::method_publickey || !auth_->publickey_query) {
+        if (!auth::is_publickey_method(auth_->method) || !auth_->publickey_query) {
             return code::unexpected_message;
         }
         wire::reader r{payload};
@@ -559,18 +585,21 @@ YANTERM_SSH_INLINE std::error_code connection::auth_on_server_payload(
                 return code::invalid_format;
             }
             auth_->clear_pk_fields();
-        } else if (method == auth::method_publickey) {
+        } else if (auth::is_publickey_method(method)) {
+            const bool hostbound = method == auth::method_hostbound_publickey;
             bool has_sig = false;
             std::string_view alg;
             std::span<const std::byte> blob;
+            std::span<const std::byte> server_host_key;
             if (!r.read_bool(has_sig) || !r.read_string(alg) || !r.read_string(blob)) {
                 return code::invalid_format;
             }
+            if (hostbound && !r.read_string(server_host_key)) return code::invalid_format;
             if (has_sig && !r.read_string(signature)) {
                 return code::invalid_format;
             }
             if (!r.empty()) return code::invalid_format;
-            if (!wire::name_list{accepted_publickey_algorithms_}.contains(alg)) {
+            const auto reject_publickey = [&]() -> std::error_code {
                 auth_->clear_pk_fields();
                 const std::string_view methods =
                     auth_->have_app_failure ? std::string_view{auth_->last_failure_methods}
@@ -578,19 +607,24 @@ YANTERM_SSH_INLINE std::error_code connection::auth_on_server_payload(
                 if (auto ec = auth_send_failure(methods, false)) return ec;
                 auth_->phase = detail::auth_phase::ready;
                 return {};
+            };
+            if (!wire::name_list{accepted_publickey_algorithms_}.contains(alg)) {
+                return reject_publickey();
+            }
+            if (hostbound
+                && (server_host_key.size() != first_host_key_blob_.size()
+                    || !std::equal(server_host_key.begin(), server_host_key.end(),
+                                   first_host_key_blob_.begin()))) {
+                return reject_publickey();
             }
             auth_->pk_has_signature = has_sig;
             auth_->pk_alg.assign(alg.begin(), alg.end());
             auth_->pk_blob.assign(blob.begin(), blob.end());
             if (has_sig) {
-                if (detail::verify_userauth_publickey(p_, session_id_, auth_->user, auth_->service,
-                                                      auth_->pk_alg, auth_->pk_blob, signature)) {
-                    const std::string_view methods =
-                        auth_->have_app_failure ? std::string_view{auth_->last_failure_methods}
-                                                : auth::method_publickey;
-                    if (auto ec = auth_send_failure(methods, false)) return ec;
-                    auth_->phase = detail::auth_phase::ready;
-                    return {};
+                if (detail::verify_userauth_publickey(
+                        p_, session_id_, auth_->user, auth_->service, auth_->pk_alg, auth_->pk_blob,
+                        signature, method, server_host_key)) {
+                    return reject_publickey();
                 }
             }
         } else if (method == auth::method_kbdint) {

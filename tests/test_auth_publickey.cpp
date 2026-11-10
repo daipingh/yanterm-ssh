@@ -9,11 +9,13 @@
 #include <yanterm-ssh/detail/error.hpp>
 #include <yanterm-ssh/keys/public_key.hpp>
 
+#include <algorithm>
 #include <array>
 #include <cstddef>
 #include <span>
 #include <string>
 #include <string_view>
+#include <utility>
 #include <vector>
 
 using namespace yanterm::ssh;
@@ -67,7 +69,7 @@ TEST_CASE("ed25519 publickey auth succeeds", "[auth][publickey]") {
         if (!is_client && std::holds_alternative<recording_handler::auth_request>(ev)) {
             REQUIRE(std::get<recording_handler::auth_request>(ev).user == "alice");
             REQUIRE(std::get<recording_handler::auth_request>(ev).service == "ssh-connection");
-            REQUIRE(std::get<recording_handler::auth_request>(ev).method == "publickey");
+            REQUIRE(std::get<recording_handler::auth_request>(ev).method == auth::method_hostbound_publickey);
             REQUIRE(std::get<recording_handler::auth_request>(ev).has_signature);
             REQUIRE(std::get<recording_handler::auth_request>(ev).algorithm == "ssh-ed25519");
             REQUIRE(std::vector<std::byte>(std::get<recording_handler::auth_request>(ev).public_blob.begin(), std::get<recording_handler::auth_request>(ev).public_blob.end())
@@ -143,7 +145,7 @@ TEST_CASE("unsigned probe PK_OK then signed success", "[auth][publickey][pkok]")
     REQUIRE(run_auth_loopback(client, server, [&](bool is_client, const recording_handler::recorded_event& ev) {
         if (!is_client && std::holds_alternative<recording_handler::auth_request>(ev)) {
             if (!std::get<recording_handler::auth_request>(ev).has_signature) {
-                REQUIRE(std::get<recording_handler::auth_request>(ev).method == "publickey");
+                REQUIRE(std::get<recording_handler::auth_request>(ev).method == auth::method_hostbound_publickey);
                 REQUIRE(std::get<recording_handler::auth_request>(ev).algorithm == "ssh-ed25519");
                 REQUIRE(std::vector<std::byte>(std::get<recording_handler::auth_request>(ev).public_blob.begin(),
                                                std::get<recording_handler::auth_request>(ev).public_blob.end())
@@ -151,7 +153,7 @@ TEST_CASE("unsigned probe PK_OK then signed success", "[auth][publickey][pkok]")
                 saw_query = true;
                 server.conn.resolve(std::get<recording_handler::auth_request>(ev).ticket, auth_verdict::success());
             } else {
-                REQUIRE(std::get<recording_handler::auth_request>(ev).method == "publickey");
+                REQUIRE(std::get<recording_handler::auth_request>(ev).method == auth::method_hostbound_publickey);
                 REQUIRE(std::get<recording_handler::auth_request>(ev).algorithm == "ssh-ed25519");
                 saw_signed = true;
                 server.conn.resolve(std::get<recording_handler::auth_request>(ev).ticket, auth_verdict::success());
@@ -233,7 +235,7 @@ TEST_CASE("rsa-sha2-256 userauth uses server-sig-algs", "[auth][publickey][rsa]"
     bool saw_resp = false;
     REQUIRE(run_auth_loopback(client, server, [&](bool is_client, const recording_handler::recorded_event& ev) {
         if (!is_client && std::holds_alternative<recording_handler::auth_request>(ev)) {
-            REQUIRE(std::get<recording_handler::auth_request>(ev).method == "publickey");
+            REQUIRE(std::get<recording_handler::auth_request>(ev).method == auth::method_hostbound_publickey);
             REQUIRE(std::get<recording_handler::auth_request>(ev).has_signature);
             REQUIRE(std::get<recording_handler::auth_request>(ev).algorithm == "rsa-sha2-256");
             core::detail::host_key_view req_blob;
@@ -273,7 +275,7 @@ TEST_CASE("rsa publickey query uses rsa-sha2-256", "[auth][publickey][rsa][pkok]
     REQUIRE(run_auth_loopback(client, server, [&](bool is_client, const recording_handler::recorded_event& ev) {
         if (!is_client && std::holds_alternative<recording_handler::auth_request>(ev)) {
             const auto& req = std::get<recording_handler::auth_request>(ev);
-            REQUIRE(req.method == "publickey");
+            REQUIRE(req.method == auth::method_hostbound_publickey);
             REQUIRE_FALSE(req.has_signature);
             REQUIRE(req.algorithm == "rsa-sha2-256");
             saw_query = true;
@@ -314,7 +316,7 @@ TEST_CASE("rsa key without rsa-sha2 in server-sig-algs is unsupported_algorithm"
     bool saw_ok = false;
     REQUIRE(run_auth_loopback(client, server, [&](bool is_client, const recording_handler::recorded_event& ev) {
         if (!is_client && std::holds_alternative<recording_handler::auth_request>(ev)) {
-            REQUIRE(std::get<recording_handler::auth_request>(ev).method == "publickey");
+            REQUIRE(std::get<recording_handler::auth_request>(ev).method == auth::method_hostbound_publickey);
             server.conn.resolve(std::get<recording_handler::auth_request>(ev).ticket, auth_verdict::success());
         }
         if (is_client && std::holds_alternative<recording_handler::auth_response>(ev)) {
@@ -599,4 +601,218 @@ TEST_CASE("explicit accepted_publickey_algorithms can opt into ssh-rsa and rsa-s
         REQUIRE_FALSE(client.conn.failure());
         REQUIRE_FALSE(server.conn.failure());
     }
+}
+
+namespace {
+
+void send_hostbound_ext(scripted_peer& peer, std::string_view version) {
+    const auto value = std::as_bytes(std::span{version.data(), version.size()});
+    const wire::detail::ext_info::entry entries[] = {{"publickey-hostbound@openssh.com", value}};
+    wire::detail::ext_info msg;
+    msg.entries = entries;
+    peer.send_msg(msg);
+}
+
+struct held_publickey : public wire::detail::userauth_request_publickey {
+    std::vector<std::byte> raw;
+
+    explicit held_publickey(std::vector<std::byte> bytes) : raw(std::move(bytes)) {
+        wire::reader reader{raw};
+        REQUIRE(decode(reader));
+        REQUIRE(reader.empty());
+    }
+
+    held_publickey(const held_publickey&) = delete;
+    held_publickey& operator=(const held_publickey&) = delete;
+    held_publickey(held_publickey&&) = delete;
+    held_publickey& operator=(held_publickey&&) = delete;
+};
+
+held_publickey take_publickey(scripted_peer& peer) {
+    auto raw = peer.take(wire::msg::userauth_request);
+    REQUIRE(raw);
+    return held_publickey{std::move(*raw)};
+}
+
+}  // namespace
+
+TEST_CASE("publickey requests follow the host-bound capability already received", "[auth][publickey][hostbound]") {
+    user_key uk;
+    generate_user_key(prov(), crypto::sig_id::ed25519, 0, uk);
+
+    SECTION("no extension keeps the plain method") {
+        peer_session s{core::role::client};
+        s.handshake();
+        REQUIRE_FALSE(s.sut.conn.supports_hostbound_publickey());
+        REQUIRE_FALSE(s.sut.conn.auth_publickey_query("alice", uk.blob()));
+        REQUIRE_FALSE(s.peer.exchange(s.sut));
+        const auto query = take_publickey(s.peer);
+        REQUIRE(query.method == auth::method_publickey);
+        REQUIRE_FALSE(query.has_signature);
+        REQUIRE(query.server_host_key.empty());
+
+        wire::detail::userauth_failure fail;
+        const std::string_view methods[] = {"publickey"};
+        fail.out_methods = methods;
+        s.peer.send_msg(fail);
+        REQUIRE_FALSE(s.peer.exchange(s.sut));
+        REQUIRE_FALSE(s.peer.take(wire::msg::userauth_request));
+
+        REQUIRE_FALSE(s.sut.conn.auth_publickey("alice", uk.blob(), uk.priv));
+        REQUIRE_FALSE(s.peer.exchange(s.sut));
+        const auto signed_req = take_publickey(s.peer);
+        REQUIRE(signed_req.method == auth::method_publickey);
+        REQUIRE(signed_req.has_signature);
+        REQUIRE(signed_req.server_host_key.empty());
+        s.peer.send_msg(fail);
+        REQUIRE_FALSE(s.peer.exchange(s.sut));
+        REQUIRE_FALSE(s.peer.take(wire::msg::userauth_request));
+    }
+
+    SECTION("version 0 uses host-bound for the query and the signed request") {
+        peer_session s{core::role::client};
+        s.handshake();
+        send_hostbound_ext(s.peer, "0");
+        REQUIRE_FALSE(s.peer.exchange(s.sut));
+        REQUIRE(s.sut.conn.supports_hostbound_publickey());
+        const auto host = s.sut.conn.initial_host_key();
+        REQUIRE_FALSE(host.empty());
+
+        core::publickey_sign_request prepared;
+        wire::writer signed_data;
+        REQUIRE_FALSE(s.sut.conn.auth_publickey_sign_request("alice", uk.blob(), prepared, signed_data));
+        wire::reader signed_reader{signed_data.data()};
+        std::span<const std::byte> sid;
+        std::uint8_t id = 0;
+        std::string_view user;
+        std::string_view service;
+        std::string_view method;
+        REQUIRE(signed_reader.read_string(sid));
+        REQUIRE(signed_reader.read_byte(id));
+        REQUIRE(signed_reader.read_string(user));
+        REQUIRE(signed_reader.read_string(service));
+        REQUIRE(signed_reader.read_string(method));
+        REQUIRE(method == auth::method_hostbound_publickey);
+
+        REQUIRE_FALSE(s.sut.conn.auth_publickey_query("alice", uk.blob()));
+        REQUIRE_FALSE(s.peer.exchange(s.sut));
+        const auto query = take_publickey(s.peer);
+        REQUIRE(query.method == auth::method_hostbound_publickey);
+        REQUIRE_FALSE(query.has_signature);
+        REQUIRE(std::equal(query.server_host_key.begin(), query.server_host_key.end(), host.begin(),
+                           host.end()));
+
+        wire::detail::userauth_pk_ok pk_ok;
+        pk_ok.algorithm = "ssh-ed25519";
+        pk_ok.blob = uk.blob();
+        s.peer.send_msg(pk_ok);
+        REQUIRE_FALSE(s.peer.exchange(s.sut));
+
+        REQUIRE_FALSE(s.sut.conn.auth_publickey("alice", uk.blob(), uk.priv));
+        REQUIRE_FALSE(s.peer.exchange(s.sut));
+        const auto signed_req = take_publickey(s.peer);
+        REQUIRE(signed_req.method == auth::method_hostbound_publickey);
+        REQUIRE(signed_req.has_signature);
+        REQUIRE(std::equal(signed_req.server_host_key.begin(), signed_req.server_host_key.end(),
+                           host.begin(), host.end()));
+        wire::detail::userauth_failure fail;
+        const std::string_view methods[] = {"publickey"};
+        fail.out_methods = methods;
+        s.peer.send_msg(fail);
+        REQUIRE_FALSE(s.peer.exchange(s.sut));
+        REQUIRE_FALSE(s.peer.take(wire::msg::userauth_request));
+        REQUIRE_FALSE(s.sut.conn.failure());
+    }
+
+    SECTION("another version does not select host-bound") {
+        peer_session s{core::role::client};
+        s.handshake();
+        send_hostbound_ext(s.peer, "1");
+        REQUIRE_FALSE(s.peer.exchange(s.sut));
+        REQUIRE_FALSE(s.sut.conn.supports_hostbound_publickey());
+        REQUIRE_FALSE(s.sut.conn.auth_publickey_query("alice", uk.blob()));
+        REQUIRE_FALSE(s.peer.exchange(s.sut));
+        const auto query = take_publickey(s.peer);
+        REQUIRE(query.method == auth::method_publickey);
+        REQUIRE(query.server_host_key.empty());
+    }
+}
+
+TEST_CASE("a later host-bound announcement replaces the capability and omission does not",
+          "[auth][publickey][hostbound]") {
+    peer_session s{core::role::client};
+    s.handshake();
+    REQUIRE_FALSE(s.sut.conn.supports_hostbound_publickey());
+
+    send_hostbound_ext(s.peer, "0");
+    REQUIRE_FALSE(s.peer.exchange(s.sut));
+    REQUIRE(s.sut.conn.supports_hostbound_publickey());
+
+    const auto algs = std::string_view{"ssh-ed25519"};
+    const wire::detail::ext_info::entry only_algs[] = {
+        {"server-sig-algs", std::as_bytes(std::span{algs.data(), algs.size()})}};
+    wire::detail::ext_info omit;
+    omit.entries = only_algs;
+    s.peer.send_msg(omit);
+    REQUIRE_FALSE(s.peer.exchange(s.sut));
+    REQUIRE(s.sut.conn.supports_hostbound_publickey());
+
+    send_hostbound_ext(s.peer, "1");
+    REQUIRE_FALSE(s.peer.exchange(s.sut));
+    REQUIRE_FALSE(s.sut.conn.supports_hostbound_publickey());
+}
+
+TEST_CASE("the server rejects a host-bound request with the wrong host key or a bad signature",
+          "[auth][publickey][hostbound]") {
+    user_key uk;
+    generate_user_key(prov(), crypto::sig_id::ed25519, 0, uk);
+    peer_session s{core::role::server};
+    s.handshake();
+    const auto host = std::vector<std::byte>{s.sut.conn.initial_host_key().begin(),
+                                             s.sut.conn.initial_host_key().end()};
+    REQUIRE_FALSE(host.empty());
+    const std::array<std::byte, 4> wrong{std::byte{1}, std::byte{2}, std::byte{3}, std::byte{4}};
+    const std::array<std::byte, 4> bogus_sig{std::byte{9}, std::byte{9}, std::byte{9}, std::byte{9}};
+
+    struct row {
+        const char* name;
+        bool has_signature;
+        bool wrong_host;
+    };
+    const row rows[] = {
+        {"probe, wrong host", false, true},
+        {"signed, wrong host", true, true},
+        {"signed, bad signature", true, false},
+    };
+    for (const auto& row : rows) {
+        INFO(row.name);
+        s.sut.handler.events.clear();
+        s.peer.clear_received();
+        wire::detail::userauth_request_publickey msg;
+        msg.user = "alice";
+        msg.service = "ssh-connection";
+        msg.method = auth::method_hostbound_publickey;
+        msg.has_signature = row.has_signature;
+        msg.algorithm = "ssh-ed25519";
+        msg.blob = uk.blob();
+        msg.server_host_key = row.wrong_host ? std::span<const std::byte>{wrong} : std::span<const std::byte>{host};
+        if (row.has_signature) msg.signature = bogus_sig;
+        s.peer.send_msg(msg);
+        REQUIRE_FALSE(s.peer.exchange(s.sut));
+        REQUIRE(s.peer.take(wire::msg::userauth_failure));
+        for (const auto& ev : s.sut.handler.events) {
+            REQUIRE_FALSE(std::holds_alternative<recording_handler::auth_request>(ev));
+        }
+        REQUIRE_FALSE(s.sut.conn.failure());
+    }
+
+    wire::writer truncated;
+    truncated.write_byte(static_cast<std::uint8_t>(wire::msg::userauth_request));
+    truncated.write_string("alice");
+    truncated.write_string("ssh-connection");
+    truncated.write_string(auth::method_hostbound_publickey);
+    truncated.write_bool(true);
+    truncated.write_string("ssh-ed25519");
+    s.peer.send(truncated.data());
+    REQUIRE(s.peer.exchange(s.sut) == code::invalid_format);
 }

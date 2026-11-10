@@ -469,7 +469,7 @@ int run_server(const options& opt, crypto::provider p, keys::private_key& host,
             } else if (const auto* req = std::get_if<testing::recording_handler::auth_request>(&ev)) {
                 if (req->user != opt.user) {
                     reject(req->ticket);
-                } else if (req->method == "publickey") {
+                } else if (auth::is_publickey_method(req->method)) {
                     if (blob_eq(req->public_blob, authorized.blob())) {
                         conn.resolve(req->ticket, auth_verdict::success());
                         if (req->has_signature) {

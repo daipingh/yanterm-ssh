@@ -18,6 +18,8 @@ inline constexpr std::string_view type_forwarded_tcpip = "forwarded-tcpip";
 inline constexpr std::string_view type_x11 = "x11";
 inline constexpr std::string_view type_direct_streamlocal = "direct-streamlocal@openssh.com";
 inline constexpr std::string_view type_forwarded_streamlocal = "forwarded-streamlocal@openssh.com";
+inline constexpr std::string_view type_auth_agent = "auth-agent@openssh.com";
+inline constexpr std::string_view type_agent_connect = "agent-connect";
 
 // Largest CHANNEL_DATA / CHANNEL_EXTENDED_DATA payload we will emit. Derived
 // from transport::max_packet_length (35000) minus the extended-data header:
@@ -25,7 +27,8 @@ inline constexpr std::string_view type_forwarded_streamlocal = "forwarded-stream
 inline constexpr std::uint32_t max_channel_data_payload = 35000u - (1u + 4u + 4u + 4u);
 
 enum class channel_type : std::uint8_t {
-    session, direct_tcpip, forwarded_tcpip, x11, direct_streamlocal, forwarded_streamlocal, unknown
+    session, direct_tcpip, forwarded_tcpip, x11, direct_streamlocal, forwarded_streamlocal,
+    auth_agent, unknown
 };
 
 enum class channel_open_reason : std::uint32_t {
@@ -43,6 +46,7 @@ enum class channel_open_reason : std::uint32_t {
     case channel_type::x11: return type_x11;
     case channel_type::direct_streamlocal: return type_direct_streamlocal;
     case channel_type::forwarded_streamlocal: return type_forwarded_streamlocal;
+    case channel_type::auth_agent: return type_auth_agent;
     case channel_type::unknown: return {};
     }
     return {};
@@ -55,6 +59,7 @@ enum class channel_open_reason : std::uint32_t {
     if (n == type_x11) return channel_type::x11;
     if (n == type_direct_streamlocal) return channel_type::direct_streamlocal;
     if (n == type_forwarded_streamlocal) return channel_type::forwarded_streamlocal;
+    if (n == type_auth_agent || n == type_agent_connect) return channel_type::auth_agent;
     return channel_type::unknown;
 }
 

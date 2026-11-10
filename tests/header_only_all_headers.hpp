@@ -20,6 +20,8 @@
 #include <yanterm-ssh/channels/requests.hpp>
 #include <yanterm-ssh/sftp/types.hpp>
 #include <yanterm-ssh/sftp/packets.hpp>
+#include <yanterm-ssh/agent/types.hpp>
+#include <yanterm-ssh/agent/packets.hpp>
 #include <yanterm-ssh/auth/types.hpp>
 #include <yanterm-ssh/crypto/algorithms.hpp>
 #include <yanterm-ssh/crypto/provider.hpp>

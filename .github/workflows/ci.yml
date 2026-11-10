@@ -97,7 +97,7 @@ jobs:
         run: |
           cmake --preset fuzz
           cmake --build --preset fuzz
-          for t in keys wire connection_prekex; do
+          for t in keys wire connection_prekex sftp agent; do
             mkdir -p "build/fuzz/out-${t}"
             "./build/fuzz/yanterm-ssh-fuzz-${t//_/-}" \
               -runs=100 -rss_limit_mb=2048 -timeout=10 \

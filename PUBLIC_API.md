@@ -9,16 +9,16 @@
 | 层 | 内容 |
 | --- | --- |
 | L0 | `detail/config.hpp`、`error.hpp` |
-| L1 词汇 | `wire/message_ids`、`transport/packet_mode`、`auth/types`、`channels/types`、`crypto/algorithms`、`sftp/types` |
+| L1 词汇 | `wire/message_ids`、`transport/packet_mode`、`auth/types`、`channels/types`、`crypto/algorithms`、`sftp/types`、`agent/types` |
 | L2 | `wire/types` + `wire/detail/messages`、`crypto/provider`、`crypto/secure_buffer` |
-| L3 | `crypto/openssl`、`keys/**`、`kex/algorithms` + `kex/detail/tables`、`channels/requests`、`memory/**`、`sftp/packets` |
+| L3 | `crypto/openssl`、`keys/**`、`kex/algorithms` + `kex/detail/tables`、`channels/requests`、`memory/**`、`sftp/packets`、`agent/packets` |
 | L4 | `core/**`（`types` / `config` / `handler` / `connection` 公开，`detail/**` 私有） |
-| L5 门面 | `facade_types.hpp`、`options.hpp`、`session.hpp`、`channel.hpp`、`sftp.hpp`、`detail/session_impl.hpp` |
+| L5 门面 | `facade_types.hpp`、`options.hpp`、`session.hpp`、`channel.hpp`、`sftp.hpp`、`agent.hpp`、`detail/session_impl.hpp` |
 
 ```mermaid
 flowchart TB
   subgraph L5["L5 门面"]
-    facade["session / channel / options / facade_types / sftp"]
+    facade["session / channel / options / facade_types / sftp / agent"]
   end
   subgraph L4["L4 core"]
     core_pub["types / config / handler / connection"]
@@ -31,6 +31,7 @@ flowchart TB
     reqs["channels/requests"]
     memory["memory/**"]
     sftp_pkt["sftp/packets"]
+    agent_pkt["agent/packets"]
   end
   subgraph L2["L2"]
     wtypes["wire/types"]
@@ -45,6 +46,7 @@ flowchart TB
     ct["channels/types"]
     calg["crypto/algorithms"]
     sftp_ty["sftp/types"]
+    agent_ty["agent/types"]
   end
   subgraph L0["L0"]
     cfg["detail/config.hpp"]
@@ -121,6 +123,7 @@ reject_inbound                  // reject_inbound_t 的实例
 session::disconnect
 session::serve
 session::open_session_channel
+session::open_auth_agent
 session::open_direct_tcpip
 session::open_direct_streamlocal
 session::open_forwarded_tcpip
@@ -139,6 +142,10 @@ session::failure_detail
 session::disconnected
 session::peer_identification
 session::session_id
+session::initial_host_key
+session::initial_kex_signature
+session::supports_hostbound_publickey
+session::supports_agent_forward
 session::negotiated
 
 client_session::handshake
@@ -182,6 +189,7 @@ channel::request_pty
 channel::request_shell
 channel::request_exec
 channel::request_subsystem
+channel::request_auth_agent
 channel::request_env
 channel::request_window_change
 channel::request_signal
@@ -340,6 +348,7 @@ connection::request_signal
 connection::send_exit_status
 connection::send_exit_signal
 connection::request_x11
+connection::request_auth_agent
 
 connection::send_global_request
 connection::request_tcpip_forward
@@ -355,6 +364,10 @@ connection::rekey
 connection::peer_identification
 connection::negotiated
 connection::session_id
+connection::initial_host_key
+connection::initial_kex_signature
+connection::supports_hostbound_publickey
+connection::supports_agent_forward
 connection::outbound_sequence_number
 connection::failure
 connection::failure_detail
@@ -472,6 +485,8 @@ type_forwarded_tcpip
 type_x11
 type_direct_streamlocal
 type_forwarded_streamlocal
+type_auth_agent
+type_agent_connect
 max_channel_data_payload
 extended_data_stderr
 struct channel_open_spec        // 出站 / 入站开通道
@@ -919,4 +934,94 @@ basic_sftp_client::expand_path
 basic_sftp_client::copy_data
 basic_sftp_client::home_directory
 basic_sftp_client::users_groups_by_id
+```
+
+## 8. ssh-agent
+
+- [yanterm-ssh/agent/types.hpp](include/yanterm-ssh/agent/types.hpp)
+- [yanterm-ssh/agent/packets.hpp](include/yanterm-ssh/agent/packets.hpp)
+- [yanterm-ssh/agent.hpp](include/yanterm-ssh/agent.hpp)
+
+### [yanterm-ssh/agent/types.hpp](include/yanterm-ssh/agent/types.hpp)
+
+```
+namespace yanterm::ssh::agent
+
+default_max_message_length       // 库默认消息上限
+max_identities_count             // 库默认身份条数上限
+session_bind_extension           // "session-bind@openssh.com"
+query_extension                  // "query"
+enum class msg                   // RFC 9987 消息号
+enum class refusal               // failure / extension_failure
+sign_flags::rsa_sha2_256         // 2
+sign_flags::rsa_sha2_512         // 4
+constrain::lifetime              // 1
+constrain::confirm               // 2
+constrain::extension             // 255
+struct identity_view             // 密钥标识（view）
+struct identity                  // 密钥标识
+struct constraint_extension      // 约束扩展名与不自描述的细节
+struct key_constraints           // lifetime / confirm / extensions
+constraints_empty
+error_category()                 // "yanterm-ssh.agent"
+make_error_code(refusal)
+```
+
+### [yanterm-ssh/agent/packets.hpp](include/yanterm-ssh/agent/packets.hpp)
+
+```
+namespace yanterm::ssh::agent
+
+decode_frame_header / encode_frame_header
+message_length_ok
+message_type
+
+encode_failure / decode_failure
+encode_success / decode_success
+encode_request_identities / decode_request_identities
+encode_identities_answer / decode_identities_answer
+encode_sign_request / decode_sign_request
+encode_sign_response / decode_sign_response
+encode_extension / decode_extension
+encode_extension_failure / decode_extension_failure
+encode_extension_response / decode_extension_response
+decode_query_response
+encode_add_identity / decode_add_identity
+encode_remove_identity / decode_remove_identity
+encode_remove_all_identities / decode_remove_all_identities
+encode_add_smartcard_key / decode_add_smartcard_key
+encode_remove_smartcard_key / decode_remove_smartcard_key
+encode_lock / decode_lock
+encode_unlock / decode_unlock
+encode_session_bind / decode_session_bind
+```
+
+### [yanterm-ssh/agent.hpp](include/yanterm-ssh/agent.hpp)
+
+```
+namespace yanterm::ssh
+
+struct agent_options                    // max_message_length
+basic_agent_client<Stream>              // 要求 auv::stream_like<Stream>
+agent_client                            // basic_agent_client<auv::stream>
+basic_agent_client::signer_adapter      // basic_agent_client::signer 的返回类型，用作 auth_publickey(signer)
+
+basic_agent_client::list_identities
+basic_agent_client::sign
+basic_agent_client::bind_session
+basic_agent_client::add_identity
+basic_agent_client::remove_identity
+basic_agent_client::remove_all_identities
+basic_agent_client::add_smartcard_key
+basic_agent_client::remove_smartcard_key
+basic_agent_client::lock
+basic_agent_client::unlock
+basic_agent_client::extension
+basic_agent_client::query_extensions
+basic_agent_client::signer
+basic_agent_client::failure
+
+bind_agent_session
+auth_publickey_from_agent
+forward_agent_channel
 ```

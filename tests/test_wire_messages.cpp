@@ -298,6 +298,67 @@ TEST_CASE("userauth_publickey request with signature round-trips", "[wire][msg][
     REQUIRE(in.algorithm == "ssh-ed25519");
     REQUIRE(in.blob.size() == 4);
     REQUIRE(in.signature.size() == 2);
+    REQUIRE(in.method == "publickey");
+    REQUIRE(in.server_host_key.empty());
+}
+
+TEST_CASE("host-bound publickey requests round-trip and a short body is rejected", "[wire][msg][auth]") {
+    const std::array<std::byte, 3> blob{std::byte{1}, std::byte{2}, std::byte{3}};
+    const std::array<std::byte, 2> host{std::byte{4}, std::byte{5}};
+    const std::array<std::byte, 1> sig{std::byte{6}};
+
+    struct row {
+        const char* name;
+        bool has_signature;
+    };
+    const row rows[] = {{"probe", false}, {"signed", true}};
+    for (const auto& row : rows) {
+        INFO(row.name);
+        wire::detail::userauth_request_publickey out;
+        out.user = "alice";
+        out.service = "ssh-connection";
+        out.method = "publickey-hostbound-v00@openssh.com";
+        out.has_signature = row.has_signature;
+        out.algorithm = "ssh-ed25519";
+        out.blob = blob;
+        out.server_host_key = host;
+        if (row.has_signature) out.signature = sig;
+        wire::writer w;
+        out.encode(w);
+
+        wire::reader r{w.data()};
+        wire::detail::userauth_request_publickey in;
+        REQUIRE(in.decode(r));
+        REQUIRE(r.empty());
+        REQUIRE(in.method == "publickey-hostbound-v00@openssh.com");
+        REQUIRE(in.has_signature == row.has_signature);
+        REQUIRE(in.server_host_key.size() == host.size());
+        REQUIRE(in.signature.size() == (row.has_signature ? sig.size() : 0));
+    }
+
+    wire::detail::userauth_pk_ok pk_ok;
+    pk_ok.algorithm = "ssh-ed25519";
+    pk_ok.blob = blob;
+    wire::writer ok;
+    pk_ok.encode(ok);
+    wire::reader ok_r{ok.data()};
+    wire::detail::userauth_pk_ok decoded_ok;
+    REQUIRE(decoded_ok.decode(ok_r));
+    REQUIRE(ok_r.empty());
+    REQUIRE(decoded_ok.algorithm == "ssh-ed25519");
+    REQUIRE(decoded_ok.blob.size() == blob.size());
+
+    wire::writer truncated;
+    truncated.write_byte(static_cast<std::uint8_t>(wire::msg::userauth_request));
+    truncated.write_string("alice");
+    truncated.write_string("ssh-connection");
+    truncated.write_string("publickey-hostbound-v00@openssh.com");
+    truncated.write_bool(false);
+    truncated.write_string("ssh-ed25519");
+    truncated.write_string(std::span<const std::byte>{blob});
+    wire::reader bad{truncated.data()};
+    wire::detail::userauth_request_publickey rejected;
+    REQUIRE_FALSE(rejected.decode(bad));
 }
 
 TEST_CASE("userauth_info_request round-trips two prompts", "[wire][msg][auth]") {

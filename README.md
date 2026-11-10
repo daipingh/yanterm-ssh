@@ -25,6 +25,7 @@ yanterm-ssh 实现了 SSH-2 的线上协议与密码学协商，但**自身不�
 - **内存与安全**：明文和密文放在引用计数的页内存里；敏感数据用 `secure_bytes` 等类型承载，释放时擦除。
 - **三种交付形态**：header-only、静态库、C++20 模块（实验性）。
 - **SFTP**：v3 客户端，以及 OpenSSH 的扩展。暂未内置 SFTP 服务端。
+- **ssh-agent**：RFC 9987 客户端，包括密钥添加、删除、锁定、扩展查询，以及 OpenSSH 的 session-bind。
 
 ### 暂未支持
 
@@ -33,8 +34,6 @@ yanterm-ssh 实现了 SSH-2 的线上协议与密码学协商，但**自身不�
 - **认证**：`gssapi-with-mic`（Kerberos）、`hostbased`。
 - **OpenSSH 证书**：`*-cert-v01@openssh.com` 用户与主机证书，以及基于 CA 的信任（`@cert-authority`）。
 - **硬件密钥**：FIDO/U2F 安全密钥（`sk-ssh-ed25519@openssh.com`、`sk-ecdsa-sha2-nistp256@openssh.com`）。
-- **外部签名**：已提供外部签名接口，但未内置 ssh-agent 与 PKCS#11/智能卡客户端。
-- **agent 转发**：`auth-agent-req@openssh.com` 及对应通道。
 - **压缩**：`zlib@openssh.com` / `zlib`，目前只协商 `none`。
 - **SCP**：未内置；可通过 `subsystem` 通道承载，但协议需自行实现。
 
@@ -284,11 +283,13 @@ ctest --preset dev -L interop
 
 ### Fuzz 测试
 
-`fuzz` 预设用 libFuzzer + ASan + UBSan 构建三个目标：
+`fuzz` 预设用 libFuzzer + ASan + UBSan 构建五个目标：
 
 - `yanterm-ssh-fuzz-keys`：公钥、私钥、`known_hosts`、`authorized_keys` 解析。
 - `yanterm-ssh-fuzz-wire`：传输层、认证层、连接层报文与通道请求的解码。
 - `yanterm-ssh-fuzz-connection-prekex`：以 client 或 server 身份驱动 `core::connection`，覆盖版本交换、密钥交换，以及按不同分块方式到达的字节流。
+- `yanterm-ssh-fuzz-sftp`：SFTP 回复与请求报文的解码。
+- `yanterm-ssh-fuzz-agent`：SSH agent 帧与消息的解码。
 
 ```bash
 cmake --preset fuzz
@@ -306,7 +307,7 @@ cmake --build --preset dev --target yanterm-ssh-fuzz-corpus-gen
 ./build/dev/yanterm-ssh-fuzz-corpus-gen tests/fuzz/corpus
 ```
 
-其余种子是按 RFC 4251/4253/4254 与 OpenSSH 密钥格式编码的静态样本，不随实现变化，无需重新生成。
+其余种子是按 RFC 4251/4253/4254、RFC 9987 与 OpenSSH 密钥及 agent 报文格式编码的静态样本，不随实现变化，无需重新生成。
 
 ## 基准测试
 

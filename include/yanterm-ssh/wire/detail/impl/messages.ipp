@@ -230,8 +230,15 @@ YANTERM_SSH_INLINE void userauth_request_password::encode(writer& w) const {
 }
 
 YANTERM_SSH_INLINE bool userauth_request_publickey::decode(reader& r) noexcept {
-    if (!read_userauth_request_head(r, "publickey", user, service)) return false;
+    if (!expect_id(r, msg::userauth_request)) return false;
+    if (!r.read_string(user) || !r.read_string(service) || !r.read_string(method)) return false;
+    if (method != "publickey" && method != "publickey-hostbound-v00@openssh.com") {
+        return r.fail(code::invalid_format);
+    }
     if (!r.read_bool(has_signature) || !r.read_string(algorithm) || !r.read_string(blob)) {
+        return false;
+    }
+    if (method == "publickey-hostbound-v00@openssh.com" && !r.read_string(server_host_key)) {
         return false;
     }
     if (has_signature) return r.read_string(signature);
@@ -239,10 +246,12 @@ YANTERM_SSH_INLINE bool userauth_request_publickey::decode(reader& r) noexcept {
 }
 
 YANTERM_SSH_INLINE void userauth_request_publickey::encode(writer& w) const {
-    write_userauth_request_head(w, user, service, "publickey");
+    const std::string_view wire_method = method.empty() ? std::string_view{"publickey"} : method;
+    write_userauth_request_head(w, user, service, wire_method);
     w.write_bool(has_signature);
     w.write_string(algorithm);
     w.write_string(blob);
+    if (wire_method == "publickey-hostbound-v00@openssh.com") w.write_string(server_host_key);
     if (has_signature) w.write_string(signature);
 }
 

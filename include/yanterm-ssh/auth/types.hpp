@@ -14,7 +14,13 @@ inline constexpr std::string_view service_connection = "ssh-connection";
 inline constexpr std::string_view method_none = "none";
 inline constexpr std::string_view method_password = "password";
 inline constexpr std::string_view method_publickey = "publickey";
+inline constexpr std::string_view method_hostbound_publickey =
+    "publickey-hostbound-v00@openssh.com";
 inline constexpr std::string_view method_kbdint = "keyboard-interactive";
+
+[[nodiscard]] inline bool is_publickey_method(std::string_view name) noexcept {
+    return name == method_publickey || name == method_hostbound_publickey;
+}
 
 enum class method : std::uint8_t {
     none, password, publickey, keyboard_interactive, unknown
@@ -23,7 +29,7 @@ enum class method : std::uint8_t {
 [[nodiscard]] inline method parse_method(std::string_view n) noexcept {
     if (n == method_none) return method::none;
     if (n == method_password) return method::password;
-    if (n == method_publickey) return method::publickey;
+    if (n == method_publickey || n == method_hostbound_publickey) return method::publickey;
     if (n == method_kbdint) return method::keyboard_interactive;
     return method::unknown;
 }

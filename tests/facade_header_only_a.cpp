@@ -1,6 +1,7 @@
 #include <yanterm-ssh/channel.hpp>
 #include <yanterm-ssh/session.hpp>
 #include <yanterm-ssh/sftp.hpp>
+#include <yanterm-ssh/agent.hpp>
 
 int touch_facade_a() {
     yanterm::ssh::client_session sess;

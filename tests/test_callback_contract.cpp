@@ -524,7 +524,7 @@ struct auth_server_handler : recording_handler {
             REQUIRE_FALSE(c.resolve(ticket, auth::auth_verdict::failure("password")));
             break;
         case auth_wire_scenario::pk_ok:
-            REQUIRE(request.method == "publickey");
+            REQUIRE(request.method == auth::method_hostbound_publickey);
             REQUIRE_FALSE(request.has_signature);
             REQUIRE_FALSE(c.resolve(ticket, auth::auth_verdict::success()));
             break;

@@ -15,7 +15,8 @@ namespace auv {
 
 namespace detail {
 template <typename T>
-concept Char8Castable = std::integral<T> && sizeof(T) == 1;
+concept Char8Castable =
+    (std::integral<T> && sizeof(T) == 1) || std::same_as<std::remove_cv_t<T>, std::byte>;
 
 template <typename P>
 concept BufferPointerB = std::is_pointer_v<P> && Char8Castable<std::remove_pointer_t<P>>;

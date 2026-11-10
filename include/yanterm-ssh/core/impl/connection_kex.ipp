@@ -88,6 +88,7 @@ YANTERM_SSH_INLINE std::error_code connection::resolve(host_key_ticket ticket, h
         sm2_userauth_sig_ = round_->exchange->host_sig_id();
     }
     (void)verified;
+    store_initial_kex_signature(round_->cached_reply);
     round_->cached_reply.clear();
 
     if (auto err = finish_kex_and_send_newkeys(hash)) {
@@ -440,6 +441,10 @@ YANTERM_SSH_INLINE std::error_code connection::on_server_kex_init(std::span<cons
                                     reply_w, hash)) {
         return fail_kex(ec);
     }
+    if (!rekeying_) {
+        first_host_key_blob_.assign(chosen->blob.begin(), chosen->blob.end());
+        store_initial_kex_signature(reply_w.data());
+    }
     if (auto ec = write_packet(reply_w.data())) return fail_kex(ec);
     if (auto ec = finish_kex_and_send_newkeys(hash)) return fail_kex(ec);
     phase_ = phase::wait_newkeys;
@@ -449,7 +454,14 @@ YANTERM_SSH_INLINE std::error_code connection::on_server_kex_init(std::span<cons
 YANTERM_SSH_INLINE std::error_code connection::send_ext_info() {
     const auto value_bytes =
         std::as_bytes(std::span{accepted_publickey_algorithms_.data(), accepted_publickey_algorithms_.size()});
-    const wire::detail::ext_info::entry entries[] = {{"server-sig-algs", value_bytes}};
+    constexpr std::string_view extension_version = "0";
+    const auto version_bytes =
+        std::as_bytes(std::span{extension_version.data(), extension_version.size()});
+    const wire::detail::ext_info::entry entries[] = {
+        {"server-sig-algs", value_bytes},
+        {"publickey-hostbound@openssh.com", version_bytes},
+        {"agent-forward", version_bytes},
+    };
     wire::detail::ext_info msg;
     msg.entries = entries;
     wire::writer payload;
@@ -517,7 +529,33 @@ YANTERM_SSH_INLINE std::error_code connection::apply_ext_info(std::span<const st
     if (msg.find("server-sig-algs", algs)) {
         server_sig_algs_.assign(algs.begin(), algs.end());
     }
+    std::string_view hostbound;
+    if (msg.find("publickey-hostbound@openssh.com", hostbound)) {
+        hostbound_publickey_ = (hostbound == "0");
+    }
+    std::string_view agent_forward;
+    if (msg.find("agent-forward", agent_forward)) {
+        agent_forward_ = (agent_forward == "0");
+    }
     return {};
+}
+
+YANTERM_SSH_INLINE void connection::store_initial_kex_signature(
+    std::span<const std::byte> reply_payload) {
+    if (!initial_kex_signature_.empty() || reply_payload.empty()) return;
+    std::span<const std::byte> signature;
+    if (kex::detail::uses_ecdh_messages(negotiated_.kex)) {
+        wire::reader r{reply_payload};
+        wire::detail::kex_ecdh_reply msg;
+        if (!msg.decode(r) || !r.empty()) return;
+        signature = msg.signature;
+    } else {
+        wire::reader r{reply_payload};
+        wire::detail::kexdh_reply msg;
+        if (!msg.decode(r) || !r.empty()) return;
+        signature = msg.signature;
+    }
+    initial_kex_signature_.assign(signature.begin(), signature.end());
 }
 
 YANTERM_SSH_INLINE std::error_code connection::on_newkeys() {

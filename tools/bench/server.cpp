@@ -419,7 +419,7 @@ corral::Task<void> serve_connection(uv_loop_t& loop, auv::stream stream, crypto:
                 }
                 co_return ssh::auth_verdict::failure(methods);
             }
-            if (req.method() == "publickey") {
+            if (ssh::auth::is_publickey_method(req.method())) {
                 if (public_blob_authorized(authorized, req.public_blob())) {
                     // Unsigned query → USERAUTH_PK_OK via success() (facade
                     // does not treat that as authenticated). Signed → done.

@@ -121,6 +121,7 @@ public:
     corral::Task<std::error_code> request_shell();
     corral::Task<std::error_code> request_exec(std::string_view command);
     corral::Task<std::error_code> request_subsystem(std::string_view name);
+    corral::Task<std::error_code> request_auth_agent();
     corral::Task<std::error_code> request_env(std::string_view name, std::string_view value);
     corral::Task<std::error_code> request_window_change(window_size size);
     corral::Task<std::error_code> request_signal(std::string_view name);
@@ -818,6 +819,12 @@ inline corral::Task<std::error_code> channel::request_exec(std::string_view comm
 inline corral::Task<std::error_code> channel::request_subsystem(std::string_view name) {
     return enqueue_channel_request(true, [this, name] {
         return impl_->core_.request_subsystem(ref_, name);
+    });
+}
+
+inline corral::Task<std::error_code> channel::request_auth_agent() {
+    return enqueue_channel_request(true, [this] {
+        return impl_->core_.request_auth_agent(ref_);
     });
 }
 

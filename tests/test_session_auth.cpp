@@ -48,7 +48,9 @@ std::vector<std::byte> ssh_signature(const keys::private_key& key, crypto::sig_i
 }
 
 auto accept_signed_publickey_or_password = [](auth_request req) -> corral::Task<auth_verdict> {
-    if (req.method() == "publickey" && req.has_signature()) co_return auth_verdict::success();
+    if (req.method() == auth::method_hostbound_publickey && req.has_signature()) {
+        co_return auth_verdict::success();
+    }
     if (req.method() == "password" && req.password() == "s3cret") {
         co_return auth_verdict::success();
     }
@@ -140,7 +142,7 @@ TEST_CASE("publickey auth succeeds", "[facade][auth]") {
             auto [aec, auth] = co_await corral::allOf(
                 fp.client.auth_publickey("alice", user_key),
                 fp.server.authenticate([](auth_request req) -> corral::Task<auth_verdict> {
-                    if (req.method() == "publickey" && req.has_signature()) {
+                    if (req.method() == auth::method_hostbound_publickey && req.has_signature()) {
                         co_return auth_verdict::success();
                     }
                     co_return auth_verdict::failure("publickey");
@@ -171,7 +173,9 @@ TEST_CASE("publickey query reports pk_ok without authenticating", "[facade][auth
             n.start([&]() -> corral::Task<void> {
                 (void)co_await fp.server.authenticate(
                     [](auth_request req) -> corral::Task<auth_verdict> {
-                        if (req.method() == "publickey") co_return auth_verdict::success();
+                        if (req.method() == auth::method_hostbound_publickey) {
+                            co_return auth_verdict::success();
+                        }
                         co_return auth_verdict::failure("publickey");
                     });
             });

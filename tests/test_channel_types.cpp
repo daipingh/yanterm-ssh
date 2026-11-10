@@ -17,6 +17,9 @@ TEST_CASE("channel type names match RFC 4254 and OpenSSH", "[channel][types]") {
     REQUIRE(channels::parse_type("session") == channels::channel_type::session);
     REQUIRE(channels::parse_type("forwarded-streamlocal@openssh.com")
             == channels::channel_type::forwarded_streamlocal);
+    REQUIRE(channels::type_name(channels::channel_type::auth_agent) == "auth-agent@openssh.com");
+    REQUIRE(channels::parse_type("auth-agent@openssh.com") == channels::channel_type::auth_agent);
+    REQUIRE(channels::parse_type("agent-connect") == channels::channel_type::auth_agent);
     REQUIRE(channels::parse_type("no-such") == channels::channel_type::unknown);
 }
 
