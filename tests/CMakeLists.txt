@@ -166,6 +166,9 @@ if(OpenSSL_FOUND)
         test_session_memory.cpp
         test_sftp_packets.cpp
         test_sftp_client.cpp
+        test_agent_packets.cpp
+        test_agent_client.cpp
+        test_agent_forward.cpp
     )
     # Exercises ossl1_1::openssl_backend next to the default 3.x backend; the
     # 1.1.1 API it uses is deprecated in OpenSSL 3.
@@ -208,6 +211,7 @@ if(OpenSSL_FOUND)
         fuzz/fuzz_wire.cpp
         fuzz/fuzz_connection_prekex.cpp
         fuzz/fuzz_sftp.cpp
+        fuzz/fuzz_agent.cpp
     )
     target_include_directories(yanterm-ssh-fuzz-replay PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR})
@@ -233,6 +237,7 @@ if(OpenSSL_FOUND)
             "yanterm-ssh-fuzz-wire:fuzz/fuzz_wire.cpp"
             "yanterm-ssh-fuzz-connection-prekex:fuzz/fuzz_connection_prekex.cpp"
             "yanterm-ssh-fuzz-sftp:fuzz/fuzz_sftp.cpp"
+            "yanterm-ssh-fuzz-agent:fuzz/fuzz_agent.cpp"
         )
             string(REPLACE ":" ";" _fuzz_parts "${_fuzz_pair}")
             list(GET _fuzz_parts 0 _bin)
@@ -286,6 +291,9 @@ if(YANTERM_SSH_MODULE_TESTS_AVAILABLE)
     add_executable(yanterm-ssh-module-corral-test
         module_corral_importer.cpp
     )
+    target_include_directories(yanterm-ssh-module-corral-test
+        PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}
+    )
     target_link_libraries(yanterm-ssh-module-corral-test
         PRIVATE yanterm-ssh-module-corral
     )
@@ -331,13 +339,16 @@ if(YANTERM_SSH_MODULE_TESTS_AVAILABLE)
             COMMAND yanterm-ssh-module-openssl-test
         )
 
-        add_executable(yanterm-ssh-module-mixed-test
-            module_mixed_importer.cpp
-        )
-        target_link_libraries(yanterm-ssh-module-mixed-test PRIVATE
-            yanterm-ssh-module-corral
-            yanterm-ssh-module-openssl
-        )
+    add_executable(yanterm-ssh-module-mixed-test
+        module_mixed_importer.cpp
+    )
+    target_include_directories(yanterm-ssh-module-mixed-test
+        PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}
+    )
+    target_link_libraries(yanterm-ssh-module-mixed-test PRIVATE
+        yanterm-ssh-module-corral
+        yanterm-ssh-module-openssl
+    )
         set_target_properties(yanterm-ssh-module-mixed-test PROPERTIES
             CXX_SCAN_FOR_MODULES ON
         )

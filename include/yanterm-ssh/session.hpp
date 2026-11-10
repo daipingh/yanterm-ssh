@@ -65,6 +65,7 @@ public:
     corral::Task<std::error_code> serve(OnOpen on_open, OnGlobal on_global, Body body);
 
     corral::Task<channel_open_result> open_session_channel();
+    corral::Task<channel_open_result> open_auth_agent();
     corral::Task<channel_open_result> open_direct_tcpip(std::string_view host, std::uint32_t port,
                                                        std::string_view originator_host,
                                                        std::uint32_t originator_port);
@@ -92,6 +93,10 @@ public:
     [[nodiscard]] const disconnect_info* disconnected() const noexcept;
     [[nodiscard]] std::string_view peer_identification() const noexcept;
     [[nodiscard]] std::span<const std::byte> session_id() const noexcept;
+    [[nodiscard]] std::span<const std::byte> initial_host_key() const noexcept;
+    [[nodiscard]] std::span<const std::byte> initial_kex_signature() const noexcept;
+    [[nodiscard]] bool supports_hostbound_publickey() const noexcept;
+    [[nodiscard]] bool supports_agent_forward() const noexcept;
     [[nodiscard]] const kex::negotiated* negotiated() const noexcept;
 
 protected:
@@ -230,6 +235,24 @@ inline std::string_view session::peer_identification() const noexcept {
 inline std::span<const std::byte> session::session_id() const noexcept {
     if (!impl_) return {};
     return impl_->core_.session_id();
+}
+
+inline std::span<const std::byte> session::initial_host_key() const noexcept {
+    if (!impl_) return {};
+    return impl_->core_.initial_host_key();
+}
+
+inline std::span<const std::byte> session::initial_kex_signature() const noexcept {
+    if (!impl_) return {};
+    return impl_->core_.initial_kex_signature();
+}
+
+inline bool session::supports_hostbound_publickey() const noexcept {
+    return impl_ && impl_->core_.supports_hostbound_publickey();
+}
+
+inline bool session::supports_agent_forward() const noexcept {
+    return impl_ && impl_->core_.supports_agent_forward();
 }
 
 inline const kex::negotiated* session::negotiated() const noexcept {
@@ -419,6 +442,12 @@ inline corral::Task<channel_open_result> session::open_typed_channel(
 
 inline corral::Task<channel_open_result> session::open_session_channel() {
     return open_typed_channel(channels::channel_open_spec{});
+}
+
+inline corral::Task<channel_open_result> session::open_auth_agent() {
+    channels::channel_open_spec spec;
+    spec.type = channel_type::auth_agent;
+    return open_typed_channel(std::move(spec));
 }
 
 inline corral::Task<channel_open_result> session::open_direct_tcpip(
@@ -808,7 +837,7 @@ inline corral::Task<std::error_code> server_session::authenticate(Authenticator 
                     req.public_blob_ = self.auth_->pending_auth_req->public_blob;
                     req.password_ = std::move(self.auth_->pending_auth_req->password);
                     const bool unsigned_publickey =
-                        req.method() == auth::method_publickey && !req.has_signature();
+                        auth::is_publickey_method(req.method()) && !req.has_signature();
                     self.auth_->auth_callback_live = true;
                     auth_verdict v = co_await authenticator(std::move(req));
                     self.auth_->auth_callback_live = false;

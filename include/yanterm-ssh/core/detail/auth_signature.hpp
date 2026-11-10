@@ -12,23 +12,27 @@
 
 namespace yanterm::ssh::core::detail {
 
+// `server_host_key` is written only for publickey-hostbound-v00@openssh.com.
 void write_publickey_signed_data(
     wire::writer& w,
     std::span<const std::byte> session_id,
     std::string_view user,
     std::string_view service,
     std::string_view alg,
-    std::span<const std::byte> blob);
+    std::span<const std::byte> blob,
+    std::string_view method = "publickey",
+    std::span<const std::byte> server_host_key = {});
 
 // Appends the SSH signature blob (string algorithm, string signature).
 std::error_code sign_publickey_data(crypto::provider p, const crypto::private_key_material& priv,
                                     std::string_view algorithm, crypto::sig_id sig,
                                     std::span<const std::byte> data, wire::writer& sig_blob);
 
-std::error_code verify_userauth_publickey(crypto::provider p, std::span<const std::byte> session_id,
-                                          std::string_view user, std::string_view service,
-                                          std::string_view alg, std::span<const std::byte> blob,
-                                          std::span<const std::byte> signature);
+std::error_code verify_userauth_publickey(
+    crypto::provider p, std::span<const std::byte> session_id, std::string_view user,
+    std::string_view service, std::string_view alg, std::span<const std::byte> blob,
+    std::span<const std::byte> signature, std::string_view method = "publickey",
+    std::span<const std::byte> server_host_key = {});
 
 }  // namespace yanterm::ssh::core::detail
 

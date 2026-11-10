@@ -23,15 +23,18 @@ YANTERM_SSH_INLINE void write_publickey_signed_data(
     std::string_view user,
     std::string_view service,
     std::string_view alg,
-    std::span<const std::byte> blob) {
+    std::span<const std::byte> blob,
+    std::string_view method,
+    std::span<const std::byte> server_host_key) {
     w.write_string(session_id);
     w.write_byte(static_cast<std::uint8_t>(wire::msg::userauth_request));
     w.write_string(user);
     w.write_string(service);
-    w.write_string(auth::method_publickey);
+    w.write_string(method);
     w.write_bool(true);
     w.write_string(alg);
     w.write_string(blob);
+    if (method == auth::method_hostbound_publickey) w.write_string(server_host_key);
 }
 
 YANTERM_SSH_INLINE std::error_code sign_publickey_data(crypto::provider p,
@@ -56,11 +59,13 @@ YANTERM_SSH_INLINE std::error_code sign_publickey_data(crypto::provider p,
 YANTERM_SSH_INLINE std::error_code verify_userauth_publickey(
     crypto::provider p, std::span<const std::byte> session_id, std::string_view user,
     std::string_view service, std::string_view alg, std::span<const std::byte> blob,
-    std::span<const std::byte> signature) {
+    std::span<const std::byte> signature, std::string_view method,
+    std::span<const std::byte> server_host_key) {
     host_key_view key;
     if (auto ec = parse_host_key(blob, key)) return ec;
     wire::writer data_w;
-    write_publickey_signed_data(data_w, session_id, user, service, alg, blob);
+    write_publickey_signed_data(data_w, session_id, user, service, alg, blob, method,
+                                server_host_key);
     return verify_signature(p, key, alg, signature, data_w.data());
 }
 

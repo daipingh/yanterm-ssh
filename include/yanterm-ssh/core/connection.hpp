@@ -203,6 +203,8 @@ public:
 
     std::error_code request_x11(channel_ref ch, const channels::x11_req_spec& spec);
 
+    std::error_code request_auth_agent(channel_ref ch);
+
     std::error_code send_global_request(std::string_view type, std::span<const std::byte> payload,
                                         bool want_reply);
 
@@ -231,6 +233,23 @@ public:
     }
     [[nodiscard]] std::span<const std::byte> session_id() const noexcept { return session_id_; }
     [[nodiscard]] std::string_view server_sig_algs() const noexcept { return server_sig_algs_; }
+
+    [[nodiscard]] std::span<const std::byte> initial_host_key() const noexcept {
+        if (!service_ready_) return {};
+        return first_host_key_blob_;
+    }
+    [[nodiscard]] std::span<const std::byte> initial_kex_signature() const noexcept {
+        if (!service_ready_) return {};
+        return initial_kex_signature_;
+    }
+    // True only after an EXT_INFO value "0" for publickey-hostbound@openssh.com.
+    // A later EXT_INFO that repeats the name replaces this; omission leaves it.
+    [[nodiscard]] bool supports_hostbound_publickey() const noexcept {
+        return hostbound_publickey_;
+    }
+    // True only after an EXT_INFO value "0" for agent-forward. A later
+    // EXT_INFO that repeats the name replaces this; omission leaves it.
+    [[nodiscard]] bool supports_agent_forward() const noexcept { return agent_forward_; }
 
     // Outbound binary-packet sequence (post-increment next-to-use). Exposed for
     // strict-KEX sequence-reset assertions; mirrors packet_writer::sequence_number().
@@ -414,6 +433,11 @@ private:
 
     std::error_code apply_ext_info(std::span<const std::byte> payload);
 
+    void store_initial_kex_signature(std::span<const std::byte> reply_payload);
+
+    std::error_code select_publickey_shape(std::string_view& method,
+                                           std::span<const std::byte>& server_host_key) const;
+
     std::error_code on_newkeys();
 
     [[nodiscard]] static bool is_userauth_or_service(wire::msg id) noexcept;
@@ -528,7 +552,15 @@ private:
     crypto::signing_key signer_;
 
     std::vector<std::byte> peer_host_key_blob_;
-    std::vector<std::byte> first_host_key_blob_;  // first K_S; rekey must match
+    std::vector<std::byte> first_host_key_blob_;  // first server host key; rekey must match
+    std::vector<std::byte> initial_kex_signature_;
+    bool hostbound_publickey_ = false;
+    bool agent_forward_ = false;
+    // Set when request_auth_agent is sent. Inbound agent channels are refused
+    // until then, before a slot is allocated or the handler is notified.
+    bool agent_forward_requested_ = false;
+    // The peer asked with the RFC 9987 name, so our agent channel uses it too.
+    bool peer_agent_req_ = false;
     detail::host_key_view peer_host_key_{};
     std::uint64_t host_key_round_ = 0;
     bool host_key_pending_ = false;

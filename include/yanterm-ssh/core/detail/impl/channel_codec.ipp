@@ -20,6 +20,7 @@ YANTERM_SSH_INLINE channels::open_request_view make_open_view(const wire::detail
     view.extra = msg.extra;
     switch (view.type) {
     case channels::channel_type::session:
+    case channels::channel_type::auth_agent:
     case channels::channel_type::unknown:
         break;
     case channels::channel_type::direct_tcpip:
@@ -47,6 +48,7 @@ YANTERM_SSH_INLINE channels::open_request_view make_open_view(const wire::detail
 YANTERM_SSH_INLINE void encode_open_extra(const channels::channel_open_spec& spec, wire::writer& extra) {
     switch (spec.type) {
     case channels::channel_type::session:
+    case channels::channel_type::auth_agent:
     case channels::channel_type::unknown:
         extra.write_bytes(spec.extra);
         break;

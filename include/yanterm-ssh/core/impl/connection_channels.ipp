@@ -127,7 +127,9 @@ YANTERM_SSH_INLINE std::error_code connection::open_channel(const channels::chan
     wire::writer extra;
     detail::encode_open_extra(spec, extra);
     wire::detail::channel_open msg;
-    msg.type = detail::type_string(spec);
+    msg.type = spec.type == channels::channel_type::auth_agent && peer_agent_req_
+                   ? channels::type_agent_connect
+                   : detail::type_string(spec);
     msg.sender = local;
     msg.window = c->local_window;
     msg.max_packet = c->local_max_packet;
@@ -366,6 +368,13 @@ YANTERM_SSH_INLINE std::error_code connection::request_x11(channel_ref ch, const
     wire::writer w;
     channels::encode_x11_req(w, spec);
     return channel_request(ch, {"x11-req", w.data(), true});
+}
+
+YANTERM_SSH_INLINE std::error_code connection::request_auth_agent(channel_ref ch) {
+    const std::string_view name = agent_forward_ ? "agent-req" : "auth-agent-req@openssh.com";
+    if (auto ec = channel_request(ch, {name, {}, true})) return ec;
+    agent_forward_requested_ = true;
+    return {};
 }
 
 YANTERM_SSH_INLINE std::error_code connection::send_global_request(std::string_view type, std::span<const std::byte> payload,
@@ -621,6 +630,17 @@ YANTERM_SSH_INLINE std::error_code connection::on_channel_open(std::span<const s
     wire::reader r{bytes};
     wire::detail::channel_open msg;
     if (!msg.decode(r)) return code::invalid_format;
+    if (channels::parse_type(msg.type) == channels::channel_type::auth_agent
+        && !agent_forward_requested_) {
+        wire::detail::channel_open_failure fail_msg;
+        fail_msg.recipient = msg.sender;
+        fail_msg.reason = static_cast<std::uint32_t>(
+            channels::channel_open_reason::administratively_prohibited);
+        fail_msg.description = {};
+        fail_msg.language = {};
+        if (auto wec = write_encoded(fail_msg)) return wec;
+        return {};
+    }
     detail::channel* c = nullptr;
     if (auto ec = slots_.allocate(cfg_.initial_window, cfg_.max_channel_packet, c)) {
         wire::detail::channel_open_failure fail_msg;
@@ -798,6 +818,7 @@ YANTERM_SSH_INLINE std::error_code connection::on_channel_request(std::span<cons
         if (c->inbound.next_seq == std::numeric_limits<std::uint64_t>::max()) return code::invalid_state;
         seq = c->inbound.next_seq++;
     }
+    if (msg.type == "agent-req") peer_agent_req_ = true;
     const auto ref = detail::ref_of(*c);
     const auto ticket = channel_request_ticket{ref, seq};
     const void* user = c->user_data;

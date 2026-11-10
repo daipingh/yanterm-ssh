@@ -78,7 +78,8 @@
         "yanterm-ssh-fuzz-keys",
         "yanterm-ssh-fuzz-wire",
         "yanterm-ssh-fuzz-connection-prekex",
-        "yanterm-ssh-fuzz-sftp"
+        "yanterm-ssh-fuzz-sftp",
+        "yanterm-ssh-fuzz-agent"
       ]
     }
   ],

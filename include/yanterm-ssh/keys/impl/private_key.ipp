@@ -157,10 +157,9 @@ YANTERM_SSH_INLINE std::error_code encode_private_body(const public_key& pub,
             return code::invalid_format;
         }
         w.write_string(m.public_key);
-        std::array<std::byte, 64> priv{};
-        std::copy(m.seed.begin(), m.seed.end(), priv.begin());
-        std::copy(m.public_key.begin(), m.public_key.end(), priv.begin() + 32);
-        w.write_string(std::span<const std::byte>{priv});
+        w.write_uint32(64);
+        w.write_bytes(m.seed);
+        w.write_bytes(m.public_key);
         return {};
     }
 

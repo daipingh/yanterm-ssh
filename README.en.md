@@ -25,6 +25,7 @@ The entire public API lives under `include/yanterm-ssh/`; see [`PUBLIC_API.md`](
 - **Memory and security**: plaintext and ciphertext live in reference-counted page memory; sensitive data is carried by types such as `secure_bytes` and wiped on release.
 - **Three delivery forms**: header-only, static library, C++20 modules (experimental).
 - **SFTP**: a v3 client, plus the OpenSSH extensions. No built-in SFTP server.
+- **ssh-agent**: an RFC 9987 client, including key addition, removal, locking and extension query, plus OpenSSH session-bind.
 
 ### Not yet supported
 
@@ -33,8 +34,6 @@ The following capabilities are common in mainstream implementations such as Open
 - **Authentication**: `gssapi-with-mic` (Kerberos), `hostbased`.
 - **OpenSSH certificates**: `*-cert-v01@openssh.com` user and host certificates, and CA-based trust (`@cert-authority`).
 - **Hardware keys**: FIDO/U2F security keys (`sk-ssh-ed25519@openssh.com`, `sk-ecdsa-sha2-nistp256@openssh.com`).
-- **External signing**: an external signing interface is provided, but no ssh-agent or PKCS#11/smart-card client is built in.
-- **Agent forwarding**: `auth-agent-req@openssh.com` and its channel.
 - **Compression**: `zlib@openssh.com` / `zlib`; only `none` is negotiated.
 - **SCP**: not built in; it can be carried over a `subsystem` channel, but the protocol must be implemented by the application.
 
@@ -58,7 +57,7 @@ The library is organized in layers (see section 0 of [`PUBLIC_API.md`](PUBLIC_AP
 - **Core protocol layer** (`core/`, `wire/`, `kex/`, `auth/`, `channels/`, `transport/`): pure sans-I/O state machines; the entry points are `core::connection` and the callback interface `core::handler`.
 - **Crypto layer** (`crypto/`): the `crypto::provider` abstraction and the OpenSSL implementation `crypto::openssl_backend`.
 - **Keys layer** (`keys/`): keys and the various file formats. `keys/io.hpp` is the only header that performs blocking file I/O and must be included explicitly.
-- **Coroutine facade** (`session.hpp`, `channel.hpp`, `options.hpp`, `facade_types.hpp`, `sftp.hpp`): wraps the core layer in corral coroutines, with the underlying stream provided by `auv::stream`.
+- **Coroutine facade** (`session.hpp`, `channel.hpp`, `options.hpp`, `facade_types.hpp`, `sftp.hpp`, `agent.hpp`): wraps the core layer in corral coroutines, with the underlying stream provided by `auv::stream`.
 
 Corresponding CMake targets:
 
@@ -284,11 +283,13 @@ If `Terrapin_Scanner` is installed, strict kex is checked as well.
 
 ### Fuzz testing
 
-The `fuzz` preset builds three targets with libFuzzer + ASan + UBSan:
+The `fuzz` preset builds five targets with libFuzzer + ASan + UBSan:
 
 - `yanterm-ssh-fuzz-keys`: parsing of public keys, private keys, `known_hosts`, and `authorized_keys`.
 - `yanterm-ssh-fuzz-wire`: decoding of transport, authentication, and connection messages and channel requests.
 - `yanterm-ssh-fuzz-connection-prekex`: drives `core::connection` as client or server through version exchange and key exchange, with the byte stream arriving in different chunkings.
+- `yanterm-ssh-fuzz-sftp`: decoding of SFTP reply and request messages.
+- `yanterm-ssh-fuzz-agent`: decoding of SSH agent frames and messages.
 
 ```bash
 cmake --preset fuzz
@@ -306,7 +307,7 @@ cmake --build --preset dev --target yanterm-ssh-fuzz-corpus-gen
 ./build/dev/yanterm-ssh-fuzz-corpus-gen tests/fuzz/corpus
 ```
 
-The remaining seeds are static samples encoded per RFC 4251/4253/4254 and the OpenSSH key formats; they do not track the implementation and need no regeneration.
+The remaining seeds are static samples encoded per RFC 4251/4253/4254, RFC 9987, and the OpenSSH key and agent message formats; they do not track the implementation and need no regeneration.
 
 ## Benchmarks
 
