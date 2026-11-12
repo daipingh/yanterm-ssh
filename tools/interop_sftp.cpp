@@ -339,11 +339,11 @@ std::string join_path(std::string_view dir, std::string_view name) {
 
 corral::Task<int> exercise(client_session& sess, std::string user, std::string workdir) {
     auto opened = co_await open_sftp(sess);
-    if (std::get<0>(opened) || !std::get<1>(opened)) {
-        std::cerr << "FAIL handshake " << std::get<0>(opened).message() << std::endl;
+    if (opened.ec || !opened.client) {
+        std::cerr << "FAIL handshake " << opened.ec.message() << std::endl;
         co_return 1;
     }
-    auto client = std::move(std::get<1>(opened));
+    auto client = std::move(opened.client);
     pass("handshake");
 
     const std::string dir = join_path(workdir, "d");

@@ -92,6 +92,21 @@ struct identity {
     std::string comment;
 };
 
+struct identity_list {
+    std::error_code ec;
+    std::vector<identity> identities;
+};
+
+struct extension_reply {
+    std::error_code ec;
+    std::vector<std::byte> payload;
+};
+
+struct extension_list {
+    std::error_code ec;
+    std::vector<std::string> names;
+};
+
 [[nodiscard]] const std::error_category& error_category() noexcept;
 [[nodiscard]] std::error_code make_error_code(refusal r) noexcept;
 

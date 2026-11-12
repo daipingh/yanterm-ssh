@@ -19,7 +19,6 @@
 #include <string>
 #include <string_view>
 #include <system_error>
-#include <tuple>
 #include <vector>
 
 namespace yanterm::ssh {
@@ -42,6 +41,22 @@ struct disconnect_info {
     disconnect_reason reason{};
     std::string description;
     std::string language;
+};
+
+// Awaited result of a publickey_signer: an error, or an SSH signature blob.
+struct sign_result {
+    std::error_code ec;
+    std::vector<std::byte> signature;
+};
+
+struct kbdint_answers {
+    std::error_code ec;
+    std::vector<crypto::secure_string> answers;
+};
+
+struct kbdint_answer {
+    std::error_code ec;
+    crypto::secure_string answer;
 };
 
 class host_key_view {
@@ -74,11 +89,11 @@ public:
     }
     [[nodiscard]] std::string_view password() const noexcept { return password_.view(); }
 
-    corral::Task<std::tuple<std::error_code, std::vector<crypto::secure_string>>> challenge(
-        std::string_view name, std::string_view instruction, std::span<const kbdint_prompt> prompts);
-    corral::Task<std::tuple<std::error_code, crypto::secure_string>> challenge(
-        std::string_view prompt, bool echo = true, std::string_view name = {},
-        std::string_view instruction = {});
+    corral::Task<kbdint_answers> challenge(std::string_view name, std::string_view instruction,
+                                          std::span<const kbdint_prompt> prompts);
+    corral::Task<kbdint_answer> challenge(std::string_view prompt, bool echo = true,
+                                         std::string_view name = {},
+                                         std::string_view instruction = {});
 
 private:
     friend class session;

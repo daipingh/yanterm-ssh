@@ -642,7 +642,9 @@ TEST_CASE("a queued agent request keeps its reply when bridging is refused", "[a
                     std::vector<agent::identity> ids;
                     CORRAL_WITH_NURSERY(n) {
                         n.start([&]() -> corral::Task<void> {
-                            std::tie(list_ec, ids) = co_await agent.list_identities();
+                            auto listed = co_await agent.list_identities();
+                            list_ec = listed.ec;
+                            ids = std::move(listed.identities);
                         });
                         const auto request = co_await read_frame(peer);
                         REQUIRE(request[0] == static_cast<std::byte>(agent::msg::request_identities));

@@ -161,8 +161,9 @@ TEST_CASE("agent client reassembles a fragmented identities answer", "[agent][cl
         std::vector<agent::identity> ids;
         CORRAL_WITH_NURSERY(n) {
             n.start([&]() -> corral::Task<void> {
-                std::error_code ec;
-                std::tie(ec, ids) = co_await client.list_identities();
+                auto listed = co_await client.list_identities();
+                std::error_code ec = listed.ec;
+                ids = std::move(listed.identities);
                 REQUIRE_FALSE(ec);
             });
             const auto end = co_await await_frame(io, 0);
@@ -337,8 +338,6 @@ TEST_CASE("agent client distinguishes cancellation from a business refusal", "[a
                     REQUIRE(io.st->written.size() == first);
                     CORRAL_WITH_NURSERY(queued) {
                         queued.start([&]() -> corral::Task<void> {
-                            // The result is unused. Naming it leaves an unconstructed
-                            // vector in this frame, which GCC 15 ASan destroys on cancel.
                             co_await client.sign(as_bytes("k"), as_bytes("d"), 0);
                         });
                         co_await corral::yield;
@@ -361,8 +360,6 @@ TEST_CASE("agent client distinguishes cancellation from a business refusal", "[a
                     });
                     CORRAL_WITH_NURSERY(op) {
                         op.start([&]() -> corral::Task<void> {
-                            // Discard the reply. A named result is not constructed until
-                            // resume, and GCC 15 ASan destroys that vector on cancel.
                             co_await client.list_identities();
                         });
                         while (!io.st->write_parked) co_await io.st->progress.park();
@@ -589,7 +586,9 @@ TEST_CASE("a complete failure still lets a queued agent request write", "[agent]
                 REQUIRE(ids.empty());
             });
             n.start([&]() -> corral::Task<void> {
-                std::tie(second_ec, signature) = co_await client.sign(as_bytes("k"), as_bytes("d"), 0);
+                auto signed_data = co_await client.sign(as_bytes("k"), as_bytes("d"), 0);
+                second_ec = signed_data.ec;
+                signature = std::move(signed_data.signature);
             });
             const auto first = co_await await_frame(io, 0);
             REQUIRE(io.st->written.size() == first);

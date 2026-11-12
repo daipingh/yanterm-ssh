@@ -82,6 +82,9 @@ using window_size
 using exit_signal
 
 struct disconnect_info          // 对端或本端 DISCONNECT
+struct sign_result              // signer 的结果
+struct kbdint_answers           // challenge 多提示应答
+struct kbdint_answer            // challenge 单提示应答
 class host_key_view             // 握手时交给客户端校验的主机公钥
 class auth_request              // 服务端 authenticate 回调入参
 
@@ -114,6 +117,7 @@ struct server_options           // 另含 host_keys、认证横幅与用户公�
 ```
 namespace yanterm::ssh
 
+concept publickey_signer        // 公钥签名回调
 class session                   // 会话基类：I/O 循环、开通道、全局请求
 class client_session            // 客户端：handshake 与认证
 class server_session            // 服务端：handshake 与 authenticate
@@ -893,6 +897,7 @@ class sftp_handle                 // 文件句柄；析构不 CLOSE
 sftp::id_name_lists               // users、groups
 basic_sftp_client<Stream>         // 要求 auv::stream_like<Stream>
 sftp_client                       // basic_sftp_client<channel>
+struct sftp_open_result           // open_sftp 的结果
 open_sftp(session&, sftp_options) // 打开 session 通道、请求 subsystem "sftp"、handshake()
 
 sftp_handle::empty
@@ -960,6 +965,9 @@ constrain::confirm               // 2
 constrain::extension             // 255
 struct identity_view             // 密钥标识（view）
 struct identity                  // 密钥标识
+struct identity_list             // list_identities 的结果
+struct extension_reply           // extension 的结果
+struct extension_list            // query_extensions 的结果
 struct constraint_extension      // 约束扩展名与不自描述的细节
 struct key_constraints           // lifetime / confirm / extensions
 constraints_empty

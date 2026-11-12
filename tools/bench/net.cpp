@@ -4,7 +4,6 @@
 #include <sys/socket.h>
 
 #include <string>
-#include <tuple>
 #include <utility>
 
 namespace bench {
@@ -97,8 +96,6 @@ void tcp_listener::on_connection(uv_stream_t* server, int status) {
     self->pending_ += 1;
     self->waiters_.unparkOne();
 }
-
-using stream_result = std::tuple<std::error_code, auv::stream>;
 
 corral::Task<stream_result> tcp_listener::accept() {
     if (error_) co_return stream_result{error_, auv::stream{}};

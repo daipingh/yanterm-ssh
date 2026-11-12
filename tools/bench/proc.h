@@ -15,6 +15,11 @@
 
 namespace bench {
 
+struct exit_info {
+    std::uint32_t status = 0;
+    std::string signal;
+};
+
 struct command_spec {
     std::string command;       // exec 的原始命令串；空 = 起默认 shell
     std::vector<std::pair<std::string, std::string>> env;
@@ -39,7 +44,7 @@ public:
     auv::stream& stderr_stream();
 
     // 进程退出后可得：正常退出给 exit code，被信号杀死给信号名。
-    corral::Task<std::tuple<std::uint32_t, std::string>> wait();
+    corral::Task<exit_info> wait();
     void terminate() noexcept;
     // SSH 信号名（无 SIG 前缀：INT/TERM/KILL/HUP/…）→ kill(pid, …)；未知名当 TERM。
     void send_signal(std::string_view ssh_name) noexcept;
@@ -76,7 +81,7 @@ public:
 
     auv::stream& io_stream();  // 双向，不分离 stderr
     std::error_code resize(pty_geometry);
-    corral::Task<std::tuple<std::uint32_t, std::string>> wait();
+    corral::Task<exit_info> wait();
     void terminate() noexcept;
     void send_signal(std::string_view ssh_name) noexcept;
 

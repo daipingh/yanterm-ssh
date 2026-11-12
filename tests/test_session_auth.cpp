@@ -18,7 +18,6 @@
 #include <string>
 #include <string_view>
 #include <system_error>
-#include <tuple>
 #include <vector>
 
 using namespace yanterm::ssh;
@@ -27,8 +26,6 @@ using namespace yanterm::ssh::testing;
 namespace {
 
 auto accept_host = [](host_key_view) -> corral::Task<bool> { co_return true; };
-
-using signer_result = std::tuple<std::error_code, std::vector<std::byte>>;
 
 // SSH signature blob (RFC 4253 section 6.6) made in process from a fixture key,
 // standing in for what an ssh-agent or token would return.
@@ -480,10 +477,10 @@ TEST_CASE("external signer publickey auth succeeds", "[facade][auth][signer]") {
 
             const auto pub_blob = user_key.pub().blob();
             auto signer = [&](const core::publickey_sign_request& req,
-                              std::span<const std::byte> data) -> corral::Task<signer_result> {
+                              std::span<const std::byte> data) -> corral::Task<sign_result> {
                 REQUIRE(std::vector<std::byte>(req.public_blob.begin(), req.public_blob.end())
                         == std::vector<std::byte>(pub_blob.begin(), pub_blob.end()));
-                co_return signer_result{std::error_code{},
+                co_return sign_result{std::error_code{},
                                         ssh_signature(user_key, req.sig, req.algorithm, data)};
             };
             auto [aec, auth] = co_await corral::allOf(
@@ -516,10 +513,10 @@ TEST_CASE("external signer signing wrong data fails auth", "[facade][auth][signe
                 (void)co_await fp.server.authenticate(accept_signed_publickey_or_password);
             });
             auto signer = [&](const core::publickey_sign_request& req,
-                              std::span<const std::byte> data) -> corral::Task<signer_result> {
+                              std::span<const std::byte> data) -> corral::Task<sign_result> {
                 std::vector<std::byte> tampered(data.begin(), data.end());
                 tampered.back() ^= std::byte{0x01};
-                co_return signer_result{std::error_code{},
+                co_return sign_result{std::error_code{},
                                         ssh_signature(user_key, req.sig, req.algorithm, tampered)};
             };
             auto [pec, result] = co_await fp.client.auth_publickey("alice", user_key.pub(), signer);
@@ -549,8 +546,8 @@ TEST_CASE("external signer downgraded to ssh-rsa is error", "[facade][auth][sign
             });
             // An agent that ignores the SHA-2 flags signs with SHA-1 as ssh-rsa.
             auto signer = [&](const core::publickey_sign_request&,
-                              std::span<const std::byte> data) -> corral::Task<signer_result> {
-                co_return signer_result{
+                              std::span<const std::byte> data) -> corral::Task<sign_result> {
+                co_return sign_result{
                     std::error_code{},
                     ssh_signature(user_key, crypto::sig_id::rsa_pkcs1_sha1, "ssh-rsa", data)};
             };
@@ -585,8 +582,8 @@ TEST_CASE("external signer error propagates unchanged", "[facade][auth][signer]"
                 (void)co_await fp.server.authenticate(accept_signed_publickey_or_password);
             });
             auto signer = [&](const core::publickey_sign_request&,
-                              std::span<const std::byte>) -> corral::Task<signer_result> {
-                co_return signer_result{signer_error, {}};
+                              std::span<const std::byte>) -> corral::Task<sign_result> {
+                co_return sign_result{signer_error, {}};
             };
             auto [kec, kresult] = co_await fp.client.auth_publickey("alice", user_key.pub(), signer);
             REQUIRE(kec == signer_error);
@@ -616,9 +613,9 @@ TEST_CASE("external signer gets rsa-sha2-512 when only it is advertised", "[faca
             REQUIRE_FALSE(sec);
 
             auto signer = [&](const core::publickey_sign_request& req,
-                              std::span<const std::byte> data) -> corral::Task<signer_result> {
+                              std::span<const std::byte> data) -> corral::Task<sign_result> {
                 requested.assign(req.algorithm.begin(), req.algorithm.end());
-                co_return signer_result{std::error_code{},
+                co_return sign_result{std::error_code{},
                                         ssh_signature(user_key, req.sig, req.algorithm, data)};
             };
             auto [aec, auth] = co_await corral::allOf(

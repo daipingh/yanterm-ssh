@@ -9,12 +9,15 @@
 #include <memory>
 #include <string_view>
 #include <system_error>
-#include <tuple>
 
 namespace bench {
 
-corral::Task<std::tuple<std::error_code, auv::stream>> tcp_connect(
-    uv_loop_t& loop, std::string_view host, int port);
+struct stream_result {
+    std::error_code ec;
+    auv::stream stream;
+};
+
+corral::Task<stream_result> tcp_connect(uv_loop_t& loop, std::string_view host, int port);
 
 class tcp_listener {
 public:
@@ -27,7 +30,7 @@ public:
 
     [[nodiscard]] std::error_code error() const noexcept;
     [[nodiscard]] std::uint16_t local_port() const noexcept;   // port=0 时为内核分配值
-    corral::Task<std::tuple<std::error_code, auv::stream>> accept();
+    corral::Task<stream_result> accept();
 
 private:
     uv_loop_t* loop_ = nullptr;

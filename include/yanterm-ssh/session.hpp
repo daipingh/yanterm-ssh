@@ -21,14 +21,14 @@
 namespace yanterm::ssh {
 
 // Called as an lvalue with the chosen algorithm and the data to sign. The
-// awaited result is either an error or an SSH signature blob (string
+// awaited result is sign_result: an error, or an SSH signature blob (string
 // algorithm, string signature), the format of an ssh-agent SIGN_RESPONSE.
 template <class S>
 concept publickey_signer =
     std::invocable<S&, const core::publickey_sign_request&, std::span<const std::byte>>
     && corral::Awaitable<
         std::invoke_result_t<S&, const core::publickey_sign_request&, std::span<const std::byte>>,
-        std::tuple<std::error_code, std::vector<std::byte>>>;
+        sign_result>;
 
 class session {
 public:
@@ -116,9 +116,14 @@ protected:
     corral::Task<void> dispatch_inbound(corral::Nursery& nursery, OnOpen& on_open,
                                        OnGlobal& on_global);
 
+    struct global_reply {
+        std::error_code ec;
+        std::vector<std::byte> payload;
+    };
+
     channel make_channel(session_impl::channel_state* st);
     corral::Task<channel_open_result> open_typed_channel(channels::channel_open_spec spec);
-    corral::Task<std::tuple<std::error_code, bool, std::vector<std::byte>>> wait_global_response();
+    corral::Task<global_reply> wait_global_response();
 
     std::shared_ptr<session_impl> impl_;
 
@@ -499,8 +504,7 @@ inline corral::Task<channel_open_result> session::open_forwarded_streamlocal(
     return open_typed_channel(std::move(spec));
 }
 
-inline corral::Task<std::tuple<std::error_code, bool, std::vector<std::byte>>>
-session::wait_global_response() {
+inline corral::Task<session::global_reply> session::wait_global_response() {
     auto& self = *impl_;
     session_impl::reply_waiter waiter;
     waiter.seq = self.next_global_send_seq_++;
@@ -509,13 +513,14 @@ session::wait_global_response() {
     for (;;) {
         if (self.closed()) {
             waiter.done = true;
-            co_return {failure(), false, {}};
+            co_return {failure(), {}};
         }
         if (waiter.done) {
             if (waiter.from_reply) {
-                co_return {std::error_code{}, waiter.success, std::move(waiter.payload)};
+                if (!waiter.success) co_return {code::request_denied, {}};
+                co_return {std::error_code{}, std::move(waiter.payload)};
             }
-            co_return {code::invalid_state, false, {}};
+            co_return {code::invalid_state, {}};
         }
         co_await waiter.ready;
     }
@@ -531,9 +536,7 @@ inline corral::Task<std::error_code> session::send_global_request(
     }
     self.wake_pumps();
     if (!want_reply) co_return {};
-    auto [ec, success, resp] = co_await wait_global_response();
-    if (ec) co_return ec;
-    co_return success ? std::error_code{} : code::request_denied;
+    co_return (co_await wait_global_response()).ec;
 }
 
 inline corral::Task<std::error_code> session::rekey() {
@@ -566,9 +569,8 @@ inline corral::Task<std::error_code> session::request_tcpip_forward(std::string_
         co_return ec;
     }
     self.wake_pumps();
-    auto [ec, success, payload] = co_await wait_global_response();
+    auto [ec, payload] = co_await wait_global_response();
     if (ec) co_return ec;
-    if (!success) co_return code::request_denied;
     if (payload.empty()) {
         bound = static_cast<std::uint16_t>(port);
         co_return {};
@@ -591,9 +593,7 @@ inline corral::Task<std::error_code> session::cancel_tcpip_forward(std::string_v
         co_return ec;
     }
     self.wake_pumps();
-    auto [ec, success, payload] = co_await wait_global_response();
-    if (ec) co_return ec;
-    co_return success ? std::error_code{} : code::request_denied;
+    co_return (co_await wait_global_response()).ec;
 }
 
 inline corral::Task<std::error_code> session::request_streamlocal_forward(std::string_view socket_path) {
@@ -604,9 +604,7 @@ inline corral::Task<std::error_code> session::request_streamlocal_forward(std::s
         co_return ec;
     }
     self.wake_pumps();
-    auto [ec, success, payload] = co_await wait_global_response();
-    if (ec) co_return ec;
-    co_return success ? std::error_code{} : code::request_denied;
+    co_return (co_await wait_global_response()).ec;
 }
 
 inline corral::Task<std::error_code> session::cancel_streamlocal_forward(std::string_view socket_path) {
@@ -617,9 +615,7 @@ inline corral::Task<std::error_code> session::cancel_streamlocal_forward(std::st
         co_return ec;
     }
     self.wake_pumps();
-    auto [ec, success, payload] = co_await wait_global_response();
-    if (ec) co_return ec;
-    co_return success ? std::error_code{} : code::request_denied;
+    co_return (co_await wait_global_response()).ec;
 }
 
 template <class OnOpen, class OnGlobal>
@@ -744,10 +740,8 @@ inline corral::Task<std::tuple<std::error_code, auth_result>> client_session::au
                     self.note_core_failure();
                     co_return {ec, {}};
                 }
-                std::tuple<std::error_code, std::vector<std::byte>> signed_data =
-                    co_await signer(std::as_const(req), data.data());
+                auto [sign_ec, signature] = co_await signer(std::as_const(req), data.data());
                 if (self.closed()) co_return {failure(), {}};
-                auto& [sign_ec, signature] = signed_data;
                 if (sign_ec) co_return {sign_ec, {}};
                 if (!self.auth_ || self.auth_->client_auth_outstanding) {
                     co_return {code::invalid_state, {}};
@@ -868,17 +862,14 @@ inline corral::Task<std::error_code> server_session::authenticate(Authenticator 
         });
 }
 
-inline corral::Task<std::tuple<std::error_code, std::vector<crypto::secure_string>>>
-auth_request::challenge(std::string_view name, std::string_view instruction,
-                        std::span<const kbdint_prompt> prompts) {
+inline corral::Task<kbdint_answers> auth_request::challenge(
+    std::string_view name, std::string_view instruction, std::span<const kbdint_prompt> prompts) {
     if (!impl_ || !impl_->auth_ || !impl_->auth_->auth_callback_live
         || method_ != auth::method_kbdint) {
-        co_return std::make_tuple(code::invalid_state, std::vector<crypto::secure_string>{});
+        co_return kbdint_answers{code::invalid_state, {}};
     }
     auto& self = *impl_;
-    if (self.closed()) {
-        co_return std::make_tuple(self.latch_, std::vector<crypto::secure_string>{});
-    }
+    if (self.closed()) co_return kbdint_answers{self.latch_, {}};
     if (!self.auth_->challenge_outstanding) {
         (void)self.core_.resolve(ticket_, auth_verdict::info(name, instruction, prompts));
         self.note_core_failure();
@@ -886,28 +877,27 @@ auth_request::challenge(std::string_view name, std::string_view instruction,
         self.auth_->challenge_outstanding = true;
     }
     for (;;) {
-        if (self.closed()) {
-            co_return std::make_tuple(self.latch_, std::vector<crypto::secure_string>{});
-        }
+        if (self.closed()) co_return kbdint_answers{self.latch_, {}};
         if (self.auth_ && self.auth_->pending_info_resp) {
             auto answers = std::move(self.auth_->pending_info_resp->responses);
             self.auth_->pending_info_resp.reset();
             self.auth_->challenge_outstanding = false;
-            co_return std::make_tuple(std::error_code{}, std::move(answers));
+            co_return kbdint_answers{std::error_code{}, std::move(answers)};
         }
         co_await self.inbound_lot_.park();
     }
 }
 
-inline corral::Task<std::tuple<std::error_code, crypto::secure_string>> auth_request::challenge(
-    std::string_view prompt, bool echo, std::string_view name, std::string_view instruction) {
+inline corral::Task<kbdint_answer> auth_request::challenge(std::string_view prompt, bool echo,
+                                                         std::string_view name,
+                                                         std::string_view instruction) {
     kbdint_prompt one;
     one.prompt.assign(prompt.begin(), prompt.end());
     one.echo = echo;
     auto [ec, answers] =
         co_await challenge(name, instruction, std::span<const kbdint_prompt>{&one, 1});
-    if (ec) co_return std::make_tuple(ec, crypto::secure_string{});
-    if (answers.empty()) co_return std::make_tuple(std::error_code{}, crypto::secure_string{});
-    co_return std::make_tuple(std::error_code{}, std::move(answers.front()));
+    if (ec) co_return kbdint_answer{ec, {}};
+    if (answers.empty()) co_return kbdint_answer{std::error_code{}, {}};
+    co_return kbdint_answer{std::error_code{}, std::move(answers.front())};
 }
 }  // namespace yanterm::ssh

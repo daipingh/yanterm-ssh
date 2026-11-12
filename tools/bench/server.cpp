@@ -27,7 +27,6 @@
 #include <span>
 #include <string>
 #include <string_view>
-#include <tuple>
 #include <utility>
 #include <vector>
 
@@ -295,7 +294,9 @@ corral::Task<void> handle_session(uv_loop_t& loop, ssh::channel ch) {
                 [&]() -> corral::Task<void> {
                     co_await corral::anyOf(
                         pump_channel_to_pty(ch, *pty, xfer.to_process_bytes), pty->wait());
-                    std::tie(exit_status, exit_sig) = co_await pty->wait();
+                    auto finished = co_await pty->wait();
+                    exit_status = finished.status;
+                    exit_sig = std::move(finished.signal);
                 });
         } else {
             co_await corral::allOf(
@@ -304,7 +305,9 @@ corral::Task<void> handle_session(uv_loop_t& loop, ssh::channel ch) {
                 [&]() -> corral::Task<void> {
                     co_await corral::anyOf(
                         pump_channel_to_stdin(ch, *child, xfer.to_process_bytes), child->wait());
-                    std::tie(exit_status, exit_sig) = co_await child->wait();
+                    auto finished = co_await child->wait();
+                    exit_status = finished.status;
+                    exit_sig = std::move(finished.signal);
                 });
         }
 

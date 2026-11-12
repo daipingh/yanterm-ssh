@@ -24,7 +24,6 @@
 #include <string>
 #include <string_view>
 #include <system_error>
-#include <tuple>
 #include <type_traits>
 #include <utility>
 #include <vector>
@@ -1115,8 +1114,12 @@ basic_sftp_client<Stream>::users_groups_by_id(std::span<const std::uint32_t> uid
 
 using sftp_client = basic_sftp_client<channel>;
 
-inline corral::Task<std::tuple<std::error_code, std::unique_ptr<sftp_client>>>
-open_sftp(session& sess, sftp_options opts = {}) {
+struct sftp_open_result {
+    std::error_code ec;
+    std::unique_ptr<sftp_client> client;
+};
+
+inline corral::Task<sftp_open_result> open_sftp(session& sess, sftp_options opts = {}) {
     auto opened = co_await sess.open_session_channel();
     if (opened.ec) co_return {opened.ec, nullptr};
     if (auto ec = co_await opened.ch.request_subsystem("sftp")) {

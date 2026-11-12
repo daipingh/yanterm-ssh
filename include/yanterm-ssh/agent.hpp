@@ -59,12 +59,10 @@ public:
     basic_agent_client(basic_agent_client&&) = delete;
     basic_agent_client& operator=(basic_agent_client&&) = delete;
 
-    corral::Task<std::tuple<std::error_code, std::vector<agent::identity>>> list_identities();
-    corral::Task<std::tuple<std::error_code, std::vector<std::byte>>>
-    sign(std::span<const std::byte> key_blob, std::span<const std::byte> data,
-         std::uint32_t flags = 0);
-    // Materials are copied before the first suspension. This does not read
-    // an SSH session and does not bind one implicitly.
+    corral::Task<agent::identity_list> list_identities();
+    corral::Task<sign_result> sign(std::span<const std::byte> key_blob,
+                                  std::span<const std::byte> data, std::uint32_t flags = 0);
+
     corral::Task<std::error_code> bind_session(std::span<const std::byte> host_key,
                                               std::span<const std::byte> session_id,
                                               std::span<const std::byte> signature,
@@ -81,17 +79,16 @@ public:
                                                       std::string_view pin);
     corral::Task<std::error_code> lock(std::string_view passphrase);
     corral::Task<std::error_code> unlock(std::string_view passphrase);
-    corral::Task<std::tuple<std::error_code, std::vector<std::byte>>>
-    extension(std::string_view name, std::span<const std::byte> data);
-    corral::Task<std::tuple<std::error_code, std::vector<std::string>>> query_extensions();
+    corral::Task<agent::extension_reply> extension(std::string_view name,
+                                                  std::span<const std::byte> data);
+    corral::Task<agent::extension_list> query_extensions();
 
-    // Borrows this client for the adapter's lifetime and for each sign call.
     class signer_adapter {
     public:
         explicit signer_adapter(basic_agent_client& client) noexcept : client_(&client) {}
 
-        corral::Task<std::tuple<std::error_code, std::vector<std::byte>>>
-        operator()(const core::publickey_sign_request& request, std::span<const std::byte> data);
+        corral::Task<sign_result> operator()(const core::publickey_sign_request& request,
+                                            std::span<const std::byte> data);
 
     private:
         basic_agent_client* client_;
@@ -115,7 +112,7 @@ private:
 
     corral::Task<raw_reply> exchange(std::vector<std::byte> request, reply_accept accept,
                                      std::string_view extension_name = {});
-    corral::Task<std::tuple<std::error_code, std::vector<std::byte>>> read_frame();
+    corral::Task<raw_reply> read_frame();
     corral::Task<std::tuple<std::error_code, std::size_t>> read_some(std::span<std::byte> dst);
 
     void fail(std::error_code ec) {
@@ -143,7 +140,7 @@ basic_agent_client<Stream>::read_some(std::span<std::byte> dst) {
 }
 
 template <class Stream>
-corral::Task<std::tuple<std::error_code, std::vector<std::byte>>>
+corral::Task<typename basic_agent_client<Stream>::raw_reply>
 basic_agent_client<Stream>::read_frame() {
     std::byte hdr[4];
     std::size_t got = 0;
@@ -199,8 +196,6 @@ basic_agent_client<Stream>::exchange(std::vector<std::byte> request, reply_accep
         co_return out;
     }
 
-    // Armed for the write and the matching read. A normal return dismisses
-    // it; cancellation destroys this frame first and latches the client.
     struct cancel_latch {
         basic_agent_client* self = nullptr;
         bool dismiss = false;
@@ -228,18 +223,14 @@ basic_agent_client<Stream>::exchange(std::vector<std::byte> request, reply_accep
         co_return out;
     }
 
-    // A structured binding of this co_await is not constructed until the
-    // read resumes. GCC 15 ASan still runs its destructor if the coroutine
-    // is destroyed while the read is suspended, and the vector frees a
-    // poisoned pointer. Keep the result in one object.
-    auto got = co_await read_frame();
-    if (std::get<0>(got)) {
-        fail(std::get<0>(got));
+    auto reply = co_await read_frame();
+    if (reply.ec) {
+        fail(reply.ec);
         guard.dismiss = true;
         out.ec = failed_;
         co_return out;
     }
-    auto& body = std::get<1>(got);
+    auto& body = reply.payload;
 
     const auto type = agent::message_type(body);
     const auto refuse = [&](agent::refusal refusal) {
@@ -262,7 +253,6 @@ basic_agent_client<Stream>::exchange(std::vector<std::byte> request, reply_accep
         if (!agent::decode_extension_failure(body)) desync(code::invalid_format);
         else refuse(agent::refusal::extension_failure);
     } else if (accept == reply_accept::identities && type == agent::msg::identities_answer) {
-        // Still holding turn_. A queued exchange must observe this latch.
         std::vector<agent::identity_view> views;
         if (!agent::decode_identities_answer(body, views)) desync(code::invalid_format);
         else out.payload = std::move(body);
@@ -293,8 +283,7 @@ basic_agent_client<Stream>::exchange(std::vector<std::byte> request, reply_accep
 }
 
 template <class Stream>
-corral::Task<std::tuple<std::error_code, std::vector<agent::identity>>>
-basic_agent_client<Stream>::list_identities() {
+corral::Task<agent::identity_list> basic_agent_client<Stream>::list_identities() {
     wire::writer w;
     agent::encode_request_identities(w);
     auto rep = co_await exchange(w.take(), reply_accept::identities);
@@ -317,9 +306,9 @@ basic_agent_client<Stream>::list_identities() {
 }
 
 template <class Stream>
-corral::Task<std::tuple<std::error_code, std::vector<std::byte>>>
-basic_agent_client<Stream>::sign(std::span<const std::byte> key_blob,
-                                 std::span<const std::byte> data, std::uint32_t flags) {
+corral::Task<sign_result> basic_agent_client<Stream>::sign(std::span<const std::byte> key_blob,
+                                                          std::span<const std::byte> data,
+                                                          std::uint32_t flags) {
     wire::writer w;
     agent::encode_sign_request(w, key_blob, data, flags);
     auto rep = co_await exchange(w.take(), reply_accept::signature);
@@ -455,7 +444,7 @@ corral::Task<std::error_code> basic_agent_client<Stream>::unlock(std::string_vie
 }
 
 template <class Stream>
-corral::Task<std::tuple<std::error_code, std::vector<std::byte>>>
+corral::Task<agent::extension_reply>
 basic_agent_client<Stream>::extension(std::string_view name, std::span<const std::byte> data) {
     wire::writer w;
     agent::encode_extension(w, name, data);
@@ -473,8 +462,7 @@ basic_agent_client<Stream>::extension(std::string_view name, std::span<const std
 }
 
 template <class Stream>
-corral::Task<std::tuple<std::error_code, std::vector<std::string>>>
-basic_agent_client<Stream>::query_extensions() {
+corral::Task<agent::extension_list> basic_agent_client<Stream>::query_extensions() {
     wire::writer w;
     agent::encode_extension(w, agent::query_extension, {});
     auto rep = co_await exchange(w.take(), reply_accept::extension, agent::query_extension);
@@ -490,9 +478,8 @@ basic_agent_client<Stream>::query_extensions() {
 }
 
 template <class Stream>
-corral::Task<std::tuple<std::error_code, std::vector<std::byte>>>
-basic_agent_client<Stream>::signer_adapter::operator()(const core::publickey_sign_request& request,
-                                                      std::span<const std::byte> data) {
+corral::Task<sign_result> basic_agent_client<Stream>::signer_adapter::operator()(
+    const core::publickey_sign_request& request, std::span<const std::byte> data) {
     std::uint32_t flags = 0;
     switch (request.sig) {
     case crypto::sig_id::rsa_pkcs1_sha256: flags = agent::sign_flags::rsa_sha2_256; break;
@@ -502,8 +489,6 @@ basic_agent_client<Stream>::signer_adapter::operator()(const core::publickey_sig
     return client_->sign(request.public_blob, data, flags);
 }
 
-// Reads the session's first host key, session id, and KEX signature. Does not
-// call bind_session when any of them is empty, so the peer sees no message.
 template <class Stream>
 corral::Task<std::error_code> bind_agent_session(basic_agent_client<Stream>& agent,
                                                 const client_session& session,
@@ -517,9 +502,6 @@ corral::Task<std::error_code> bind_agent_session(basic_agent_client<Stream>& age
     co_return co_await agent.bind_session(host_key, session_id, signature, is_forwarding);
 }
 
-// Tries each agent identity with the same publickey path as a local key.
-// Does not bind the agent and does not require serve(). One business refusal
-// continues with the next key; a latched agent or a transport error stops.
 template <class Stream>
 corral::Task<std::tuple<std::error_code, auth_result>> auth_publickey_from_agent(
     client_session& session, std::string_view user, basic_agent_client<Stream>& agent) {
@@ -559,7 +541,6 @@ corral::Task<std::tuple<std::error_code, auth_result>> auth_publickey_from_agent
     co_return {tried ? last : code::request_denied, last_result};
 }
 
-// Copies raw bytes until EOF, error, or cancellation.
 template <class Stream>
 corral::Task<std::error_code> forward_agent_channel(channel& ch, basic_agent_client<Stream>& agent) {
     if (agent.failed_) co_return agent.failed_;

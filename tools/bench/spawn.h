@@ -15,6 +15,7 @@
 namespace bench {
 
 struct spawned_peer;
+struct spawned_peer_result;
 
 // 子进程句柄：析构时 kill + reap，保证异常/超时路径不留孤儿。
 class child_process {
@@ -44,8 +45,8 @@ private:
     explicit child_process(std::unique_ptr<impl> impl) noexcept;
     void abandon() noexcept;
 
-    friend corral::Task<std::tuple<std::error_code, spawned_peer>> spawn_bench_server(
-        uv_loop_t& loop, const client_config&);
+    friend corral::Task<spawned_peer_result> spawn_bench_server(uv_loop_t& loop,
+                                                              const client_config&);
 };
 
 struct spawned_peer {
@@ -54,10 +55,14 @@ struct spawned_peer {
     int port = 0;
 };
 
+struct spawned_peer_result {
+    std::error_code ec;
+    spawned_peer peer;
+};
+
 // 以本二进制（uv_exepath）再起一份 server：算法与 tuning 透传，stderr 接管道，
 // 读到 "listening <ip> <port>" 为就绪；超时或子进程早退返回错误。
-corral::Task<std::tuple<std::error_code, spawned_peer>> spawn_bench_server(
-    uv_loop_t& loop, const client_config&);
+corral::Task<spawned_peer_result> spawn_bench_server(uv_loop_t& loop, const client_config&);
 
 struct sshd_peer {
     spawned_peer peer;
@@ -76,9 +81,13 @@ private:
     void cleanup() noexcept;
 };
 
+struct sshd_peer_result {
+    std::error_code ec;
+    sshd_peer peer;
+};
+
 // 临时目录 + ssh-keygen 生成 host/user key + 生成 sshd_config + 起 sshd。
 // 算法按 client_config::algo 钉死。找不到 sshd / ssh-keygen 返回错误。
-corral::Task<std::tuple<std::error_code, sshd_peer>> spawn_openssh_sshd(
-    uv_loop_t& loop, const client_config&);
+corral::Task<sshd_peer_result> spawn_openssh_sshd(uv_loop_t& loop, const client_config&);
 
 }  // namespace bench

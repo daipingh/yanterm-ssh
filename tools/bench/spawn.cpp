@@ -536,14 +536,12 @@ std::int64_t child_process::exit_status() const noexcept {
     return impl_ ? impl_->exit_status : 0;
 }
 
-using spawn_result = std::tuple<std::error_code, spawned_peer>;
-
-corral::Task<spawn_result> spawn_bench_server(uv_loop_t& loop, const client_config& cfg) {
+corral::Task<spawned_peer_result> spawn_bench_server(uv_loop_t& loop, const client_config& cfg) {
     spawned_peer peer;
 
     const std::string exe = exe_path();
     if (exe.empty()) {
-        co_return spawn_result{std::make_error_code(std::errc::no_such_file_or_directory), std::move(peer)};
+        co_return spawned_peer_result{std::make_error_code(std::errc::no_such_file_or_directory), std::move(peer)};
     }
 
     const std::string user = cfg.user.empty() ? std::string{k_default_user} : cfg.user;
@@ -608,7 +606,7 @@ corral::Task<spawn_result> spawn_bench_server(uv_loop_t& loop, const client_conf
             proc.terminate();
             co_await proc.impl_->exited;
         }
-        co_return spawn_result{ec, std::move(peer)};
+        co_return spawned_peer_result{ec, std::move(peer)};
     }
 
     const int reading = uv_read_start(reinterpret_cast<uv_stream_t*>(state->stderr_pipe.get()),
@@ -617,7 +615,7 @@ corral::Task<spawn_result> spawn_bench_server(uv_loop_t& loop, const client_conf
         (void)uv_process_kill(&state->process, k_kill_signal);
         child_process proc{std::move(state)};
         (void)proc;
-        co_return spawn_result{auv::make_uv_error_code(reading), std::move(peer)};
+        co_return spawned_peer_result{auv::make_uv_error_code(reading), std::move(peer)};
     }
 
     child_process proc{std::move(state)};
@@ -630,14 +628,14 @@ corral::Task<spawn_result> spawn_bench_server(uv_loop_t& loop, const client_conf
             peer.host = st->listen_host;
             peer.port = st->listen_port;
             peer.proc = std::move(proc);
-            co_return spawn_result{std::error_code{}, std::move(peer)};
+            co_return spawned_peer_result{std::error_code{}, std::move(peer)};
         }
         if (std::get<1>(outcome)) {
             proc.terminate();
-            co_return spawn_result{std::make_error_code(std::errc::connection_aborted), std::move(peer)};
+            co_return spawned_peer_result{std::make_error_code(std::errc::connection_aborted), std::move(peer)};
         }
         proc.terminate();
-        co_return spawn_result{std::make_error_code(std::errc::timed_out), std::move(peer)};
+        co_return spawned_peer_result{std::make_error_code(std::errc::timed_out), std::move(peer)};
     }
 
     auto outcome = co_await corral::anyOf(st->listening, st->exited);
@@ -645,10 +643,10 @@ corral::Task<spawn_result> spawn_bench_server(uv_loop_t& loop, const client_conf
         peer.host = st->listen_host;
         peer.port = st->listen_port;
         peer.proc = std::move(proc);
-        co_return spawn_result{std::error_code{}, std::move(peer)};
+        co_return spawned_peer_result{std::error_code{}, std::move(peer)};
     }
     proc.terminate();
-    co_return spawn_result{std::make_error_code(std::errc::connection_aborted), std::move(peer)};
+    co_return spawned_peer_result{std::make_error_code(std::errc::connection_aborted), std::move(peer)};
 }
 
 void sshd_peer::cleanup() noexcept {
@@ -682,9 +680,7 @@ sshd_peer& sshd_peer::operator=(sshd_peer&& other) noexcept {
 
 sshd_peer::~sshd_peer() { cleanup(); }
 
-using sshd_result = std::tuple<std::error_code, sshd_peer>;
-
-corral::Task<sshd_result> spawn_openssh_sshd(uv_loop_t& loop, const client_config& cfg) {
+corral::Task<sshd_peer_result> spawn_openssh_sshd(uv_loop_t& loop, const client_config& cfg) {
     sshd_peer peer;
 
     const std::string sshd = find_sshd(cfg.sshd_path);
@@ -699,26 +695,26 @@ corral::Task<sshd_result> spawn_openssh_sshd(uv_loop_t& loop, const client_confi
             std::cerr << "sshd not found (tried --sshd, PATH, /usr/sbin/sshd)\n";
 #endif
         }
-        co_return sshd_result{std::make_error_code(std::errc::no_such_file_or_directory), std::move(peer)};
+        co_return sshd_peer_result{std::make_error_code(std::errc::no_such_file_or_directory), std::move(peer)};
     }
 
     const std::string keygen = find_ssh_keygen();
     if (keygen.empty()) {
         std::cerr << "ssh-keygen not found (install OpenSSH or put ssh-keygen on PATH)\n";
-        co_return sshd_result{std::make_error_code(std::errc::no_such_file_or_directory), std::move(peer)};
+        co_return sshd_peer_result{std::make_error_code(std::errc::no_such_file_or_directory), std::move(peer)};
     }
 
     const std::string tmp = make_temp_dir();
     if (tmp.empty()) {
         std::cerr << "failed to create temporary directory for sshd\n";
-        co_return sshd_result{std::make_error_code(std::errc::io_error), std::move(peer)};
+        co_return sshd_peer_result{std::make_error_code(std::errc::io_error), std::move(peer)};
     }
     dir_guard guard{tmp};
 
     const int port = pick_free_port();
     if (port <= 0) {
         std::cerr << "failed to pick a free loopback port for sshd\n";
-        co_return sshd_result{std::make_error_code(std::errc::address_in_use), std::move(peer)};
+        co_return sshd_peer_result{std::make_error_code(std::errc::address_in_use), std::move(peer)};
     }
 
     const std::string kex = cfg.algo.kex.empty() ? std::string{k_default_kex} : cfg.algo.kex;
@@ -758,29 +754,29 @@ corral::Task<sshd_result> spawn_openssh_sshd(uv_loop_t& loop, const client_confi
 
     if (auto kec = co_await run_and_wait(loop, keygen, host_keygen_args, cfg.timeout_seconds,
                                          "ssh-keygen (host key)")) {
-        co_return sshd_result{kec, std::move(peer)};
+        co_return sshd_peer_result{kec, std::move(peer)};
     }
     std::vector<std::string> user_keygen_args{
         keygen, "-q", "-t", "ed25519", "-N", "", "-f", user_key_path};
     if (auto kec = co_await run_and_wait(loop, keygen, user_keygen_args, cfg.timeout_seconds,
                                          "ssh-keygen (user key)")) {
-        co_return sshd_result{kec, std::move(peer)};
+        co_return sshd_peer_result{kec, std::move(peer)};
     }
     if (!file_exists(host_key_path) || !file_exists(user_key_path) || !file_exists(user_pub_path)) {
         std::cerr << "ssh-keygen did not produce expected key files in " << tmp << '\n';
-        co_return sshd_result{std::make_error_code(std::errc::io_error), std::move(peer)};
+        co_return sshd_peer_result{std::make_error_code(std::errc::io_error), std::move(peer)};
     }
 
     if (!write_sshd_config(config_path, port, host_key_path, user_pub_path, kex, cipher, hostkey, mac,
                            pid_file)) {
         std::cerr << "failed to write " << config_path << '\n';
-        co_return sshd_result{std::make_error_code(std::errc::io_error), std::move(peer)};
+        co_return sshd_peer_result{std::make_error_code(std::errc::io_error), std::move(peer)};
     }
 
     std::vector<std::string> test_args{sshd, "-f", config_path, "-t"};
     if (auto tec = co_await run_and_wait(loop, sshd, test_args, cfg.timeout_seconds, "sshd -t")) {
         dump_file_stderr(log_path);
-        co_return sshd_result{tec, std::move(peer)};
+        co_return sshd_peer_result{tec, std::move(peer)};
     }
 
     std::vector<std::string> sshd_args{sshd, "-f", config_path, "-D", "-E", log_path};
@@ -792,15 +788,15 @@ corral::Task<sshd_result> spawn_openssh_sshd(uv_loop_t& loop, const client_confi
         }
         std::cerr << "sshd failed to start: " << sec.message() << '\n';
         dump_file_stderr(log_path);
-        co_return sshd_result{sec, std::move(peer)};
+        co_return sshd_peer_result{sec, std::move(peer)};
     }
 
-    auto fail_ready = [&](std::error_code ec, const char* why) -> corral::Task<sshd_result> {
+    auto fail_ready = [&](std::error_code ec, const char* why) -> corral::Task<sshd_peer_result> {
         std::cerr << why << '\n';
         dump_file_stderr(log_path);
         proc.terminate();
         if (!proc.has_exited()) co_await proc.wait_exited();
-        co_return sshd_result{ec, std::move(peer)};
+        co_return sshd_peer_result{ec, std::move(peer)};
     };
 
     std::unique_ptr<auv::Timer> watchdog;
@@ -843,7 +839,7 @@ corral::Task<sshd_result> spawn_openssh_sshd(uv_loop_t& loop, const client_confi
     peer.identity_path = user_key_path;
     peer.temp_dir = tmp;
     guard.disarm();
-    co_return sshd_result{std::error_code{}, std::move(peer)};
+    co_return sshd_peer_result{std::error_code{}, std::move(peer)};
 }
 
 }  // namespace bench

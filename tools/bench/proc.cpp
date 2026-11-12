@@ -259,7 +259,7 @@ auv::stream& piped_child::stdin_stream() { return impl_->stdin_stream; }
 auv::stream& piped_child::stdout_stream() { return impl_->stdout_stream; }
 auv::stream& piped_child::stderr_stream() { return impl_->stderr_stream; }
 
-corral::Task<std::tuple<std::uint32_t, std::string>> piped_child::wait() {
+corral::Task<exit_info> piped_child::wait() {
     if (!impl_) co_return {0u, std::string{}};
     if (!impl_->process_exited) co_await impl_->exited;
     if (impl_->term_signal != 0) {
@@ -500,7 +500,7 @@ std::error_code pty_child::resize(pty_geometry geo) {
 #endif
 }
 
-corral::Task<std::tuple<std::uint32_t, std::string>> pty_child::wait() {
+corral::Task<exit_info> pty_child::wait() {
     if (!impl_) co_return {0u, std::string{}};
 #ifndef _WIN32
     if (!impl_->process_exited) impl_->try_reap();
