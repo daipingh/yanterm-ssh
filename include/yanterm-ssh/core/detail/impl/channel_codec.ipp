@@ -45,27 +45,4 @@ YANTERM_SSH_INLINE channels::open_request_view make_open_view(const wire::detail
     return view;
 }
 
-YANTERM_SSH_INLINE void encode_open_extra(const channels::channel_open_spec& spec, wire::writer& extra) {
-    switch (spec.type) {
-    case channels::channel_type::session:
-    case channels::channel_type::auth_agent:
-    case channels::channel_type::unknown:
-        extra.write_bytes(spec.extra);
-        break;
-    case channels::channel_type::direct_tcpip:
-    case channels::channel_type::forwarded_tcpip:
-        channels::encode_direct_tcpip(extra, spec.host, spec.port, spec.originator_host, spec.originator_port);
-        break;
-    case channels::channel_type::x11:
-        channels::encode_x11(extra, spec.originator_host, spec.originator_port);
-        break;
-    case channels::channel_type::direct_streamlocal:
-        channels::encode_streamlocal(extra, spec.socket_path);
-        break;
-    case channels::channel_type::forwarded_streamlocal:
-        channels::encode_forwarded_streamlocal(extra, spec.socket_path);
-        break;
-    }
-}
-
 }  // namespace yanterm::ssh::core::detail

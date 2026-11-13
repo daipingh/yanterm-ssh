@@ -453,3 +453,42 @@ TEST_CASE("send_keepalive", "[facade][keepalive]") {
         });
     }());
 }
+
+TEST_CASE("send_keepalive treats REQUEST_FAILURE as success", "[facade][keepalive]") {
+    auto fp = make_facade_pair();
+    bool saw_keepalive = false;
+
+    corral::run(fp.loop, [&]() -> corral::Task<void> {
+        co_await handshake_and_password(fp.client, fp.server);
+        co_await fp.client.serve(reject_inbound, reject_inbound, [&]() -> corral::Task<void> {
+        CORRAL_WITH_NURSERY(n) {
+            corral::Event serving;
+            n.start([&]() -> corral::Task<void> {
+                serving.trigger();
+                co_await fp.server.serve(
+                    [](inbound_channel_open open) -> corral::Task<void> {
+                        open.reject(channel_open_reason::administratively_prohibited, "none");
+                        co_return;
+                    },
+                    [&](inbound_global_request req) -> corral::Task<void> {
+                        if (req.type() == "keepalive@openssh.com") {
+                            saw_keepalive = true;
+                            req.reject();
+                            co_return;
+                        }
+                        req.reject();
+                    });
+            });
+            co_await serving;
+
+            auto kec = co_await fp.client.send_keepalive();
+            REQUIRE_FALSE(kec);
+            REQUIRE(saw_keepalive);
+            REQUIRE_FALSE(fp.client.failure());
+
+            co_await fp.client.disconnect(disconnect_reason::by_application, "done");
+            co_return corral::cancel;
+        };
+        });
+    }());
+}

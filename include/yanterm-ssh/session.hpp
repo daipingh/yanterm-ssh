@@ -2,6 +2,7 @@
 
 #include <yanterm-ssh/detail/session_impl.hpp>
 #include <yanterm-ssh/channel.hpp>
+#include <yanterm-ssh/channels/requests.hpp>
 #include <yanterm-ssh/core/types.hpp>
 #include <yanterm-ssh/keys/public_key.hpp>
 #include <yanterm-ssh/wire/types.hpp>
@@ -10,6 +11,7 @@
 
 #include <concepts>
 #include <cstddef>
+#include <functional>
 #include <span>
 #include <system_error>
 #include <tuple>
@@ -19,6 +21,13 @@
 #include <vector>
 
 namespace yanterm::ssh {
+
+// Result of session::send_global_request. `payload` is set only for a
+// REQUEST_SUCCESS that carried data.
+struct global_request_result {
+    std::error_code ec;
+    std::vector<std::byte> payload;
+};
 
 // Called as an lvalue with the chosen algorithm and the data to sign. The
 // awaited result is sign_result: an error, or an SSH signature blob (string
@@ -64,6 +73,8 @@ public:
     template <class OnOpen, class OnGlobal, class Body>
     corral::Task<std::error_code> serve(OnOpen on_open, OnGlobal on_global, Body body);
 
+    corral::Task<channel_open_result> open_channel(std::string_view type,
+                                                  std::span<const std::byte> extra);
     corral::Task<channel_open_result> open_session_channel();
     corral::Task<channel_open_result> open_auth_agent();
     corral::Task<channel_open_result> open_direct_tcpip(std::string_view host, std::uint32_t port,
@@ -82,9 +93,10 @@ public:
     corral::Task<std::error_code> cancel_tcpip_forward(std::string_view addr, std::uint32_t port);
     corral::Task<std::error_code> request_streamlocal_forward(std::string_view socket_path);
     corral::Task<std::error_code> cancel_streamlocal_forward(std::string_view socket_path);
-    corral::Task<std::error_code> send_global_request(std::string_view name,
-                                                     std::span<const std::byte> payload,
-                                                     bool want_reply);
+    // Cancelling the wait does not withdraw the request; the peer may already have acted.
+    corral::Task<global_request_result> send_global_request(std::string_view name,
+                                                           std::span<const std::byte> payload,
+                                                           bool want_reply);
     corral::Task<std::error_code> rekey();
     corral::Task<std::error_code> send_keepalive();
 
@@ -116,14 +128,13 @@ protected:
     corral::Task<void> dispatch_inbound(corral::Nursery& nursery, OnOpen& on_open,
                                        OnGlobal& on_global);
 
-    struct global_reply {
-        std::error_code ec;
-        std::vector<std::byte> payload;
-    };
-
     channel make_channel(session_impl::channel_state* st);
-    corral::Task<channel_open_result> open_typed_channel(channels::channel_open_spec spec);
-    corral::Task<global_reply> wait_global_response();
+    template <detail::wire_payload Extra>
+    corral::Task<channel_open_result> enqueue_channel_open(std::string_view type, Extra extra);
+    template <detail::wire_payload Payload, class Finish = std::identity>
+    corral::Task<std::decay_t<std::invoke_result_t<Finish&, global_request_result>>>
+    enqueue_global_request(std::string_view name, bool want_reply, Payload payload,
+                           Finish finish = {});
 
     std::shared_ptr<session_impl> impl_;
 
@@ -379,27 +390,32 @@ inline channel session::make_channel(session_impl::channel_state* st) {
     return channel{impl_, st};
 }
 
-inline corral::Task<channel_open_result> session::open_typed_channel(
-    channels::channel_open_spec spec) {
+template <detail::wire_payload Extra>
+inline corral::Task<channel_open_result> session::enqueue_channel_open(std::string_view type,
+                                                                      Extra extra) {
     channel_open_result r;
     if (auto ec = ready_or_closed()) {
         r.ec = ec;
         co_return r;
     }
     auto& self = *impl_;
-    auto* st = new session_impl::channel_state{};
-    st->refs = 2;
-    self.live_channels_.push_back(*st);
-
+    auto st_owner = std::make_unique<session_impl::channel_state>();
     core::channel_ref ref{};
-    if (auto ec = self.core_.open_channel(spec, st, ref)) {
+    const auto ec = detail::submit_payload(extra, [&](std::span<const std::byte> bytes) {
+        channels::channel_open_spec spec;
+        spec.type = type;
+        spec.extra = bytes;
+        return self.core_.open_channel(spec, st_owner.get(), ref);
+    });
+    if (ec) {
         self.note_core_failure();
-        self.release(st);
-        self.release(st);
         r.ec = ec;
         co_return r;
     }
+    auto* st = st_owner.release();
+    st->refs = 2;
     st->ref = ref;
+    self.live_channels_.push_back(*st);
     self.wake_pumps();
 
     struct abandon_guard {
@@ -445,67 +461,83 @@ inline corral::Task<channel_open_result> session::open_typed_channel(
     }
 }
 
+inline corral::Task<channel_open_result> session::open_channel(std::string_view type,
+                                                             std::span<const std::byte> extra) {
+    return enqueue_channel_open(type, extra);
+}
+
 inline corral::Task<channel_open_result> session::open_session_channel() {
-    return open_typed_channel(channels::channel_open_spec{});
+    return enqueue_channel_open(channels::type_session, std::span<const std::byte>{});
 }
 
 inline corral::Task<channel_open_result> session::open_auth_agent() {
-    channels::channel_open_spec spec;
-    spec.type = channel_type::auth_agent;
-    return open_typed_channel(std::move(spec));
+    return enqueue_channel_open(channels::type_auth_agent, std::span<const std::byte>{});
 }
 
 inline corral::Task<channel_open_result> session::open_direct_tcpip(
     std::string_view host, std::uint32_t port, std::string_view originator_host,
     std::uint32_t originator_port) {
-    channels::channel_open_spec spec;
-    spec.type = channel_type::direct_tcpip;
-    spec.host.assign(host.begin(), host.end());
-    spec.port = port;
-    spec.originator_host.assign(originator_host.begin(), originator_host.end());
-    spec.originator_port = originator_port;
-    return open_typed_channel(std::move(spec));
+    return enqueue_channel_open(
+        channels::type_direct_tcpip,
+        [host, port, originator_host, originator_port](wire::writer& extra) {
+            channels::encode_direct_tcpip(extra, host, port, originator_host, originator_port);
+        });
 }
 
 inline corral::Task<channel_open_result> session::open_direct_streamlocal(
     std::string_view socket_path) {
-    channels::channel_open_spec spec;
-    spec.type = channel_type::direct_streamlocal;
-    spec.socket_path.assign(socket_path.begin(), socket_path.end());
-    return open_typed_channel(std::move(spec));
+    return enqueue_channel_open(channels::type_direct_streamlocal,
+                                [socket_path](wire::writer& extra) {
+                                    channels::encode_streamlocal(extra, socket_path);
+                                });
 }
 
 inline corral::Task<channel_open_result> session::open_forwarded_tcpip(
     std::string_view host, std::uint32_t port, std::string_view originator_host,
     std::uint32_t originator_port) {
-    channels::channel_open_spec spec;
-    spec.type = channel_type::forwarded_tcpip;
-    spec.host.assign(host.begin(), host.end());
-    spec.port = port;
-    spec.originator_host.assign(originator_host.begin(), originator_host.end());
-    spec.originator_port = originator_port;
-    return open_typed_channel(std::move(spec));
+    return enqueue_channel_open(
+        channels::type_forwarded_tcpip,
+        [host, port, originator_host, originator_port](wire::writer& extra) {
+            channels::encode_direct_tcpip(extra, host, port, originator_host, originator_port);
+        });
 }
 
 inline corral::Task<channel_open_result> session::open_x11(std::string_view originator_host,
                                                           std::uint32_t originator_port) {
-    channels::channel_open_spec spec;
-    spec.type = channel_type::x11;
-    spec.originator_host.assign(originator_host.begin(), originator_host.end());
-    spec.originator_port = originator_port;
-    return open_typed_channel(std::move(spec));
+    return enqueue_channel_open(channels::type_x11,
+                                [originator_host, originator_port](wire::writer& extra) {
+                                    channels::encode_x11(extra, originator_host, originator_port);
+                                });
 }
 
 inline corral::Task<channel_open_result> session::open_forwarded_streamlocal(
     std::string_view socket_path) {
-    channels::channel_open_spec spec;
-    spec.type = channel_type::forwarded_streamlocal;
-    spec.socket_path.assign(socket_path.begin(), socket_path.end());
-    return open_typed_channel(std::move(spec));
+    return enqueue_channel_open(channels::type_forwarded_streamlocal,
+                                [socket_path](wire::writer& extra) {
+                                    channels::encode_forwarded_streamlocal(extra, socket_path);
+                                });
 }
 
-inline corral::Task<session::global_reply> session::wait_global_response() {
+template <detail::wire_payload Payload, class Finish>
+inline auto session::enqueue_global_request(std::string_view name, bool want_reply, Payload payload,
+                                            Finish finish)
+    -> corral::Task<std::decay_t<std::invoke_result_t<Finish&, global_request_result>>> {
+    global_request_result result;
+    if (auto ec = ready_or_closed()) {
+        result.ec = ec;
+        co_return finish(std::move(result));
+    }
     auto& self = *impl_;
+    if (auto ec = detail::submit_payload(payload, [&](std::span<const std::byte> bytes) {
+            return self.core_.send_global_request(name, bytes, want_reply);
+        })) {
+        self.note_core_failure();
+        result.ec = ec;
+        co_return finish(std::move(result));
+    }
+    self.wake_pumps();
+    if (!want_reply) co_return finish(std::move(result));
+
     session_impl::reply_waiter waiter;
     waiter.seq = self.next_global_send_seq_++;
     self.global_waiters_.push_back(waiter);
@@ -513,30 +545,28 @@ inline corral::Task<session::global_reply> session::wait_global_response() {
     for (;;) {
         if (self.closed()) {
             waiter.done = true;
-            co_return {failure(), {}};
+            result.ec = failure();
+            co_return finish(std::move(result));
         }
         if (waiter.done) {
             if (waiter.from_reply) {
-                if (!waiter.success) co_return {code::request_denied, {}};
-                co_return {std::error_code{}, std::move(waiter.payload)};
+                if (!waiter.success) {
+                    result.ec = code::request_denied;
+                } else {
+                    result.payload = std::move(waiter.payload);
+                }
+                co_return finish(std::move(result));
             }
-            co_return {code::invalid_state, {}};
+            result.ec = code::invalid_state;
+            co_return finish(std::move(result));
         }
         co_await waiter.ready;
     }
 }
 
-inline corral::Task<std::error_code> session::send_global_request(
+inline corral::Task<global_request_result> session::send_global_request(
     std::string_view name, std::span<const std::byte> payload, bool want_reply) {
-    if (auto ec = ready_or_closed()) co_return ec;
-    auto& self = *impl_;
-    if (auto ec = self.core_.send_global_request(name, payload, want_reply)) {
-        self.note_core_failure();
-        co_return ec;
-    }
-    self.wake_pumps();
-    if (!want_reply) co_return {};
-    co_return (co_await wait_global_response()).ec;
+    return enqueue_global_request(name, want_reply, payload);
 }
 
 inline corral::Task<std::error_code> session::rekey() {
@@ -556,66 +586,59 @@ inline corral::Task<std::error_code> session::rekey() {
 }
 
 inline corral::Task<std::error_code> session::send_keepalive() {
-    return send_global_request("keepalive@openssh.com", {}, true);
+    // OpenSSH answers keepalive@openssh.com with REQUEST_FAILURE. Any reply
+    // means the peer is alive.
+    return enqueue_global_request(
+        "keepalive@openssh.com", true, std::span<const std::byte>{},
+        [](global_request_result reply) -> std::error_code {
+            if (!reply.ec || reply.ec == code::request_denied) return {};
+            return reply.ec;
+        });
 }
 
 inline corral::Task<std::error_code> session::request_tcpip_forward(std::string_view addr,
                                                                    std::uint32_t port,
                                                                    std::uint16_t& bound) {
-    if (auto ec = ready_or_closed()) co_return ec;
-    auto& self = *impl_;
-    if (auto ec = self.core_.request_tcpip_forward(addr, port)) {
-        self.note_core_failure();
-        co_return ec;
-    }
-    self.wake_pumps();
-    auto [ec, payload] = co_await wait_global_response();
-    if (ec) co_return ec;
-    if (payload.empty()) {
-        bound = static_cast<std::uint16_t>(port);
-        co_return {};
-    }
-    wire::reader r{payload};
-    std::uint32_t p = 0;
-    if (!r.read_uint32(p) || !r.empty() || p > 65535u) {
-        co_return code::invalid_format;
-    }
-    bound = static_cast<std::uint16_t>(p);
-    co_return {};
+    std::uint16_t* const bound_out = &bound;
+    return enqueue_global_request(
+        "tcpip-forward", true,
+        [addr, port](wire::writer& w) { channels::encode_tcpip_forward(w, addr, port); },
+        [bound_out, port](global_request_result reply) -> std::error_code {
+            if (reply.ec) return reply.ec;
+            if (reply.payload.empty()) {
+                *bound_out = static_cast<std::uint16_t>(port);
+                return {};
+            }
+            wire::reader r{reply.payload};
+            std::uint32_t p = 0;
+            if (!r.read_uint32(p) || !r.empty() || p > 65535u) return code::invalid_format;
+            *bound_out = static_cast<std::uint16_t>(p);
+            return {};
+        });
 }
 
 inline corral::Task<std::error_code> session::cancel_tcpip_forward(std::string_view addr,
                                                                   std::uint32_t port) {
-    if (auto ec = ready_or_closed()) co_return ec;
-    auto& self = *impl_;
-    if (auto ec = self.core_.cancel_tcpip_forward(addr, port)) {
-        self.note_core_failure();
-        co_return ec;
-    }
-    self.wake_pumps();
-    co_return (co_await wait_global_response()).ec;
+    return enqueue_global_request(
+        "cancel-tcpip-forward", true,
+        [addr, port](wire::writer& w) { channels::encode_tcpip_forward(w, addr, port); },
+        [](global_request_result reply) { return reply.ec; });
 }
 
-inline corral::Task<std::error_code> session::request_streamlocal_forward(std::string_view socket_path) {
-    if (auto ec = ready_or_closed()) co_return ec;
-    auto& self = *impl_;
-    if (auto ec = self.core_.request_streamlocal_forward(socket_path)) {
-        self.note_core_failure();
-        co_return ec;
-    }
-    self.wake_pumps();
-    co_return (co_await wait_global_response()).ec;
+inline corral::Task<std::error_code> session::request_streamlocal_forward(
+    std::string_view socket_path) {
+    return enqueue_global_request(
+        "streamlocal-forward@openssh.com", true,
+        [socket_path](wire::writer& w) { channels::encode_streamlocal_forward(w, socket_path); },
+        [](global_request_result reply) { return reply.ec; });
 }
 
-inline corral::Task<std::error_code> session::cancel_streamlocal_forward(std::string_view socket_path) {
-    if (auto ec = ready_or_closed()) co_return ec;
-    auto& self = *impl_;
-    if (auto ec = self.core_.cancel_streamlocal_forward(socket_path)) {
-        self.note_core_failure();
-        co_return ec;
-    }
-    self.wake_pumps();
-    co_return (co_await wait_global_response()).ec;
+inline corral::Task<std::error_code> session::cancel_streamlocal_forward(
+    std::string_view socket_path) {
+    return enqueue_global_request(
+        "cancel-streamlocal-forward@openssh.com", true,
+        [socket_path](wire::writer& w) { channels::encode_streamlocal_forward(w, socket_path); },
+        [](global_request_result reply) { return reply.ec; });
 }
 
 template <class OnOpen, class OnGlobal>

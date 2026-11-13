@@ -181,40 +181,11 @@ public:
 
     void set_user_data(channel_ref ch, void* user);
 
-    std::error_code channel_request(channel_ref ch, const channels::channel_request_spec& spec);
-
-    std::error_code request_pty(channel_ref ch, const channels::pty_spec& spec);
-
-    std::error_code request_shell(channel_ref ch);
-
-    std::error_code request_exec(channel_ref ch, std::string_view command);
-
-    std::error_code request_subsystem(channel_ref ch, std::string_view name);
-
-    std::error_code request_env(channel_ref ch, std::string_view name, std::string_view value);
-
-    std::error_code request_window_change(channel_ref ch, const channels::window_size& size);
-
-    std::error_code request_signal(channel_ref ch, std::string_view name);
-
-    std::error_code send_exit_status(channel_ref ch, std::uint32_t status);
-
-    std::error_code send_exit_signal(channel_ref ch, const channels::exit_signal& sig);
-
-    std::error_code request_x11(channel_ref ch, const channels::x11_req_spec& spec);
-
-    std::error_code request_auth_agent(channel_ref ch);
+    std::error_code channel_request(channel_ref ch, std::string_view type,
+                                    std::span<const std::byte> payload, bool want_reply);
 
     std::error_code send_global_request(std::string_view type, std::span<const std::byte> payload,
                                         bool want_reply);
-
-    std::error_code request_tcpip_forward(std::string_view addr, std::uint32_t port);
-
-    std::error_code cancel_tcpip_forward(std::string_view addr, std::uint32_t port);
-
-    std::error_code request_streamlocal_forward(std::string_view socket_path);
-
-    std::error_code cancel_streamlocal_forward(std::string_view socket_path);
 
     // --- actions (synchronous enqueue) ---
     std::error_code send_ignore(std::span<const std::byte> data);
@@ -556,8 +527,8 @@ private:
     std::vector<std::byte> initial_kex_signature_;
     bool hostbound_publickey_ = false;
     bool agent_forward_ = false;
-    // Set when request_auth_agent is sent. Inbound agent channels are refused
-    // until then, before a slot is allocated or the handler is notified.
+    // Set when an agent-forward channel request is sent. Inbound agent channels
+    // are refused until then, before a slot is allocated or the handler is notified.
     bool agent_forward_requested_ = false;
     // The peer asked with the RFC 9987 name, so our agent channel uses it too.
     bool peer_agent_req_ = false;

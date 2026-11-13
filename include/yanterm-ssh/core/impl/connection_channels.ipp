@@ -6,7 +6,6 @@
 #error "yanterm-ssh/core/impl/connection_channels.ipp is an implementation file, not a public header."
 #endif
 
-#include <yanterm-ssh/channels/requests.hpp>
 #include <yanterm-ssh/wire/detail/messages.hpp>
 #include <yanterm-ssh/wire/types.hpp>
 #include <yanterm-ssh/detail/error.hpp>
@@ -116,6 +115,17 @@ YANTERM_SSH_INLINE std::error_code connection::resolve(global_request_ticket tic
 YANTERM_SSH_INLINE std::error_code connection::open_channel(const channels::channel_open_spec& spec, void* user,
                                                             channel_ref& out) {
     if (!channels_active()) return code::invalid_state;
+    if (!detail::ssh_name_ok(spec.type)) return code::invalid_argument;
+    // A peer that requested forwarding with the RFC 9987 name expects the
+    // channel to open under that name too.
+    const std::string_view type =
+        channels::parse_type(spec.type) == channels::channel_type::auth_agent && peer_agent_req_
+            ? channels::type_agent_connect
+            : spec.type;
+    // msg(1) + string length(4) + sender(4) + window(4) + max_packet(4)
+    if (!detail::control_message_fits(1u + 4u + 4u + 4u + 4u, type, spec.extra)) {
+        return code::invalid_argument;
+    }
     const auto window = spec.initial_window != 0 ? spec.initial_window : cfg_.initial_window;
     const auto max_packet = spec.max_packet != 0 ? spec.max_packet : cfg_.max_channel_packet;
     detail::channel* c = nullptr;
@@ -124,16 +134,12 @@ YANTERM_SSH_INLINE std::error_code connection::open_channel(const channels::chan
     const auto ref = detail::ref_of(*c);
     const auto local = c->local;
 
-    wire::writer extra;
-    detail::encode_open_extra(spec, extra);
     wire::detail::channel_open msg;
-    msg.type = spec.type == channels::channel_type::auth_agent && peer_agent_req_
-                   ? channels::type_agent_connect
-                   : detail::type_string(spec);
+    msg.type = type;
     msg.sender = local;
     msg.window = c->local_window;
     msg.max_packet = c->local_max_packet;
-    msg.extra = extra.data();
+    msg.extra = spec.extra;
     if (auto ec = write_encoded(msg)) {
         slots_.erase(local);
         fail(ec);
@@ -292,94 +298,40 @@ YANTERM_SSH_INLINE std::error_code connection::release_extended_data(channel_ref
     return ec;
 }
 
-YANTERM_SSH_INLINE std::error_code connection::channel_request(channel_ref ch,
-                                const channels::channel_request_spec& spec) {
+YANTERM_SSH_INLINE std::error_code connection::channel_request(channel_ref ch, std::string_view type,
+                                                               std::span<const std::byte> payload,
+                                                               bool want_reply) {
     if (!channels_active()) return code::invalid_state;
     auto* c = slots_.find(ch);
     if (!c || !c->remote_known || c->sent_close || c->recv_close) return code::invalid_state;
+    if (!detail::ssh_name_ok(type)) return code::invalid_argument;
+    // msg(1) + recipient(4) + string length(4) + want_reply(1)
+    if (!detail::control_message_fits(1u + 4u + 4u + 1u, type, payload)) {
+        return code::invalid_argument;
+    }
     wire::detail::channel_request msg;
     msg.recipient = c->remote;
-    msg.type = spec.type;
-    msg.want_reply = spec.want_reply;
-    msg.extra = spec.payload;
-    if (spec.want_reply) ++c->outbound_outstanding;
+    msg.type = type;
+    msg.want_reply = want_reply;
+    msg.extra = payload;
+    if (want_reply) ++c->outbound_outstanding;
     if (auto ec = write_encoded(msg)) {
         fail(ec);
         phase_ = phase::dead;
         return ec;
     }
-    return {};
-}
-
-YANTERM_SSH_INLINE std::error_code connection::request_pty(channel_ref ch, const channels::pty_spec& spec) {
-    wire::writer w;
-    channels::encode_pty_req(w, spec);
-    return channel_request(ch, {"pty-req", w.data(), true});
-}
-
-YANTERM_SSH_INLINE std::error_code connection::request_shell(channel_ref ch) {
-    return channel_request(ch, {"shell", {}, true});
-}
-
-YANTERM_SSH_INLINE std::error_code connection::request_exec(channel_ref ch, std::string_view command) {
-    wire::writer w;
-    channels::encode_exec(w, command);
-    return channel_request(ch, {"exec", w.data(), true});
-}
-
-YANTERM_SSH_INLINE std::error_code connection::request_subsystem(channel_ref ch, std::string_view name) {
-    wire::writer w;
-    channels::encode_subsystem(w, name);
-    return channel_request(ch, {"subsystem", w.data(), true});
-}
-
-YANTERM_SSH_INLINE std::error_code connection::request_env(channel_ref ch, std::string_view name,
-                            std::string_view value) {
-    wire::writer w;
-    channels::encode_env(w, name, value);
-    return channel_request(ch, {"env", w.data(), true});
-}
-
-YANTERM_SSH_INLINE std::error_code connection::request_window_change(channel_ref ch, const channels::window_size& size) {
-    wire::writer w;
-    channels::encode_window_change(w, size);
-    return channel_request(ch, {"window-change", w.data(), false});
-}
-
-YANTERM_SSH_INLINE std::error_code connection::request_signal(channel_ref ch, std::string_view name) {
-    wire::writer w;
-    channels::encode_signal(w, name);
-    return channel_request(ch, {"signal", w.data(), false});
-}
-
-YANTERM_SSH_INLINE std::error_code connection::send_exit_status(channel_ref ch, std::uint32_t status) {
-    wire::writer w;
-    channels::encode_exit_status(w, status);
-    return channel_request(ch, {"exit-status", w.data(), false});
-}
-
-YANTERM_SSH_INLINE std::error_code connection::send_exit_signal(channel_ref ch, const channels::exit_signal& sig) {
-    wire::writer w;
-    channels::encode_exit_signal(w, sig);
-    return channel_request(ch, {"exit-signal", w.data(), false});
-}
-
-YANTERM_SSH_INLINE std::error_code connection::request_x11(channel_ref ch, const channels::x11_req_spec& spec) {
-    wire::writer w;
-    channels::encode_x11_req(w, spec);
-    return channel_request(ch, {"x11-req", w.data(), true});
-}
-
-YANTERM_SSH_INLINE std::error_code connection::request_auth_agent(channel_ref ch) {
-    const std::string_view name = agent_forward_ ? "agent-req" : "auth-agent-req@openssh.com";
-    if (auto ec = channel_request(ch, {name, {}, true})) return ec;
-    agent_forward_requested_ = true;
+    if (type == "agent-req" || type == "auth-agent-req@openssh.com") {
+        agent_forward_requested_ = true;
+    }
     return {};
 }
 
 YANTERM_SSH_INLINE std::error_code connection::send_global_request(std::string_view type, std::span<const std::byte> payload,
                                     bool want_reply) {
     if (!channels_active()) return code::invalid_state;
+    if (!detail::ssh_name_ok(type)) return code::invalid_argument;
+    // msg(1) + string length(4) + want_reply(1)
+    if (!detail::control_message_fits(1u + 4u + 1u, type, payload)) return code::invalid_argument;
     wire::detail::global_request msg;
     msg.type = type;
     msg.want_reply = want_reply;
@@ -391,30 +343,6 @@ YANTERM_SSH_INLINE std::error_code connection::send_global_request(std::string_v
         return ec;
     }
     return {};
-}
-
-YANTERM_SSH_INLINE std::error_code connection::request_tcpip_forward(std::string_view addr, std::uint32_t port) {
-    wire::writer w;
-    channels::encode_tcpip_forward(w, addr, port);
-    return send_global_request("tcpip-forward", w.data(), true);
-}
-
-YANTERM_SSH_INLINE std::error_code connection::cancel_tcpip_forward(std::string_view addr, std::uint32_t port) {
-    wire::writer w;
-    channels::encode_tcpip_forward(w, addr, port);
-    return send_global_request("cancel-tcpip-forward", w.data(), true);
-}
-
-YANTERM_SSH_INLINE std::error_code connection::request_streamlocal_forward(std::string_view socket_path) {
-    wire::writer w;
-    channels::encode_streamlocal_forward(w, socket_path);
-    return send_global_request("streamlocal-forward@openssh.com", w.data(), true);
-}
-
-YANTERM_SSH_INLINE std::error_code connection::cancel_streamlocal_forward(std::string_view socket_path) {
-    wire::writer w;
-    channels::encode_streamlocal_forward(w, socket_path);
-    return send_global_request("cancel-streamlocal-forward@openssh.com", w.data(), true);
 }
 
 YANTERM_SSH_INLINE std::error_code connection::send_ignore(std::span<const std::byte> data) {

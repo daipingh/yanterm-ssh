@@ -125,7 +125,7 @@ reply_outcomes server_reply(bool resolve_inline) {
     wire::writer gw;
     channels::encode_tcpip_forward(gw, "127.0.0.1", 0);
     REQUIRE_FALSE(client.conn.send_global_request("tcpip-forward", gw.data(), true));
-    REQUIRE_FALSE(client.conn.request_env(cid, "K", "V"));
+    REQUIRE_FALSE(request_env(client.conn, cid, "K", "V"));
 
     const auto mark = collect_output(server);
 
@@ -182,7 +182,7 @@ TEST_CASE("inbound channel requests settle only at queue head", "[callback]") {
     const auto ids = open_session(client, server);
 
     for (int i = 0; i < 3; ++i) {
-        REQUIRE_FALSE(client.conn.request_env(ids.client_ch, "K", std::to_string(i)));
+        REQUIRE_FALSE(request_env(client.conn, ids.client_ch, "K", std::to_string(i)));
     }
     const auto out = client.conn.pending_output0();
     REQUIRE_FALSE(out.empty());
@@ -227,9 +227,9 @@ TEST_CASE("inbound channel requests settle only at queue head", "[callback]") {
     const auto stale_ref = ids.server_ch;
     const auto stale_ticket = ticket0;
     REQUIRE(server.conn.resolve(stale_ticket, true) == code::invalid_state);
-    REQUIRE(server.conn.request_env(stale_ref, "K", "V") == code::invalid_state);
+    REQUIRE(request_env(server.conn, stale_ref, "K", "V") == code::invalid_state);
     const auto ids2 = open_session(client, server);
-    REQUIRE_FALSE(client.conn.request_env(ids2.client_ch, "K", "after"));
+    REQUIRE_FALSE(request_env(client.conn, ids2.client_ch, "K", "after"));
     transfer_all(client, server);
     const auto fresh = all_of<recording_handler::channel_request>(server.handler.events);
     REQUIRE(fresh.size() == 1);
@@ -286,7 +286,7 @@ TEST_CASE("dead connection resolve emits no inbound replies", "[callback]") {
     bring_up_authed(client, server, hm);
     const auto ids = open_session(client, server);
 
-    REQUIRE_FALSE(client.conn.request_env(ids.client_ch, "K", "V"));
+    REQUIRE_FALSE(request_env(client.conn, ids.client_ch, "K", "V"));
     wire::writer gw;
     channels::encode_tcpip_forward(gw, "127.0.0.1", 0);
     REQUIRE_FALSE(client.conn.send_global_request("tcpip-forward", gw.data(), true));

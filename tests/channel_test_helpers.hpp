@@ -5,11 +5,15 @@
 #include "loopback.hpp"
 #include "recording_handler.hpp"
 
+#include <yanterm-ssh/channels/requests.hpp>
 #include <yanterm-ssh/channels/types.hpp>
 #include <yanterm-ssh/core/connection.hpp>
+#include <yanterm-ssh/wire/types.hpp>
 
 #include <cstddef>
+#include <cstdint>
 #include <optional>
+#include <string_view>
 #include <vector>
 
 namespace yanterm::ssh::testing {
@@ -115,6 +119,80 @@ inline void accept_inbound_open(core::connection& side, bool for_client, bool is
     if (const auto* o = std::get_if<recording_handler::channel_open_request>(&ev)) {
         side.resolve(o->ticket, channels::channel_open_verdict::accepted());
     }
+}
+
+inline std::error_code request_pty(core::connection& conn, core::channel_ref ch,
+                                   channels::pty_spec spec = {}) {
+    wire::writer w;
+    channels::encode_pty_req(w, spec);
+    return conn.channel_request(ch, "pty-req", w.data(), true);
+}
+
+inline std::error_code request_shell(core::connection& conn, core::channel_ref ch) {
+    return conn.channel_request(ch, "shell", {}, true);
+}
+
+inline std::error_code request_exec(core::connection& conn, core::channel_ref ch,
+                                    std::string_view command) {
+    wire::writer w;
+    channels::encode_exec(w, command);
+    return conn.channel_request(ch, "exec", w.data(), true);
+}
+
+inline std::error_code request_env(core::connection& conn, core::channel_ref ch,
+                                   std::string_view name, std::string_view value) {
+    wire::writer w;
+    channels::encode_env(w, name, value);
+    return conn.channel_request(ch, "env", w.data(), true);
+}
+
+inline std::error_code request_window_change(core::connection& conn, core::channel_ref ch,
+                                             channels::window_size size = {}) {
+    wire::writer w;
+    channels::encode_window_change(w, size);
+    return conn.channel_request(ch, "window-change", w.data(), false);
+}
+
+inline std::error_code send_exit_status(core::connection& conn, core::channel_ref ch,
+                                        std::uint32_t status) {
+    wire::writer w;
+    channels::encode_exit_status(w, status);
+    return conn.channel_request(ch, "exit-status", w.data(), false);
+}
+
+inline std::error_code request_x11(core::connection& conn, core::channel_ref ch,
+                                   const channels::x11_req_spec& spec) {
+    wire::writer w;
+    channels::encode_x11_req(w, spec);
+    return conn.channel_request(ch, "x11-req", w.data(), true);
+}
+
+inline std::error_code request_tcpip_forward(core::connection& conn, std::string_view addr,
+                                             std::uint32_t port) {
+    wire::writer w;
+    channels::encode_tcpip_forward(w, addr, port);
+    return conn.send_global_request("tcpip-forward", w.data(), true);
+}
+
+inline std::error_code cancel_tcpip_forward(core::connection& conn, std::string_view addr,
+                                            std::uint32_t port) {
+    wire::writer w;
+    channels::encode_tcpip_forward(w, addr, port);
+    return conn.send_global_request("cancel-tcpip-forward", w.data(), true);
+}
+
+inline std::error_code request_streamlocal_forward(core::connection& conn,
+                                                   std::string_view socket_path) {
+    wire::writer w;
+    channels::encode_streamlocal_forward(w, socket_path);
+    return conn.send_global_request("streamlocal-forward@openssh.com", w.data(), true);
+}
+
+inline std::error_code cancel_streamlocal_forward(core::connection& conn,
+                                                  std::string_view socket_path) {
+    wire::writer w;
+    channels::encode_streamlocal_forward(w, socket_path);
+    return conn.send_global_request("cancel-streamlocal-forward@openssh.com", w.data(), true);
 }
 
 }  // namespace yanterm::ssh::testing

@@ -118,6 +118,7 @@ struct server_options           // 另含 host_keys、认证横幅与用户公�
 namespace yanterm::ssh
 
 concept publickey_signer        // 公钥签名回调
+struct global_request_result    // send_global_request 的结果
 class session                   // 会话基类：I/O 循环、开通道、全局请求
 class client_session            // 客户端：handshake 与认证
 class server_session            // 服务端：handshake 与 authenticate
@@ -126,6 +127,7 @@ reject_inbound                  // reject_inbound_t 的实例
 
 session::disconnect
 session::serve
+session::open_channel
 session::open_session_channel
 session::open_auth_agent
 session::open_direct_tcpip
@@ -200,6 +202,7 @@ channel::request_signal
 channel::send_exit_status
 channel::send_exit_signal
 channel::request_x11
+channel::send_request
 channel::serve_requests
 
 inbound_channel_open::type
@@ -342,23 +345,7 @@ connection::channel_read
 connection::capture_extended_data
 connection::release_extended_data
 connection::channel_request
-connection::request_pty
-connection::request_shell
-connection::request_exec
-connection::request_subsystem
-connection::request_env
-connection::request_window_change
-connection::request_signal
-connection::send_exit_status
-connection::send_exit_signal
-connection::request_x11
-connection::request_auth_agent
-
 connection::send_global_request
-connection::request_tcpip_forward
-connection::cancel_tcpip_forward
-connection::request_streamlocal_forward
-connection::cancel_streamlocal_forward
 
 connection::send_ignore
 connection::send_debug
@@ -493,10 +480,10 @@ type_auth_agent
 type_agent_connect
 max_channel_data_payload
 extended_data_stderr
-struct channel_open_spec        // 出站 / 入站开通道
+struct channel_open_spec        // 出站开通道：type、extra、窗口
+channel_open_spec::type
 channel_open_spec::extra
 struct channel_open_verdict     // 入站开通道裁决
-struct channel_request_spec     // 通道请求 type + payload
 struct window_size
 struct pty_spec
 struct x11_req_spec

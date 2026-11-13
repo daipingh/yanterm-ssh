@@ -44,8 +44,8 @@ TEST_CASE("pipelined pty-req then shell is serial on the server", "[channel][req
     bring_up_authed(client, server, hm);
     const auto ids = open_session(client, server);
 
-    REQUIRE_FALSE(client.conn.request_pty(ids.client_ch, {}));
-    REQUIRE_FALSE(client.conn.request_shell(ids.client_ch));
+    REQUIRE_FALSE(request_pty(client.conn, ids.client_ch));
+    REQUIRE_FALSE(request_shell(client.conn, ids.client_ch));
 
     std::vector<recording_handler::recorded_event> cap;
     transfer_all_capture(client, server, cap);
@@ -85,7 +85,7 @@ TEST_CASE("channel request failure does not fail the session", "[channel][reques
     bring_up_authed(client, server, hm);
     const auto ids = open_session(client, server);
 
-    REQUIRE_FALSE(client.conn.request_pty(ids.client_ch, {}));
+    REQUIRE_FALSE(request_pty(client.conn, ids.client_ch));
     std::vector<recording_handler::recorded_event> cap;
     transfer_all_capture(client, server, cap);
     const auto* req = find_first<recording_handler::channel_request>(cap);
@@ -109,7 +109,7 @@ TEST_CASE("window-change want_reply false needs resolve but sends no SUCCESS", "
     bring_up_authed(client, server, hm);
     const auto ids = open_session(client, server);
 
-    REQUIRE_FALSE(client.conn.request_window_change(ids.client_ch, {}));
+    REQUIRE_FALSE(request_window_change(client.conn, ids.client_ch));
     std::vector<recording_handler::recorded_event> cap;
     transfer_all_capture(client, server, cap);
     const auto* req = find_first<recording_handler::channel_request>(cap);
@@ -132,8 +132,8 @@ TEST_CASE("resolving a non-head channel request id is invalid_state", "[channel]
     bring_up_authed(client, server, hm);
     const auto ids = open_session(client, server);
 
-    REQUIRE_FALSE(client.conn.request_pty(ids.client_ch, {}));
-    REQUIRE_FALSE(client.conn.request_pty(ids.client_ch, {}));
+    REQUIRE_FALSE(request_pty(client.conn, ids.client_ch));
+    REQUIRE_FALSE(request_pty(client.conn, ids.client_ch));
     std::vector<recording_handler::recorded_event> cap;
     transfer_all_capture(client, server, cap);
     const auto reqs = find_all<recording_handler::channel_request>(cap);
@@ -157,7 +157,7 @@ TEST_CASE("many inbound channel requests are all delivered without stalling feed
     const auto ids = open_session(client, server);
 
     for (int i = 0; i < 33; ++i) {
-        REQUIRE_FALSE(client.conn.request_env(ids.client_ch, "K", "V"));
+        REQUIRE_FALSE(request_env(client.conn, ids.client_ch, "K", "V"));
     }
     std::vector<recording_handler::recorded_event> cap;
     transfer_all_capture(client, server, cap);
@@ -179,7 +179,7 @@ TEST_CASE("request_exec payload round-trips", "[channel][request]") {
     bring_up_authed(client, server, hm);
     const auto ids = open_session(client, server);
 
-    REQUIRE_FALSE(client.conn.request_exec(ids.client_ch, "ls"));
+    REQUIRE_FALSE(request_exec(client.conn, ids.client_ch, "ls"));
     std::vector<recording_handler::recorded_event> cap;
     transfer_all_capture(client, server, cap);
     const auto* req = find_first<recording_handler::channel_request>(cap);
@@ -198,7 +198,7 @@ TEST_CASE("send_exit_status is want_reply false and decodes", "[channel][request
     bring_up_authed(client, server, hm);
     const auto ids = open_session(client, server);
 
-    REQUIRE_FALSE(server.conn.send_exit_status(ids.server_ch, 7));
+    REQUIRE_FALSE(send_exit_status(server.conn, ids.server_ch, 7));
     std::vector<recording_handler::recorded_event> cap;
     transfer_all_capture(server, client, cap);
     const auto* req = find_first<recording_handler::channel_request>(cap);
@@ -224,7 +224,7 @@ TEST_CASE("channel_request after close is invalid_state", "[channel][request]") 
     const auto ids = open_session(client, server);
 
     REQUIRE_FALSE(client.conn.channel_close(ids.client_ch));
-    REQUIRE(client.conn.request_pty(ids.client_ch, {}) == code::invalid_state);
+    REQUIRE(request_pty(client.conn, ids.client_ch) == code::invalid_state);
     REQUIRE_FALSE(client.conn.failure());
 }
 
@@ -241,7 +241,7 @@ TEST_CASE("x11-req extra round-trips through a session channel", "[channel][requ
     spec.protocol = "MIT-MAGIC-COOKIE-1";
     spec.cookie = "aabbccdd";
     spec.screen = 12;
-    REQUIRE_FALSE(client.conn.request_x11(ids.client_ch, spec));
+    REQUIRE_FALSE(request_x11(client.conn, ids.client_ch, spec));
     std::vector<recording_handler::recorded_event> cap;
     transfer_all_capture(client, server, cap);
     const auto* req = find_first<recording_handler::channel_request>(cap);
@@ -277,7 +277,7 @@ TEST_CASE("all inbound channel requests are delivered while earlier views stay v
     bring_up_authed(client, server, hm);
     const auto ids = open_session(client, server);
 
-    REQUIRE_FALSE(client.conn.request_shell(ids.client_ch));
+    REQUIRE_FALSE(request_shell(client.conn, ids.client_ch));
     std::vector<recording_handler::recorded_event> cap;
     transfer_all_capture(client, server, cap);
     const auto* head = find_first<recording_handler::channel_request>(cap);
@@ -287,7 +287,7 @@ TEST_CASE("all inbound channel requests are delivered while earlier views stay v
     const auto head_ticket = head->ticket;
 
     for (int i = 0; i < 20; ++i) {
-        REQUIRE_FALSE(client.conn.request_env(ids.client_ch, "K", "V"));
+        REQUIRE_FALSE(request_env(client.conn, ids.client_ch, "K", "V"));
     }
     transfer_all_capture(client, server, cap);
     const auto reqs = find_all<recording_handler::channel_request>(cap);
@@ -306,7 +306,7 @@ TEST_CASE("core rejects an unsolicited agent channel before the handler", "[agen
     bring_up_authed(client, server, hm);
 
     channels::channel_open_spec spec;
-    spec.type = channels::channel_type::auth_agent;
+    spec.type = channels::type_auth_agent;
     core::channel_ref sid{};
     REQUIRE_FALSE(server.conn.open_channel(spec, nullptr, sid));
 
@@ -347,7 +347,11 @@ TEST_CASE("agent forwarding uses RFC names after agent-forward and legacy names 
         REQUIRE(client.conn.supports_agent_forward() == row.advertise);
 
         const auto ids = open_session(client, server);
-        REQUIRE_FALSE(client.conn.request_auth_agent(ids.client_ch));
+        const std::string_view agent_req = client.conn.supports_agent_forward()
+                                               ? "agent-req"
+                                               : "auth-agent-req@openssh.com";
+        REQUIRE(agent_req == row.request);
+        REQUIRE_FALSE(client.conn.channel_request(ids.client_ch, agent_req, {}, true));
         std::vector<recording_handler::recorded_event> cap;
         transfer_all_capture(client, server, cap);
         const auto* req = find_first<recording_handler::channel_request>(cap);
@@ -358,7 +362,7 @@ TEST_CASE("agent forwarding uses RFC names after agent-forward and legacy names 
         REQUIRE_FALSE(server.conn.resolve(req->ticket, true));
 
         channels::channel_open_spec spec;
-        spec.type = channels::channel_type::auth_agent;
+        spec.type = channels::type_auth_agent;
         core::channel_ref opened{};
         REQUIRE_FALSE(server.conn.open_channel(spec, nullptr, opened));
         cap.clear();

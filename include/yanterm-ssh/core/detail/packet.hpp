@@ -83,12 +83,26 @@ inline direction_state& direction_state::operator=(direction_state&& other) noex
 }
 
 // Smallest padding_len >= min_padding such that (base + padding_len) % block == 0.
-[[nodiscard]] inline std::size_t choose_padding(std::size_t base, std::size_t block) noexcept {
+[[nodiscard]] constexpr std::size_t choose_padding(std::size_t base, std::size_t block) noexcept {
     std::size_t pad = min_padding;
     const std::size_t rem = (base + pad) % block;
     if (rem != 0) pad += block - rem;
     return pad;
 }
+
+// Largest SSH payload write_packet accepts in every mode this library can
+// negotiate: 16-byte block, encrypt-and-MAC alignment, and a page that holds
+// one max_packet_length body plus a 64-byte MAC. Checked before a control
+// message is buffered, so a too-large request fails without killing the
+// connection, including one that is deferred across rekey.
+inline constexpr std::size_t max_control_payload = [] {
+    constexpr std::size_t block = 16;
+    constexpr std::size_t align_base = 5;
+    constexpr std::size_t aligned = ((max_packet_length - 1 + align_base) / block) * block;
+    return aligned - align_base - min_padding;
+}();
+static_assert(1 + max_control_payload + choose_padding(5 + max_control_payload, 16)
+              <= max_packet_length);
 
 inline void store_be32(std::span<std::byte> out, std::uint32_t v) noexcept {
     out[0] = static_cast<std::byte>((v >> 24) & 0xffu);

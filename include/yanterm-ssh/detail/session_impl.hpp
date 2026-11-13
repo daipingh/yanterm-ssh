@@ -22,6 +22,7 @@
 
 #include <array>
 #include <cassert>
+#include <concepts>
 #include <cstdint>
 #include <cstring>
 #include <functional>
@@ -38,6 +39,27 @@
 #include <vector>
 
 namespace yanterm::ssh {
+
+namespace detail {
+
+template <class P>
+concept wire_payload =
+    std::convertible_to<P, std::span<const std::byte>> || std::invocable<P&, wire::writer&>;
+
+// Synchronous: a wire::writer used by an encoder stays in this frame and is
+// destroyed before the caller reaches a coroutine suspend point.
+template <wire_payload Payload, class Submit>
+std::error_code submit_payload(Payload& payload, Submit&& submit) {
+    if constexpr (std::convertible_to<Payload, std::span<const std::byte>>) {
+        return submit(std::span<const std::byte>{payload});
+    } else {
+        wire::writer w;
+        payload(w);
+        return submit(w.data());
+    }
+}
+
+}  // namespace detail
 
 struct session_impl : core::handler {
     session_impl(core::role r, auv::stream stream, crypto::provider provider,

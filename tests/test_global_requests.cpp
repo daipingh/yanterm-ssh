@@ -8,10 +8,14 @@
 #include <yanterm-ssh/wire/types.hpp>
 #include <yanterm-ssh/error.hpp>
 
+#include <yanterm-ssh/core/detail/packet.hpp>
+
 #include <array>
 #include <cstddef>
 #include <span>
+#include <string>
 #include <string_view>
+#include <vector>
 
 using namespace yanterm::ssh;
 using namespace yanterm::ssh::testing;
@@ -56,7 +60,7 @@ TEST_CASE("tcpip-forward success carries the bound port", "[channel][global]") {
     auto server = make_server(p);
     bring_up_authed(client, server, hm);
 
-    REQUIRE_FALSE(client.conn.request_tcpip_forward("127.0.0.1", 0));
+    REQUIRE_FALSE(request_tcpip_forward(client.conn, "127.0.0.1", 0));
     transfer_all(client, server);
 
     auto ev = pop_legacy_event(server);
@@ -93,7 +97,7 @@ TEST_CASE("global request failure does not fail the session", "[channel][global]
     auto server = make_server(p);
     bring_up_authed(client, server, hm);
 
-    REQUIRE_FALSE(client.conn.request_tcpip_forward("127.0.0.1", 22));
+    REQUIRE_FALSE(request_tcpip_forward(client.conn, "127.0.0.1", 22));
     transfer_all(client, server);
 
     auto ev = pop_legacy_event(server);
@@ -118,8 +122,8 @@ TEST_CASE("pipelined global requests are serial on the server", "[channel][globa
     auto server = make_server(p);
     bring_up_authed(client, server, hm);
 
-    REQUIRE_FALSE(client.conn.request_tcpip_forward("127.0.0.1", 0));
-    REQUIRE_FALSE(client.conn.request_tcpip_forward("127.0.0.1", 1));
+    REQUIRE_FALSE(request_tcpip_forward(client.conn, "127.0.0.1", 0));
+    REQUIRE_FALSE(request_tcpip_forward(client.conn, "127.0.0.1", 1));
     transfer_all(client, server);
 
     auto ev = pop_legacy_event(server);
@@ -173,12 +177,11 @@ TEST_CASE("direct-tcpip open extras round-trip", "[channel][global]") {
     auto server = make_server(p);
     bring_up_authed(client, server, hm);
 
+    wire::writer extra;
+    channels::encode_direct_tcpip(extra, "example", 443, "127.0.0.1", 9);
     channels::channel_open_spec spec;
-    spec.type = channels::channel_type::direct_tcpip;
-    spec.host = "example";
-    spec.port = 443;
-    spec.originator_host = "127.0.0.1";
-    spec.originator_port = 9;
+    spec.type = channels::type_direct_tcpip;
+    spec.extra = extra.data();
     core::channel_ref cid{};
     REQUIRE_FALSE(client.conn.open_channel(spec, nullptr, cid));
 
@@ -214,7 +217,7 @@ TEST_CASE("forwarded-tcpip opens after tcpip-forward success", "[channel][global
     auto server = make_server(p);
     bring_up_authed(client, server, hm);
 
-    REQUIRE_FALSE(client.conn.request_tcpip_forward("127.0.0.1", 0));
+    REQUIRE_FALSE(request_tcpip_forward(client.conn, "127.0.0.1", 0));
     transfer_all(client, server);
     auto gev = pop_legacy_event(server);
     REQUIRE(gev);
@@ -228,12 +231,11 @@ TEST_CASE("forwarded-tcpip opens after tcpip-forward success", "[channel][global
     REQUIRE(resp->type == legacy_event_type::global_response);
     REQUIRE(resp->request_success);
 
+    wire::writer extra;
+    channels::encode_direct_tcpip(extra, "127.0.0.1", 1234, "10.0.0.1", 99);
     channels::channel_open_spec spec;
-    spec.type = channels::channel_type::forwarded_tcpip;
-    spec.host = "127.0.0.1";
-    spec.port = 1234;
-    spec.originator_host = "10.0.0.1";
-    spec.originator_port = 99;
+    spec.type = channels::type_forwarded_tcpip;
+    spec.extra = extra.data();
     core::channel_ref sid{};
     REQUIRE_FALSE(server.conn.open_channel(spec, nullptr, sid));
 
@@ -269,10 +271,11 @@ TEST_CASE("x11 open extras round-trip", "[channel][global]") {
     auto server = make_server(p);
     bring_up_authed(client, server, hm);
 
+    wire::writer extra;
+    channels::encode_x11(extra, "127.0.0.1", 6010);
     channels::channel_open_spec spec;
-    spec.type = channels::channel_type::x11;
-    spec.originator_host = "127.0.0.1";
-    spec.originator_port = 6010;
+    spec.type = channels::type_x11;
+    spec.extra = extra.data();
     core::channel_ref cid{};
     REQUIRE_FALSE(client.conn.open_channel(spec, nullptr, cid));
 
@@ -300,7 +303,7 @@ TEST_CASE("streamlocal-forward extra round-trips", "[channel][global]") {
     auto server = make_server(p);
     bring_up_authed(client, server, hm);
 
-    REQUIRE_FALSE(client.conn.request_streamlocal_forward("/tmp/agent.sock"));
+    REQUIRE_FALSE(request_streamlocal_forward(client.conn, "/tmp/agent.sock"));
     transfer_all(client, server);
 
     auto ev = pop_legacy_event(server);
@@ -329,7 +332,7 @@ TEST_CASE("cancel-streamlocal-forward is a want_reply global request", "[channel
     auto server = make_server(p);
     bring_up_authed(client, server, hm);
 
-    REQUIRE_FALSE(client.conn.cancel_streamlocal_forward("/tmp/agent.sock"));
+    REQUIRE_FALSE(cancel_streamlocal_forward(client.conn, "/tmp/agent.sock"));
     transfer_all(client, server);
 
     auto ev = pop_legacy_event(server);
@@ -358,9 +361,11 @@ TEST_CASE("direct-streamlocal open extras round-trip", "[channel][global]") {
     auto server = make_server(p);
     bring_up_authed(client, server, hm);
 
+    wire::writer extra;
+    channels::encode_streamlocal(extra, "/tmp/s.sock");
     channels::channel_open_spec spec;
-    spec.type = channels::channel_type::direct_streamlocal;
-    spec.socket_path = "/tmp/s.sock";
+    spec.type = channels::type_direct_streamlocal;
+    spec.extra = extra.data();
     core::channel_ref cid{};
     REQUIRE_FALSE(client.conn.open_channel(spec, nullptr, cid));
 
@@ -387,9 +392,11 @@ TEST_CASE("forwarded-streamlocal open extras round-trip", "[channel][global]") {
     auto server = make_server(p);
     bring_up_authed(client, server, hm);
 
+    wire::writer extra;
+    channels::encode_forwarded_streamlocal(extra, "/tmp/fwd.sock");
     channels::channel_open_spec spec;
-    spec.type = channels::channel_type::forwarded_streamlocal;
-    spec.socket_path = "/tmp/fwd.sock";
+    spec.type = channels::type_forwarded_streamlocal;
+    spec.extra = extra.data();
     core::channel_ref cid{};
     REQUIRE_FALSE(client.conn.open_channel(spec, nullptr, cid));
 
@@ -417,8 +424,7 @@ TEST_CASE("unknown channel open type is rejected as unknown_channel_type", "[cha
     bring_up_authed(client, server, hm);
 
     channels::channel_open_spec spec;
-    spec.type = channels::channel_type::unknown;
-    spec.extra_type = "foo@bar";
+    spec.type = "foo@bar";
     core::channel_ref cid{};
     REQUIRE_FALSE(client.conn.open_channel(spec, nullptr, cid));
 
@@ -697,7 +703,7 @@ TEST_CASE("cancel-tcpip-forward is a want_reply global request", "[channel][glob
     auto server = make_server(p);
     bring_up_authed(client, server, hm);
 
-    REQUIRE_FALSE(client.conn.cancel_tcpip_forward("127.0.0.1", 1234));
+    REQUIRE_FALSE(cancel_tcpip_forward(client.conn, "127.0.0.1", 1234));
     transfer_all(client, server);
 
     auto ev = pop_legacy_event(server);
@@ -728,8 +734,8 @@ TEST_CASE("many inbound global requests are delivered without stalling feed", "[
     auto server = make_server(p);
     bring_up_authed(client, server, hm);
 
-    REQUIRE_FALSE(client.conn.request_tcpip_forward("127.0.0.1", 0));
-    REQUIRE_FALSE(client.conn.request_tcpip_forward("127.0.0.1", 1));
+    REQUIRE_FALSE(request_tcpip_forward(client.conn, "127.0.0.1", 0));
+    REQUIRE_FALSE(request_tcpip_forward(client.conn, "127.0.0.1", 1));
     std::vector<recording_handler::recorded_event> cap;
     transfer_all_capture(client, server, cap);
     std::size_t globals = 0;
@@ -748,7 +754,7 @@ TEST_CASE("inbound global requests are not stalled by core limits", "[channel][g
     auto server = make_server(p);
     bring_up_authed(client, server, hm);
 
-    REQUIRE_FALSE(client.conn.request_tcpip_forward("127.0.0.1", 0));
+    REQUIRE_FALSE(request_tcpip_forward(client.conn, "127.0.0.1", 0));
     std::vector<recording_handler::recorded_event> cap;
     transfer_all_capture(client, server, cap);
     REQUIRE_FALSE(server.conn.inbound_requests_stalled());
@@ -815,4 +821,87 @@ TEST_CASE("an emitted global request keeps its views while more requests queue b
     CHECK(next->request_payload[0] == std::byte{'a'});
     CHECK(next->request_payload[1] == std::byte{'b'});
     CHECK(next->request_payload[2] == std::byte{'c'});
+}
+
+TEST_CASE("ssh names and oversized payloads are rejected without failing the connection",
+          "[channel][global]") {
+    auto p = prov();
+    auto hm = make_ed25519_host(p);
+    auto client = make_client(p);
+    auto server = make_server(p);
+    bring_up_authed(client, server, hm);
+    const auto ids = open_session(client, server);
+
+    const std::string name64(64, 'a');
+    const std::string name65(65, 'a');
+    struct row {
+        std::string_view name;
+        bool ok;
+        const char* label;
+    };
+    const row rows[] = {
+        {"session", true, "plain"},
+        {"a", true, "single"},
+        {name64, true, "sixty-four"},
+        {"keepalive@openssh.com", true, "at-sign"},
+        {"a.b-c_d", true, "punctuation"},
+        {"", false, "empty"},
+        {name65, false, "sixty-five"},
+        {"a,b", false, "comma"},
+        {"a b", false, "space"},
+        {"a\nb", false, "newline"},
+        {"@domain", false, "leading-at"},
+        {"name@", false, "trailing-at"},
+        {"a@b@c", false, "two-ats"},
+        {"\x7f", false, "del"},
+        {"\x1f", false, "control"},
+        {"caf\xc3\xa9", false, "non-ascii"},
+    };
+
+    for (const auto& row : rows) {
+        INFO(row.label);
+        const auto before = client.conn.pending_output_bytes();
+        channels::channel_open_spec spec;
+        spec.type = row.name;
+        core::channel_ref opened{};
+        if (row.ok) {
+            REQUIRE_FALSE(client.conn.send_global_request(row.name, {}, false));
+            REQUIRE(client.conn.pending_output_bytes() > before);
+            REQUIRE_FALSE(client.conn.channel_request(ids.client_ch, row.name, {}, false));
+            REQUIRE_FALSE(client.conn.open_channel(spec, nullptr, opened));
+        } else {
+            REQUIRE(client.conn.send_global_request(row.name, {}, false) == code::invalid_argument);
+            REQUIRE(client.conn.channel_request(ids.client_ch, row.name, {}, false)
+                    == code::invalid_argument);
+            REQUIRE(client.conn.open_channel(spec, nullptr, opened) == code::invalid_argument);
+            REQUIRE(client.conn.pending_output_bytes() == before);
+        }
+        REQUIRE_FALSE(client.conn.failure());
+        REQUIRE_FALSE(server.conn.failure());
+    }
+
+    const std::vector<std::byte> huge(core::detail::max_control_payload, std::byte{1});
+    const auto before = client.conn.pending_output_bytes();
+    REQUIRE(client.conn.send_global_request("x", huge, false) == code::invalid_argument);
+    REQUIRE(client.conn.channel_request(ids.client_ch, "x", huge, false) == code::invalid_argument);
+    channels::channel_open_spec spec;
+    spec.type = "x";
+    spec.extra = huge;
+    core::channel_ref opened{};
+    REQUIRE(client.conn.open_channel(spec, nullptr, opened) == code::invalid_argument);
+    REQUIRE(client.conn.pending_output_bytes() == before);
+    REQUIRE_FALSE(client.conn.failure());
+
+    // msg(1) + string length(4) + name "x" + want_reply(1)
+    const std::size_t room = core::detail::max_control_payload - (1u + 4u + 1u + 1u);
+    const std::vector<std::byte> fit(room, std::byte{2});
+    REQUIRE_FALSE(client.conn.send_global_request("x", fit, false));
+    const std::vector<std::byte> over(room + 1, std::byte{3});
+    const auto mid = client.conn.pending_output_bytes();
+    REQUIRE(client.conn.send_global_request("x", over, false) == code::invalid_argument);
+    REQUIRE(client.conn.pending_output_bytes() == mid);
+    REQUIRE_FALSE(client.conn.failure());
+
+    REQUIRE_FALSE(client.conn.send_global_request("still-ok@example.com", {}, false));
+    REQUIRE_FALSE(client.conn.failure());
 }

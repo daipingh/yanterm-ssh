@@ -78,7 +78,7 @@ TEST_CASE("channel and global calls before serve return invalid_state", "[facade
         REQUIRE_FALSE(opened.ch);
 
         auto gec = co_await fp.client.send_global_request("tcpip-forward", {}, true);
-        REQUIRE(gec == code::invalid_state);
+        REQUIRE(gec.ec == code::invalid_state);
 
         auto rec = co_await fp.client.rekey();
         REQUIRE(rec == code::invalid_state);

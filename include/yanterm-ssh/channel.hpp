@@ -3,6 +3,7 @@
 #include <yanterm-ssh/detail/config.hpp>
 #include <yanterm-ssh/detail/session_impl.hpp>
 #include <yanterm-ssh/channels/requests.hpp>
+#include <yanterm-ssh/wire/types.hpp>
 
 #include <auv/error.hpp>
 #include <auv/stream.hpp>
@@ -128,6 +129,9 @@ public:
     corral::Task<std::error_code> send_exit_status(std::uint32_t status);
     corral::Task<std::error_code> send_exit_signal(exit_signal sig);
     corral::Task<std::error_code> request_x11(x11_req_spec spec);
+    // Cancelling the wait does not withdraw the request; the peer may already have acted.
+    corral::Task<std::error_code> send_request(std::string_view type,
+                                              std::span<const std::byte> payload, bool want_reply);
 
     template <class Handler>
     corral::Task<void> serve_requests(Handler handler);
@@ -151,8 +155,9 @@ private:
                                                    session_impl::channel_state& st,
                                                    core::channel_ref ref, std::uint32_t ext,
                                                    const auv::buffer* bufs, std::size_t nbufs);
-    template <class Enqueue>
-    corral::Task<std::error_code> enqueue_channel_request(bool want_reply, Enqueue enqueue);
+    template <detail::wire_payload Payload>
+    corral::Task<std::error_code> enqueue_channel_request(std::string_view type, bool want_reply,
+                                                          Payload payload);
     template <class Handler>
     corral::Task<void> serve_requests_loop(Handler handler);
 
@@ -762,13 +767,16 @@ inline std::optional<x11_req_spec> inbound_channel_request::x11() const {
     return spec;
 }
 
-template <class Enqueue>
-inline corral::Task<std::error_code> channel::enqueue_channel_request(bool want_reply,
-                                                                      Enqueue enqueue) {
+template <detail::wire_payload Payload>
+inline corral::Task<std::error_code> channel::enqueue_channel_request(std::string_view type,
+                                                                      bool want_reply,
+                                                                      Payload payload) {
     if (!impl_ || st_ == nullptr) co_return code::invalid_state;
     auto& self = *impl_;
     if (self.closed()) co_return self.latch_;
-    if (auto ec = enqueue()) {
+    if (auto ec = detail::submit_payload(payload, [&](std::span<const std::byte> bytes) {
+            return self.core_.channel_request(ref_, type, bytes, want_reply);
+        })) {
         self.note_core_failure();
         co_return ec;
     }
@@ -799,70 +807,75 @@ inline corral::Task<std::error_code> channel::enqueue_channel_request(bool want_
 }
 
 inline corral::Task<std::error_code> channel::request_pty(pty_spec spec) {
-    return enqueue_channel_request(true, [this, spec] {
-        return impl_->core_.request_pty(ref_, spec);
+    return enqueue_channel_request("pty-req", true, [spec](wire::writer& w) {
+        channels::encode_pty_req(w, spec);
     });
 }
 
 inline corral::Task<std::error_code> channel::request_shell() {
-    return enqueue_channel_request(true, [this] {
-        return impl_->core_.request_shell(ref_);
-    });
+    return enqueue_channel_request("shell", true, std::span<const std::byte>{});
 }
 
 inline corral::Task<std::error_code> channel::request_exec(std::string_view command) {
-    return enqueue_channel_request(true, [this, command] {
-        return impl_->core_.request_exec(ref_, command);
+    return enqueue_channel_request("exec", true, [command](wire::writer& w) {
+        channels::encode_exec(w, command);
     });
 }
 
 inline corral::Task<std::error_code> channel::request_subsystem(std::string_view name) {
-    return enqueue_channel_request(true, [this, name] {
-        return impl_->core_.request_subsystem(ref_, name);
+    return enqueue_channel_request("subsystem", true, [name](wire::writer& w) {
+        channels::encode_subsystem(w, name);
     });
 }
 
 inline corral::Task<std::error_code> channel::request_auth_agent() {
-    return enqueue_channel_request(true, [this] {
-        return impl_->core_.request_auth_agent(ref_);
-    });
+    const std::string_view name = impl_ && impl_->core_.supports_agent_forward()
+                                      ? "agent-req"
+                                      : "auth-agent-req@openssh.com";
+    return enqueue_channel_request(name, true, std::span<const std::byte>{});
 }
 
 inline corral::Task<std::error_code> channel::request_env(std::string_view name,
                                                          std::string_view value) {
-    return enqueue_channel_request(true, [this, name, value] {
-        return impl_->core_.request_env(ref_, name, value);
+    return enqueue_channel_request("env", true, [name, value](wire::writer& w) {
+        channels::encode_env(w, name, value);
     });
 }
 
 inline corral::Task<std::error_code> channel::request_window_change(window_size size) {
-    return enqueue_channel_request(false, [this, size] {
-        return impl_->core_.request_window_change(ref_, size);
+    return enqueue_channel_request("window-change", false, [size](wire::writer& w) {
+        channels::encode_window_change(w, size);
     });
 }
 
 inline corral::Task<std::error_code> channel::request_signal(std::string_view name) {
-    return enqueue_channel_request(false, [this, name] {
-        return impl_->core_.request_signal(ref_, name);
+    return enqueue_channel_request("signal", false, [name](wire::writer& w) {
+        channels::encode_signal(w, name);
     });
 }
 
 inline corral::Task<std::error_code> channel::send_exit_status(std::uint32_t status) {
-    return enqueue_channel_request(false, [this, status] {
-        return impl_->core_.send_exit_status(ref_, status);
+    return enqueue_channel_request("exit-status", false, [status](wire::writer& w) {
+        channels::encode_exit_status(w, status);
     });
 }
 
 inline corral::Task<std::error_code> channel::send_exit_signal(exit_signal sig) {
-    return enqueue_channel_request(false, [this, sig] {
-        return impl_->core_.send_exit_signal(ref_, sig);
+    return enqueue_channel_request("exit-signal", false, [sig](wire::writer& w) {
+        channels::encode_exit_signal(w, sig);
     });
 }
 
 inline corral::Task<std::error_code> channel::request_x11(x11_req_spec spec) {
-    return enqueue_channel_request(true, [this, spec] {
-        return impl_->core_.request_x11(ref_, spec);
+    return enqueue_channel_request("x11-req", true, [spec](wire::writer& w) {
+        channels::encode_x11_req(w, spec);
     });
+}
+
+inline corral::Task<std::error_code> channel::send_request(std::string_view type,
+                                                          std::span<const std::byte> payload,
+                                                          bool want_reply) {
+    return enqueue_channel_request(type, want_reply, payload);
 }
 
 template <class Handler>

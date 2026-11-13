@@ -533,12 +533,13 @@ int run_client(const options& opt, crypto::provider p, keys::private_key& ident)
 
     auto start_open = [&]() -> std::error_code {
         channels::channel_open_spec spec;
+        wire::writer extra;
         if (opt.scenario == "direct-tcpip") {
-            spec.type = channels::channel_type::direct_tcpip;
-            spec.host = opt.forward_host;
-            spec.port = static_cast<std::uint32_t>(opt.forward_port);
-            spec.originator_host = "127.0.0.1";
-            spec.originator_port = 1;
+            channels::encode_direct_tcpip(extra, opt.forward_host,
+                                          static_cast<std::uint32_t>(opt.forward_port),
+                                          "127.0.0.1", 1);
+            spec.type = channels::type_direct_tcpip;
+            spec.extra = extra.data();
         }
         return conn.open_channel(spec, nullptr, open_id);
     };
@@ -599,7 +600,9 @@ int run_client(const options& opt, crypto::provider p, keys::private_key& ident)
                     pty.term = "xterm-256color";
                     pty.width = 80;
                     pty.height = 24;
-                    if (auto ec = conn.request_pty(ch_id, pty)) {
+                    wire::writer pty_payload;
+                    channels::encode_pty_req(pty_payload, pty);
+                    if (auto ec = conn.channel_request(ch_id, "pty-req", pty_payload.data(), true)) {
                         std::cerr << "request_pty failed: " << ec.message() << '\n';
                         stop = true;
                         return;
@@ -617,7 +620,7 @@ int run_client(const options& opt, crypto::provider p, keys::private_key& ident)
                     return;
                 }
                 if (phase == client_phase::wait_pty) {
-                    if (auto ec = conn.request_shell(ch_id)) {
+                    if (auto ec = conn.channel_request(ch_id, "shell", {}, true)) {
                         std::cerr << "request_shell failed: " << ec.message() << '\n';
                         stop = true;
                         return;
@@ -783,7 +786,10 @@ int run_server(const options& opt, crypto::provider p, keys::private_key& host,
                 }
                 conn.resolve(ev.channel_req, true);
                 if (req_type == "exec" && (cmd == "true" || cmd.empty()) && !exec_done) {
-                    if (auto ec = conn.send_exit_status(ev.ref, 0)) {
+                    wire::writer exit_payload;
+                    channels::encode_exit_status(exit_payload, 0);
+                    if (auto ec = conn.channel_request(ev.ref, "exit-status", exit_payload.data(),
+                                                      false)) {
                         std::cerr << "send_exit_status: " << ec.message() << '\n';
                         stop = true;
                         return;

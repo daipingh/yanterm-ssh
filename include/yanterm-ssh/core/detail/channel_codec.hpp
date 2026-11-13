@@ -24,12 +24,29 @@ static_assert(channels::max_channel_data_payload
     return std::clamp(advertised, 1u, channels::max_channel_data_payload);
 }
 
-[[nodiscard]] inline std::string_view type_string(const channels::channel_open_spec& spec) noexcept {
-    if (spec.type == channels::channel_type::unknown) return spec.extra_type;
-    return channels::type_name(spec.type);
+// RFC 4251 section 6: printable US-ASCII, no comma or whitespace, at most 64
+// characters. An at-sign, if present, appears once and has text on both sides.
+[[nodiscard]] inline bool ssh_name_ok(std::string_view name) noexcept {
+    if (name.empty() || name.size() > 64) return false;
+    const auto at = name.find('@');
+    if (at != std::string_view::npos) {
+        if (at == 0 || at + 1 == name.size()) return false;
+        if (name.find('@', at + 1) != std::string_view::npos) return false;
+    }
+    for (const char ch : name) {
+        const auto c = static_cast<unsigned char>(ch);
+        if (c < 0x21 || c > 0x7E || c == ',') return false;
+    }
+    return true;
 }
 
-void encode_open_extra(const channels::channel_open_spec& spec, wire::writer& extra);
+// `fixed` is the encoded size aside from the name and the raw tail.
+[[nodiscard]] inline bool control_message_fits(std::size_t fixed, std::string_view name,
+                                               std::span<const std::byte> tail) noexcept {
+    if (name.size() > max_control_payload || tail.size() > max_control_payload) return false;
+    const std::size_t n = fixed + name.size() + tail.size();
+    return n >= fixed && n <= max_control_payload;
+}
 
 [[nodiscard]] channels::open_request_view make_open_view(const wire::detail::channel_open& msg);
 

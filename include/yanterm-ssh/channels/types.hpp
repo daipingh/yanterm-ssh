@@ -63,17 +63,14 @@ enum class channel_open_reason : std::uint32_t {
     return channel_type::unknown;
 }
 
+// Outbound CHANNEL_OPEN. `type` is an SSH name (RFC 4251 section 6). `extra`
+// is the type-specific data, already encoded. A zero window or max_packet
+// selects the connection config default.
 struct channel_open_spec {
-    channel_type type = channel_type::session;
+    std::string_view type = type_session;
+    std::span<const std::byte> extra{};
     std::uint32_t initial_window = 0;  // 0 → config.initial_window
     std::uint32_t max_packet = 0;      // 0 → config.max_channel_packet
-    std::string host;
-    std::uint32_t port = 0;
-    std::string originator_host;
-    std::uint32_t originator_port = 0;
-    std::string socket_path;
-    std::string extra_type;  // when type==unknown
-    std::span<const std::byte> extra{};
 };
 
 struct channel_open_verdict {
@@ -96,12 +93,6 @@ struct channel_open_verdict {
         v.description.assign(desc.begin(), desc.end());
         return v;
     }
-};
-
-struct channel_request_spec {
-    std::string_view type;
-    std::span<const std::byte> payload{};
-    bool want_reply = true;
 };
 
 struct open_request_view {

@@ -719,8 +719,7 @@ TEST_CASE("unknown CHANNEL_OPEN extra is inbound request_payload", "[channel][op
     const auto extra = extra_w.take();
 
     channels::channel_open_spec spec;
-    spec.type = channels::channel_type::unknown;
-    spec.extra_type = "foo@ex";
+    spec.type = "foo@ex";
     spec.extra = extra;
 
     core::channel_ref cid{};
@@ -762,7 +761,6 @@ TEST_CASE("session CHANNEL_OPEN extra is inbound request_payload", "[channel][op
     const auto extra = extra_w.take();
 
     channels::channel_open_spec spec;
-    spec.type = channels::channel_type::session;
     spec.extra = extra;
 
     core::channel_ref cid{};
@@ -787,7 +785,7 @@ TEST_CASE("session CHANNEL_OPEN extra is inbound request_payload", "[channel][op
     REQUIRE_FALSE(server.conn.failure());
 }
 
-TEST_CASE("direct-tcpip CHANNEL_OPEN ignores extra", "[channel][open]") {
+TEST_CASE("direct-tcpip CHANNEL_OPEN forwards the caller payload", "[channel][open]") {
     auto p = prov();
     auto hm = make_ed25519_host(p);
     auto client = make_client(p);
@@ -798,17 +796,8 @@ TEST_CASE("direct-tcpip CHANNEL_OPEN ignores extra", "[channel][open]") {
                                         std::byte{0xEF}};
 
     channels::channel_open_spec spec;
-    spec.type = channels::channel_type::direct_tcpip;
-    spec.host = "example";
-    spec.port = 443;
-    spec.originator_host = "127.0.0.1";
-    spec.originator_port = 9;
+    spec.type = channels::type_direct_tcpip;
     spec.extra = junk;
-
-    wire::writer encoded;
-    channels::encode_direct_tcpip(encoded, spec.host, spec.port, spec.originator_host,
-                            spec.originator_port);
-    const auto want = encoded.take();
 
     core::channel_ref cid{};
     REQUIRE_FALSE(client.conn.open_channel(spec, nullptr, cid));
@@ -819,13 +808,8 @@ TEST_CASE("direct-tcpip CHANNEL_OPEN ignores extra", "[channel][open]") {
         [&](bool is_client, const legacy_event& ev) {
             if (!is_client && ev.type == legacy_event_type::channel_open_request) {
                 REQUIRE(ev.request_type == channels::type_direct_tcpip);
-                REQUIRE(ev.tcp_host == "example");
-                REQUIRE(ev.tcp_port == 443);
-                REQUIRE(ev.originator_host == "127.0.0.1");
-                REQUIRE(ev.originator_port == 9);
-                const auto got = copied(ev.request_payload);
-                REQUIRE(got == want);
-                REQUIRE(got != copied(junk));
+                REQUIRE(copied(ev.request_payload) == copied(junk));
+                REQUIRE(ev.tcp_host.empty());
                 server.conn.resolve(ev.inbound_open, channels::channel_open_verdict::accepted());
                 saw_open = true;
             }
@@ -848,17 +832,13 @@ TEST_CASE("inbound direct-tcpip request_payload is encoded four fields", "[chann
     auto server = make_server(p);
     bring_up_authed(client, server, hm);
 
-    channels::channel_open_spec spec;
-    spec.type = channels::channel_type::direct_tcpip;
-    spec.host = "example";
-    spec.port = 443;
-    spec.originator_host = "127.0.0.1";
-    spec.originator_port = 9;
-
     wire::writer encoded;
-    channels::encode_direct_tcpip(encoded, spec.host, spec.port, spec.originator_host,
-                            spec.originator_port);
+    channels::encode_direct_tcpip(encoded, "example", 443, "127.0.0.1", 9);
     const auto want = encoded.take();
+
+    channels::channel_open_spec spec;
+    spec.type = channels::type_direct_tcpip;
+    spec.extra = want;
 
     core::channel_ref cid{};
     REQUIRE_FALSE(client.conn.open_channel(spec, nullptr, cid));

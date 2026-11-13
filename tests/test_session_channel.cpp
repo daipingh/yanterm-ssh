@@ -958,3 +958,95 @@ TEST_CASE("close of a parked stderr_stream read returns EOF and stdout still flo
         });
     }());
 }
+
+TEST_CASE("send_global_request returns the success payload", "[facade][global]") {
+    auto fp = make_facade_pair();
+    const std::vector<std::byte> reply{std::byte{1}, std::byte{2}, std::byte{3}, std::byte{4}};
+
+    corral::run(fp.loop, [&]() -> corral::Task<void> {
+        co_await handshake_and_password(fp.client, fp.server);
+        co_await fp.client.serve(reject_inbound, reject_inbound, [&]() -> corral::Task<void> {
+        CORRAL_WITH_NURSERY(n) {
+            corral::Event serving;
+            n.start([&]() -> corral::Task<void> {
+                serving.trigger();
+                co_await fp.server.serve(
+                    [](inbound_channel_open open) -> corral::Task<void> {
+                        open.reject(channel_open_reason::administratively_prohibited, "none");
+                        co_return;
+                    },
+                    [&](inbound_global_request req) -> corral::Task<void> {
+                        if (req.type() == "bound@example.com") {
+                            REQUIRE(req.want_reply());
+                            req.accept(reply);
+                            co_return;
+                        }
+                        req.reject();
+                    });
+            });
+            co_await serving;
+
+            auto ok = co_await fp.client.send_global_request("bound@example.com", {}, true);
+            REQUIRE_FALSE(ok.ec);
+            REQUIRE(ok.payload == reply);
+
+            auto denied = co_await fp.client.send_global_request("nope@example.com", {}, true);
+            REQUIRE(denied.ec == code::request_denied);
+            REQUIRE(denied.payload.empty());
+
+            auto quiet = co_await fp.client.send_global_request("quiet@example.com", {}, false);
+            REQUIRE_FALSE(quiet.ec);
+            REQUIRE(quiet.payload.empty());
+
+            co_await fp.client.disconnect(disconnect_reason::by_application, "done");
+            co_return corral::cancel;
+        };
+        });
+    }());
+}
+
+TEST_CASE("channel send_request delivers a caller-defined request", "[facade][channel]") {
+    auto fp = make_facade_pair();
+    const std::vector<std::byte> body{std::byte{'p'}, std::byte{'q'}};
+    int seen = 0;
+
+    corral::run(fp.loop, [&]() -> corral::Task<void> {
+        co_await handshake_and_password(fp.client, fp.server);
+        co_await fp.client.serve(reject_inbound, reject_inbound, [&]() -> corral::Task<void> {
+        CORRAL_WITH_NURSERY(n) {
+            corral::Event serving;
+            n.start([&]() -> corral::Task<void> {
+                serving.trigger();
+                co_await fp.server.serve(
+                    [&](inbound_channel_open open) -> corral::Task<void> {
+                        REQUIRE(open.type() == channel_type::session);
+                        channel ch = open.accept();
+                        REQUIRE(ch);
+                        co_await ch.serve_requests(
+                            [&](inbound_channel_request req) -> corral::Task<bool> {
+                                REQUIRE(req.type() == "custom-req@example.com");
+                                const std::vector<std::byte> got(req.payload().begin(),
+                                                                 req.payload().end());
+                                REQUIRE(got == body);
+                                ++seen;
+                                co_return seen == 1;
+                            });
+                    },
+                    dummy_global);
+            });
+            co_await serving;
+
+            auto opened = co_await fp.client.open_session_channel();
+            REQUIRE_FALSE(opened.ec);
+            auto ok = co_await opened.ch.send_request("custom-req@example.com", body, true);
+            REQUIRE_FALSE(ok);
+            auto denied = co_await opened.ch.send_request("custom-req@example.com", body, true);
+            REQUIRE(denied == code::request_denied);
+            REQUIRE(seen == 2);
+
+            co_await fp.client.disconnect(disconnect_reason::by_application, "done");
+            co_return corral::cancel;
+        };
+        });
+    }());
+}
